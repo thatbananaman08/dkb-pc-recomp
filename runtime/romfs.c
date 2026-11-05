@@ -530,8 +530,35 @@ void fs_init(void) {
 }
 
 // ---- the RomFS interface (fs.h)
+// DKB_FS_BACKTRACE=<text>: for the first 64 opens whose path contains text, log the open and the guest call stack
+// (the caller, then the frame-pointer chain), whether or not TOTK_TRACE=fs is on. It shows which game functions ask
+// for a file, for instance StageData/ for the code that loads an area.
+static void fs_backtrace(const char *what, const char *path) {
+    static const char *want;
+    static int checked, left = 64;
+    if (!checked) want = getenv("DKB_FS_BACKTRACE"), checked = 1;
+    if (!want || !*want || !path || !strstr(path, want) || left <= 0) return;
+    left--;
+    Cpu *c = kern_cpu();
+    char d[160];
+    rt_log("fs backtrace: %s %s", what, path);
+    if (!c) {
+        rt_log("  not on a guest thread");
+        return;
+    }
+    rt_log("  caller %s", ldr_describe(c->x[30], d, sizeof d));
+    uint64_t fp = c->x[29];
+    for (int n = 0; n < 24 && fp && !(fp & 7) && plat_mem_readable(fp, 16); n++) {
+        uint64_t next = LD64(fp), lr = LD64(fp + 8);
+        rt_log("  guest frame %2d: %s", n, ldr_describe(lr, d, sizeof d));
+        if (next <= fp || next - fp > (64u << 20)) break;
+        fp = next;
+    }
+}
+
 void fs_trace(const char *what, const char *path) {
     static double t0;
+    fs_backtrace(what, path);
     if (!(rt_trace & RT_TRACE_FS)) return;
     if (!t0) t0 = now_s();
     rt_log("fs %8.3f %s %s", now_s() - t0, what, path ? path : "(null)");
