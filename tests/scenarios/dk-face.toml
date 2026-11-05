@@ -1,0 +1,8 @@
+# Tutorial cave save with the camera turned toward DK's face for the NaN dump.
+description = "tutorial cave from a save, camera turned toward DK's face for NaN evidence"
+save = "tutorial-cave"
+input = "tools/input/dkb-face-camera.txt"
+seconds = 100
+
+[checks]
+min_hud_bright = 0.005

@@ -1,0 +1,7 @@
+# Bananza 1.0.0: title screen to the first save slot, then turn the camera toward DK's face.
+1500 A 4
+1800 A 4
+2100 A 4
+2400 A 4
+2700 A 4
+3500 RSTICK 32767 0 70
