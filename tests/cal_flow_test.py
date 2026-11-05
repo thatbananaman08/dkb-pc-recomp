@@ -1,7 +1,8 @@
-"""Regression fixture for an unconditional CAL followed by an unconditional BRA.
+"""Regression fixture for CAL's fall-through edge.
 
-The helper writes 1 to R0.  The BRA after the return skips the fast-path write of 2,
-so a decoder that loses CAL's fall-through translates the wrong final colour.
+The dynamic c[0] predicate selects either the fast write of 2 or CAL's slow write
+of 1.  The unconditional BRA after CAL must skip fast; the old decoder loses that
+block and lets slow fall through to fast.
 """
 import argparse
 import json
@@ -28,11 +29,17 @@ def framed(ops):
 
 def shader():
     # The relative targets use physical instruction addresses, which include the scheduling words.
-    ops = ['cal', 'bra', mov32i(0, 2.0), mov32i(1, 0.0), mov32i(2, 0.0), mov32i(3, 1.0), EXIT,
+    ldc = 0xef90000000000000 | (4 << 48) | (255 << 8) | PT | 4
+    # ISETP.EQ P0, R4, 0, PT: predicate comes from a runtime c[0] load.
+    isetp = (0x366 << 50) | (2 << 49) | (7 << 39) | PT | (4 << 8)
+    ops = [ldc, isetp, 'fast_bra', 'cal', 'end_bra', mov32i(0, 2.0),
+           mov32i(1, 0.0), mov32i(2, 0.0), mov32i(3, 1.0), EXIT,
            mov32i(0, 1.0), 0xe32000000000000f | PT]
     address = lambda index: 8 * (index + index // 3 + 1)
-    ops[0] = 0xe260000000000000 | (((address(7) - address(0) - 8) & 0xffffff) << 20)
-    ops[1] = 0xe24000000000000f | PT | (((address(3) - address(1) - 8) & 0xffffff) << 20)
+    # @!P0 BRA fast; CAL slow; BRA end; fast: write 2; end: exit; slow: write 1; RET.
+    ops[2] = 0xe24000000000000f | (0 << 16) | (1 << 19) | (((address(5) - address(2) - 8) & 0xffffff) << 20)
+    ops[3] = 0xe260000000000000 | PT | (((address(10) - address(3) - 8) & 0xffffff) << 20)
+    ops[4] = 0xe24000000000000f | PT | (((address(9) - address(4) - 8) & 0xffffff) << 20)
     header = [0] * 20
     header[0] = 2 | (3 << 5) | (5 << 10)
     header[18] = 0xf
@@ -58,11 +65,14 @@ def main():
     assert run.returncode == 0 and run.stdout.strip() == 'ok cal-flow', (run.stdout, run.stderr)
     spv = words(args.out / 'cal-flow.spv')
     assert spv[0] == 0x07230203
-    # A fixed translator removes the unreachable fast-path literal (2.0 / 0x40000000)
-    # and retains the helper's 1.0 result as the colour output.
-    assert 0x40000000 not in spv, 'CAL fall-through lost: the post-CAL BRA did not skip the fast path'
-    assert 0x3f800000 in spv
-    print('CAL flow: fast-path 2.0 absent; post-CAL BRA retained')
+    # Both results must remain because c[0] controls P0. A fixed CFG contains two conditional
+    # conditional branch for P0 and an unconditional post-CAL edge to end. The old decoder loses
+    # the latter and emits only the P0 selection, making slow overwrite with 2.0.
+    conditional = sum((word & 0xffff) == 250 for word in spv[5:])
+    unconditional = sum((word & 0xffff) == 249 for word in spv[5:])
+    assert 0x40000000 in spv and 0x3f800000 in spv
+    assert conditional >= 1 and unconditional >= 2, f'CAL fall-through lost: {conditional} conditional, {unconditional} unconditional branches'
+    print(f'CAL flow: {conditional} conditional + {unconditional} unconditional branches retain the dynamic fast/slow split')
 
 
 if __name__ == '__main__':
