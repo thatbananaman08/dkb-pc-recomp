@@ -720,6 +720,92 @@ static uint32_t *spirv_dual_source(const uint32_t *w, uint64_t n, uint64_t *out_
     return o;
 }
 
+// NVN's alpha test (nvnColorStateSetAlphaTest, nvnCommandBufferSetAlphaRef) has no Vulkan state. The fragment fails when
+// colour output 0's alpha does not compare true with the reference, before blending; NaN fails. So before each return of
+// the entry point this adds: load Location 0, compare its w, OpKill when false. The pipeline is keyed by GKey.alpha, so
+// only draws with a test get this module. NULL when the module has no float vec4 Output at Location 0.
+// Two cases follow Eglantine, our default reference, without an NVN source for either. A game draw that needs the other
+// answer decides them. EarlyFragmentTests stays, so with depth or stencil writes on, a rejected fragment has already
+// written them. NEVER on a module without that output also gets NULL, so the draw runs with no test: Eglantine checks for
+// a colour output first, Ryujinx discards first.
+static uint32_t *spirv_alpha_test(const uint32_t *w, uint64_t n, unsigned func, float ref, uint64_t *out_n) {
+    enum { OP_TYPE_BOOL = 20, OP_FUNCTION_END = 56, OP_LOAD = 61, OP_COMPOSITE_EXTRACT = 81, OP_SELECTION_MERGE = 247,
+           OP_LABEL = 248, OP_BRANCH_CONDITIONAL = 250, OP_KILL = 252, OP_RETURN = 253, RETURN_WORDS = 26 };
+    // By NVN_ALPHA_FUNC_*: FOrdLessThan (a < a is never true), FOrdLessThan, FOrdEqual, FOrdLessThanEqual,
+    // FOrdGreaterThan, FOrdNotEqual, FOrdGreaterThanEqual
+    static const uint16_t compare[8] = {0, 184, 184, 180, 188, 186, 182, 190};
+    if (func < 1 || func > 7 || n < 5) return NULL;
+    uint32_t bound = w[3], entry = 0, bool_type = 0, *loc0 = calloc(bound, 4), *type_of = calloc(bound, 4);
+    uint32_t *comp = calloc(bound, 4), *count = calloc(bound, 4);
+    uint32_t *f32 = calloc(bound, 4), *o = NULL;
+    uint32_t out_var = 0, vec = 0, flt = 0, returns = 0, bad = !loc0 || !type_of || !comp || !count || !f32;
+    uint64_t fn_at = 0;
+    for (uint64_t i = 5; i < n && !bad;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) { bad = 1; break; }
+        const uint32_t *a = w + i + 1;
+        if (op == SPV_OP_ENTRY_POINT && len >= 3 && !entry) {
+            if (a[0] != 4) bad = 1;   // ExecutionModel Fragment
+            entry = a[1];
+        } else if (op == SPV_OP_DECORATE && len == 4 && a[1] == SPV_DEC_LOCATION && a[2] == 0 && a[0] < bound) loc0[a[0]] = 1;
+        else if (op == OP_TYPE_BOOL && len == 2) bool_type = a[0];
+        else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[0] < bound && a[1] == 32) f32[a[0]] = 1;
+        else if (op == SPV_OP_TYPE_VECTOR && len >= 4 && a[0] < bound) comp[a[0]] = a[1], count[a[0]] = a[2];
+        else if (op == SPV_OP_TYPE_POINTER && len >= 4 && a[0] < bound && a[1] == SPV_SC_OUTPUT) type_of[a[0]] = a[2];
+        else if (op == SPV_OP_VARIABLE && len >= 4 && a[2] == SPV_SC_OUTPUT && a[1] < bound && loc0[a[1]] && a[0] < bound) {
+            uint32_t t = type_of[a[0]];
+            if (t < bound && count[t] == 4 && comp[t] < bound && f32[comp[t]]) out_var = a[1], vec = t, flt = comp[t];
+        } else if (op == SPV_OP_FUNCTION) { fn_at = i; break; }
+        i += len;
+    }
+    int in_entry = 0;
+    for (uint64_t i = fn_at; fn_at && i < n && !bad;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) { bad = 1; break; }
+        if (op == SPV_OP_FUNCTION) in_entry = len >= 3 && w[i + 2] == entry;
+        else if (op == OP_FUNCTION_END) in_entry = 0;
+        else if (op == OP_RETURN && in_entry) returns++;
+        i += len;
+    }
+    if (!bad && out_var && entry && fn_at && returns) {
+        uint32_t add = (bool_type ? 0 : 2) + 4;
+        uint64_t total = n + add + (uint64_t)returns * RETURN_WORDS;
+        o = malloc(total * 4);
+        if (o) {
+            uint32_t ref_id = bound++, bits;
+            memcpy(&bits, &ref, 4);
+            memcpy(o, w, fn_at * 4);
+            uint64_t d = fn_at;
+            if (!bool_type) bool_type = bound++, o[d++] = 2u << 16 | OP_TYPE_BOOL, o[d++] = bool_type;
+            o[d++] = 4u << 16 | SPV_OP_CONSTANT, o[d++] = flt, o[d++] = ref_id, o[d++] = bits;
+            in_entry = 0;
+            for (uint64_t i = fn_at; i < n;) {
+                uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+                if (op == SPV_OP_FUNCTION) in_entry = w[i + 2] == entry;
+                else if (op == OP_FUNCTION_END) in_entry = 0;
+                else if (op == OP_RETURN && in_entry) {
+                    uint32_t v = bound++, a = bound++, c = bound++, kill = bound++, merge = bound++;
+                    o[d++] = 4u << 16 | OP_LOAD, o[d++] = vec, o[d++] = v, o[d++] = out_var;
+                    o[d++] = 5u << 16 | OP_COMPOSITE_EXTRACT, o[d++] = flt, o[d++] = a, o[d++] = v, o[d++] = 3;
+                    o[d++] = 5u << 16 | compare[func], o[d++] = bool_type, o[d++] = c, o[d++] = a;
+                    o[d++] = func == 1 ? a : ref_id;
+                    o[d++] = 3u << 16 | OP_SELECTION_MERGE, o[d++] = merge, o[d++] = 0;
+                    o[d++] = 4u << 16 | OP_BRANCH_CONDITIONAL, o[d++] = c, o[d++] = merge, o[d++] = kill;
+                    o[d++] = 2u << 16 | OP_LABEL, o[d++] = kill;
+                    o[d++] = 1u << 16 | OP_KILL;
+                    o[d++] = 2u << 16 | OP_LABEL, o[d++] = merge;
+                }
+                memcpy(o + d, w + i, len * 4);
+                d += len, i += len;
+            }
+            o[3] = bound;
+            *out_n = d;
+        }
+    }
+    free(loc0), free(type_of), free(comp), free(count), free(f32);
+    return o;
+}
+
 // Adds an Output variable for each Location of `missing` (type and width from io) to a module, declared in the entry
 // point interface and initialised as Maxwell reads an unwritten output: (0, 0, 0, 1), the w as the bits of 1.0f whatever
 // the type (attribute memory is untyped); fewer than 4 components are all zero. Existing scalar, vector and pointer types
@@ -1741,7 +1827,8 @@ typedef struct {                       // normalized: zero where the state is dy
     uint32_t color[8], depth, stencil; // VkFormat
     uint8_t n_color, samples, topo_class, minus_w;
     uint8_t clamp, poly_mode, a2c, logic_op;   // logic_op: VkLogicOp + 1 when enabled
-    uint8_t blend_en, dsb, fbl, pad;  // dsb: an enabled target blends with a SRC1 factor; fbl: VkPipeState.feedback
+    uint8_t blend_en, dsb, fbl, alpha;  // dsb: an enabled target blends with a SRC1 factor; fbl: VkPipeState.feedback;
+                                       // alpha: NVN_ALPHA_FUNC_* of an alpha test (spirv_alpha_test), else 0
     uint32_t wmask;
     uint8_t blend[8][6];               // src, dst, op, src alpha, dst alpha, alpha op (VkBlendFactor / VkBlendOp)
     uint32_t attr_fmt[32], attr_off[32];
@@ -1749,6 +1836,7 @@ typedef struct {                       // normalized: zero where the state is dy
     uint8_t rate[17];                  // per binding: 0 unused, 1 vertex, 2 instance
     uint8_t indep;                     // P.indep when built: the probe draws through both layouts
     uint8_t geometry_input, pad2;
+    float alpha_ref;                   // 0 without an alpha test
 } GKey;
 
 static int blendable(VkFormat f) {
@@ -1809,6 +1897,8 @@ static void gkey_fill(const VkPipeState *s, GKey *k) {
     k->minus_w = s->depth_minus_w != 0;
     k->dsb = s->fs && P.f_dual_src && uses_src1(s);
     k->fbl = s->fs ? s->feedback : 0;
+    if (s->fs && s->color.alpha_func >= NVN_ALPHA_FUNC_NEVER && s->color.alpha_func < NVN_ALPHA_FUNC_ALWAYS)
+        k->alpha = (uint8_t)s->color.alpha_func, k->alpha_ref = s->alpha_ref;
     if (!P.dyn_clamp) k->clamp = s->depth_clamp && P.f_depth_clamp;
     if (!P.dyn_poly) k->poly_mode = (uint8_t)polygon_mode(s->poly.mode);
     if (!P.dyn_a2c) k->a2c = s->ms.a2c != 0;
@@ -1894,10 +1984,16 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             }
         }
         const uint32_t *fcode = gfx_shader_spirv(s->fs, &fw);
+        if (k->alpha && fcode) {   // before spirv_dual_source, which adds a second output at Location 0
+            uint64_t n2 = 0;
+            uint32_t *a = spirv_alpha_test(fcode, fw, k->alpha, k->alpha_ref, &n2);
+            if (a) fcode = fpatched = a, fw = n2;
+            else LOG_ONCE("vk_pipeline: alpha test but the fragment shader has no float vec4 output at location 0");
+        }
         if (k->dsb) {
             uint64_t n2 = 0;
             uint32_t *d = spirv_dual_source(fcode, fw, &n2);
-            if (d) fcode = fpatched = d, fw = n2;
+            if (d) free(fpatched), fcode = fpatched = d, fw = n2;
             else LOG_ONCE("vk_pipeline: SRC1 blend factors but the fragment shader writes no colour output 1");
         }
         if (l->set1 || fs_off) {
@@ -2039,7 +2135,7 @@ static Lib *libs[LIB_BUCKETS];
 
 typedef struct { uint32_t kind, topo_class, attr_fmt[32], attr_off[32]; uint8_t attr_bind[32], rate[17], pad[3]; } ViKey;
 typedef struct { uint32_t kind, missing; const GfxShader *vs; uint8_t clamp, poly_mode, minus_w, pad; GfxShaderIo fin[32]; } PrKey;
-typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, pad; const GfxShader *fs; } FsKey;
+typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, alpha; const GfxShader *fs; float alpha_ref; uint32_t pad; } FsKey;
 typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, pad[3]; uint32_t color[8], depth, stencil, wmask;
                  uint8_t blend[8][6]; } FoKey;
 
@@ -2124,13 +2220,17 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
             uint64_t fw, sw, n2 = 0;
             const uint32_t *fcode = gfx_shader_spirv(s->fs, &fw), *scode = fcode;
             sw = fw;
-            uint32_t *d = NULL;
+            uint32_t *d = NULL, *at = NULL;
+            if (k->alpha && fcode) {   // before spirv_dual_source, which adds a second output at Location 0
+                if ((at = spirv_alpha_test(fcode, fw, k->alpha, k->alpha_ref, &n2))) fcode = at, fw = n2;
+                else LOG_ONCE("vk_pipeline: alpha test but the fragment shader has no float vec4 output at location 0");
+            }
             if (k->dsb && fcode) {
                 if ((d = spirv_dual_source(fcode, fw, &n2))) fcode = d, fw = n2;
                 else LOG_ONCE("vk_pipeline: SRC1 blend factors but the fragment shader writes no colour output 1");
             }
             patched = fcode ? spirv_set(fcode, fw, 1) : NULL;
-            free(d);
+            free(d), free(at);
             if (!patched || !(m = make_module(patched, fw))) goto out;
             st.stage = VK_SHADER_STAGE_FRAGMENT_BIT, st.module = m;
             pin_subgroup32(&st, &rq, scode, sw);
@@ -2307,6 +2407,7 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
         if (pk->missing >> i & 1) pk->fin[i] = fin[i];
     memset(fk, 0, sizeof *fk);
     fk->kind = LIB_FS, fk->fs = s->fs, fk->dsb = k->dsb, fk->samples = k->samples, fk->a2c = k->a2c;
+    fk->alpha = k->alpha, fk->alpha_ref = k->alpha_ref;
     memset(ok, 0, sizeof *ok);
     ok->kind = LIB_FO, ok->n_color = k->n_color, ok->samples = k->samples, ok->a2c = k->a2c, ok->logic_op = k->logic_op;
     ok->blend_en = k->blend_en, ok->depth = k->depth, ok->stencil = k->stencil, ok->wmask = k->wmask;

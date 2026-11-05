@@ -62,7 +62,7 @@ typedef struct Mixer {
     uint64_t *sink_address; uint32_t *sink_size, *sink_offset, *sink_old, *sink_written;
     unsigned reported;                             // one-time reports
     float voice_scratch[6][MAX_FRAME], filter_scratch[MAX_FRAME], output_scratch[MAX_FRAME * 2];
-    double level_sum, level_peak; uint64_t level_count, level_frames; int first_sound_logged;
+    double level_sum[2], level_peak[2]; uint64_t level_frames; int first_sound_logged;   // [0] left, [1] right
     int prefill;                                   // render blocks
 } Mixer;
 
@@ -236,13 +236,12 @@ static void output_push(Mixer *m, const float *lr, int frames) {
 static void level_note(AudioRenderer *r, Mixer *m, const float *lr, int frames) {
     if (!(rt_trace & RT_TRACE_AUDIO)) return;
     int sound = 0;
-    for (int k = 0; k < 2 * frames; k++) {
+    for (int k = 0; k < 2 * frames; k++) {   // interleaved: even samples left, odd right
         double x = lr[k];
-        m->level_sum += x * x;
-        if (fabs(x) > m->level_peak) m->level_peak = fabs(x);
+        m->level_sum[k & 1] += x * x;
+        if (fabs(x) > m->level_peak[k & 1]) m->level_peak[k & 1] = fabs(x);
         if (x != 0) sound = 1;
     }
-    m->level_count += 2 * (uint64_t)frames;
     m->level_frames += (uint64_t)frames;
     if (sound && !m->first_sound_logged) {
         m->first_sound_logged = 1;
@@ -250,15 +249,17 @@ static void level_note(AudioRenderer *r, Mixer *m, const float *lr, int frames) 
     }
     if (m->level_frames >= (uint64_t)r->param.sample_rate * 5) {
         uint64_t wr = atomic_load(&m->wr), queued = wr - atomic_load(&m->rd);
-        rt_log("audio: level rms %.4f peak %.4f over %.1f s; written %llu frames, underruns %llu, overruns %llu, "
+        // Per channel, so a route that reaches one side only shows (#63).
+        rt_log("audio: level rms L %.4f R %.4f, peak L %.4f R %.4f over %.1f s; written %llu frames, underruns %llu, overruns %llu, "
                "missing frames %llu, callback frames %llu (nonzero %llu), queued %.1f ms, skipped %llu frames",
-               sqrt(m->level_sum / (double)m->level_count), m->level_peak, m->level_frames / (double)r->param.sample_rate,
+               sqrt(m->level_sum[0] / (double)m->level_frames), sqrt(m->level_sum[1] / (double)m->level_frames),
+               m->level_peak[0], m->level_peak[1], m->level_frames / (double)r->param.sample_rate,
                (unsigned long long)wr, (unsigned long long)atomic_load(&m->underruns),
                (unsigned long long)atomic_load(&m->overruns), (unsigned long long)atomic_load(&m->missing_frames),
                (unsigned long long)atomic_load(&m->callback_frames), (unsigned long long)atomic_load(&m->callback_nonzero),
                queued * 1000.0 / r->param.sample_rate, (unsigned long long)atomic_load(&m->skipped_frames));
-        m->level_sum = m->level_peak = 0;
-        m->level_count = m->level_frames = 0;
+        m->level_sum[0] = m->level_sum[1] = m->level_peak[0] = m->level_peak[1] = 0;
+        m->level_frames = 0;
     }
 }
 

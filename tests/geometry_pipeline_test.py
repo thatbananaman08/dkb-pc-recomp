@@ -84,7 +84,7 @@ static uint32_t vs_outs(const GfxShader *v,const GfxShader *f,GfxShaderIo io[32]
              'uint8_t vk_geometry_input(', 'static int topology_class(', 'static int format_type(',
              'static VkFormatFeatureFlags format_features(', 'static VkFormat target_format(',
              'static uint32_t *spirv_rebind(', 'static uint32_t *spirv_set(',
-             'static uint32_t *spirv_dual_source(', 'static uint32_t *spirv_add_outputs(',
+             'static uint32_t *spirv_dual_source(', 'static uint32_t *spirv_alpha_test(', 'static uint32_t *spirv_add_outputs(',
              'static uint32_t *spirv_fixup_linked(', 'static uint32_t *spirv_fixup(', 'static int uses_subgroup_ops(',
              'static void pin_subgroup32(', 'static VkShaderModule make_module_linked(', 'static VkShaderModule make_module(']
     prefix += '\n'.join(interface.function(source, name) for name in names)

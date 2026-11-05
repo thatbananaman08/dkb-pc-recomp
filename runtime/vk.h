@@ -461,6 +461,9 @@ typedef struct VkPipeState {
     vs_st vstream[16];                     // OP_BIND_VSTREAM
     // Keep the legacy fields above byte-for-byte stable for pipeline-key records.
     const GfxShader *gs;                   // experimental ordinary GS; NULL keeps the existing VS/FS paths
+    float alpha_ref;                       // OP_BIND_STATE kind 7: reference of color.alpha_func's test. After gs, so not in
+                                           // the pipeline-key records: a prebuilt alpha-test pipeline has reference 0 and
+                                           // goes unused, and the draw builds its own
 } VkPipeState;
 void vk_pipe_state_defaults(VkPipeState *s);   // NVN defaults of every state object (shaders and formats left 0)
 enum { VK_PIPE_SUPPORT = GFX_RES_KINDS };      // VkPipeBinding.kind of the support buffer

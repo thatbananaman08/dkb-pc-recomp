@@ -3,7 +3,37 @@
 Milestones of DKB Recomp, newest first. The plan they follow is [bananza-plan.md](bananza-plan.md); open work is in
 the [roadmap issue](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/10).
 
+## 5 November 2026
+
+- **The destructible terrain renders with `TOTK_NATIVE_GS=1`** (#67 by philneitz, 0ee59b2, [#45](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/45)).
+  The terrain's passthrough geometry stage now replays natively and fills the indirect counts that the reset from #48
+  leaves at zero. In the mining tunnel the walls and floor render, where they are black with the switch off. It is
+  translator patch 0018 and stays opt-in. A 180 s tutorial run with the Vulkan validation layer had 0 faults and the
+  same 10 validation errors as with it off.
+- **Written ranges go through a hash table** (#74 by philneitz, a8d6afc). `note_written` searched its whole list on
+  every call. In the Hilltop Layer with the geometry stage it took most of the replay thread.
+- **The opening wall's cause is found** ([#45](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/45), by dwk001).
+  The translator's decoder treats an unpredicated `CAL` as an unconditional branch, so the code after the call loses
+  its predecessor. In a square root's slow path the result is then overwritten with `0 × inf = NaN`. The one-line fix
+  brings the wall back here as well and will be patch 0019.
+- **A device lost in the end-of-tutorial cutscene** ([#75](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/75))
+  reproduces on two machines and two drivers, with and without the `CAL` fix. Skipping the cutscene avoids it.
+
 ## 4 November 2026
+
+- **The NaN on DK's face is fixed** (#72 by zswxp59, 60e7616, [#70](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/70)).
+  DK's skinning stage packs tangents as signed bytes with Ampere `F2I.S8`. The lowering turns that into a Maxwell
+  F2I with an 8-bit destination, which the translator read as unsigned, so every negative component was stored as 0
+  and some tangents became zero vectors. DK's vertex stage normalized them into NaN, and the bloom spread it into
+  the headlamp halo and the black blot. Translator patch 0017 converts with the right sign and saturates to the byte
+  range before converting. In the frame 7400 scene the NaN goes from every attempt to 0, without the FMZ experiments.
+  The missing opening wall in #45 has another cause.
+- **NVN's alpha test applies** (#68 by philneitz, 73aade7). Vulkan has no alpha test, so the pipeline gets a fragment
+  variant that discards when output 0's alpha fails the compare. The skill tree menu no longer shows black blocks.
+- **Mixed routes reach the output** (#66 by monsterlag, 9a31b48, [#63](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/63)).
+  Submixes fed through a splitter were mixed after their destination, so their sound was lost: the banana jingle,
+  the area title card, area music and more. They are now ordered as a graph. Two main menu sounds still play in the
+  right channel only.
 
 - **No more clip and cull validation errors** (5ffe6ad). The translator declares `CullDistance[1]` next to
   `ClipDistance[8]`, which together exceed the device's limit of 8, and the runtime drops the member when nothing

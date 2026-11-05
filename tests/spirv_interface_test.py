@@ -117,7 +117,7 @@ typedef struct {
     const uint32_t *spirv; uint64_t words; uint32_t local[3], in_mask, out_mask;
     GfxShaderIo in[32]; uint32_t in_guard; GfxShaderIo out[32]; uint32_t out_guard;
     int stage; const char *reflection;
-    int geometry_source_passthrough; unsigned geometry_position;   // read and written by reflect_spirv (gfx_shader.c)
+    int geometry_source_passthrough; unsigned geometry_position;
 } GfxShader;
 typedef struct { const GfxShader *vs, *fs; } VkPipeState;
 static struct { int vs_outs_all; } P;

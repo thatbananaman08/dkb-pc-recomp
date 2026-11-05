@@ -609,6 +609,13 @@ NVN_API(nvnCommandBufferSetPointSize) {
     r->kind = 6;
     memcpy(r->bytes, &s, sizeof s);
 }
+// void nvnCommandBufferSetAlphaRef(NVNcommandBuffer *cmd, float ref): recorded as bind-state kind 7 (spirv_alpha_test)
+NVN_API(nvnCommandBufferSetAlphaRef) {
+    p_bind_state *r = REC(cmd_of(c), OP_BIND_STATE, p_bind_state);
+    float s = arg_s(c, 0);
+    r->kind = 7;
+    memcpy(r->bytes, &s, sizeof s);
+}
 // void nvnCommandBufferBindVertexAttribState(NVNcommandBuffer *cmd, int n, const NVNvertexAttribState *states)
 NVN_API(nvnCommandBufferBindVertexAttribState) {
     cmd_t *o = cmd_of(c);
