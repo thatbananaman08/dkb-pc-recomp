@@ -305,6 +305,13 @@ cmd = ["{python}", "tools/xlate_smoke.py"]
 needs = ["xlate", "spirv_val"]
 
 [[test]]
+name = "cal-flow"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/cal_flow_test.py", "--translator", "{xlate}"]
+needs = ["xlate"]
+
+[[test]]
 name = "fragment-nonfinite-fixture"
 tier = 1
 area = "shaders"

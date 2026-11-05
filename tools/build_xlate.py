@@ -1,19 +1,21 @@
 """Build the shader translator: build/xlate/totk_xlate.exe (Ryujinx 1.3.2 + patches, NativeAOT, SPIR-V for Vulkan).
 
 Copies tools/vendor/ryujinx to build/xlate/ryujinx, applies the selected tools/xlate/patches there (tools/vendor stays
-byte-identical), then runs `dotnet publish`. The default applies patches 0001-0013 and 0015-0018, preserving the fast floating
+byte-identical), then runs `dotnet publish`. The default applies patches 0001-0013 and 0015-0019, preserving the fast floating
 min/max/clamp operations. Patch 0015 makes runtime storage-candidate resolution available only to explicit version-1
 NVN 2 compute requests; missing/version-0 requests retain the legacy pass. --defined-float-minmax also applies 0014's integer selection and numeric constant folding;
-this adds shader ALU work and has no established game visual or frame-time benefit. Needs the .NET 10 SDK, the MSVC build
+this adds shader ALU work and has no established game visual or frame-time benefit. --force-fmz also applies 0020, forcing
+Maxwell FMZ (0 x anything = 0) on every FP32 multiply. This is a broad testing workaround for GPU faults, not a fix; it
+has its own translator identity and must not be used as the default. Needs the .NET 10 SDK, the MSVC build
 tools and vswhere.exe (docs/building.md). Run with .venv. On Linux it builds build/xlate/totk_xlate for linux-x64, which
 NativeAOT links with the system's clang (no MSVC); NativeAOT builds for the OS it runs on only.
 
 Next to the exe it writes totk_xlate.id: the translator identity, a sha256 over everything the build reads (this script,
 Program.cs, the csproj, the selected patches, the vendor tree). runtime/gfx_shader.c puts it into every shader cache key, so a
 translator change re-keys the cache without a hand-made KEY_VERSION bump. --id-only writes it for the exe already built
-(the caller vouches that the exe matches the sources and must use the same --defined-float-minmax setting).
+(the caller vouches that the exe matches the sources and must use the same translator options).
 
-  python tools/build_xlate.py [--defined-float-minmax] [--id-only] [--out DIR]
+  python tools/build_xlate.py [--defined-float-minmax] [--force-fmz] [--id-only] [--out DIR]
 
 --out builds into DIR instead of build/xlate (a task build dir: totk.exe takes the translator next to it).
 """
@@ -36,6 +38,7 @@ WIN = os.name == "nt"
 EXE = "totk_xlate.exe" if WIN else "totk_xlate"
 VSWHERE_DIR = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer"
 DEFINED_FLOAT_MINMAX_PATCH = "0014-numeric-float-minmax-and-saturation.patch"
+FORCE_FMZ_PATCH = "0020-force-fmz.patch"
 
 
 def tree_hashes(base: Path) -> dict[str, str]:
@@ -95,24 +98,25 @@ def verify_vendor() -> None:
     print(f"vendor identical to MNG: {len(ours)} files")
 
 
-def selected_patches(*, defined_float_minmax: bool = False) -> list[Path]:
+def selected_patches(*, defined_float_minmax: bool = False, force_fmz: bool = False) -> list[Path]:
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 18:
-        sys.exit(f"expected 18 patches, found {len(patches)}")
-    optional = XLATE / "patches" / DEFINED_FLOAT_MINMAX_PATCH
-    if optional not in patches:
-        sys.exit(f"missing optional patch: {DEFINED_FLOAT_MINMAX_PATCH}")
-    return patches if defined_float_minmax else [p for p in patches if p != optional]
+    if len(patches) != 20:
+        sys.exit(f"expected 20 patches, found {len(patches)}")
+    optional = {XLATE / "patches" / DEFINED_FLOAT_MINMAX_PATCH: defined_float_minmax,
+                XLATE / "patches" / FORCE_FMZ_PATCH: force_fmz}
+    if not all(optional):
+        sys.exit("missing optional patch")
+    return [p for p in patches if optional.get(p, True)]
 
 
-def prepare_sources(*, defined_float_minmax: bool = False) -> Path:
+def prepare_sources(*, defined_float_minmax: bool = False, force_fmz: bool = False) -> Path:
     src = BUILD / "ryujinx"
     if BUILD.exists():
         shutil.rmtree(BUILD / "ryujinx", ignore_errors=True)
     shutil.copytree(VENDOR, src)
     for junk in list(src.glob("src/*/obj")) + list(src.glob("src/*/bin")):
         shutil.rmtree(junk)
-    for patch in selected_patches(defined_float_minmax=defined_float_minmax):
+    for patch in selected_patches(defined_float_minmax=defined_float_minmax, force_fmz=force_fmz):
         # git apply works outside a repository when given a directory; --check first so a failure names the patch.
         for extra in (["--check"], []):
             r = subprocess.run(
@@ -125,11 +129,11 @@ def prepare_sources(*, defined_float_minmax: bool = False) -> Path:
     return src
 
 
-def identity(*, defined_float_minmax: bool = False) -> str:
+def identity(*, defined_float_minmax: bool = False, force_fmz: bool = False) -> str:
     """sha256 over the translator's inputs, in a fixed order: path and content hash of each file."""
     h = hashlib.sha256()
     files = [Path(__file__).resolve(), XLATE / "Program.cs", XLATE / "totk_xlate.csproj",
-             *selected_patches(defined_float_minmax=defined_float_minmax)]
+             *selected_patches(defined_float_minmax=defined_float_minmax, force_fmz=force_fmz)]
     for f in files:
         h.update(f"{f.name}\0{hashlib.sha256(f.read_bytes()).hexdigest()}\n".encode())
     for rel, digest in tree_hashes(VENDOR).items():
@@ -137,8 +141,8 @@ def identity(*, defined_float_minmax: bool = False) -> str:
     return h.hexdigest()
 
 
-def write_identity(exe: Path, *, defined_float_minmax: bool = False) -> None:
-    ident = identity(defined_float_minmax=defined_float_minmax)
+def write_identity(exe: Path, *, defined_float_minmax: bool = False, force_fmz: bool = False) -> None:
+    ident = identity(defined_float_minmax=defined_float_minmax, force_fmz=force_fmz)
     exe.with_suffix(".id").write_text(ident + "\n", encoding="ascii")
     print(f"translator identity {ident[:16]} -> {exe.with_suffix('.id')}")
 
@@ -149,6 +153,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, help="build directory instead of build/xlate")
     parser.add_argument("--defined-float-minmax", action="store_true",
                         help="opt in to numeric NaN/signed-zero min/max/SAT via integer selection (more shader ALU work)")
+    parser.add_argument("--force-fmz", action="store_true",
+                        help="testing workaround: force Maxwell FMZ on every FP32 multiply (not a fix)")
     parser.add_argument("--llvm", type=Path, help="Linux: an LLVM directory whose bin/clang and lld link the exe")
     parser.add_argument("--sysroot", type=Path, help="Linux: link against this sysroot's glibc instead of the host's "
                                                      "(tools/make_release_linux.py)")
@@ -157,7 +163,7 @@ def main() -> None:
         global BUILD
         BUILD = a.out.resolve()
     if a.id_only:
-        write_identity(BUILD / EXE, defined_float_minmax=a.defined_float_minmax)
+        write_identity(BUILD / EXE, defined_float_minmax=a.defined_float_minmax, force_fmz=a.force_fmz)
         return
     started = time.time()
     dotnet = shutil.which("dotnet")
@@ -170,7 +176,7 @@ def main() -> None:
         env["PATH"] = str(VSWHERE_DIR) + os.pathsep + env["PATH"]
 
     verify_vendor()
-    src = prepare_sources(defined_float_minmax=a.defined_float_minmax)
+    src = prepare_sources(defined_float_minmax=a.defined_float_minmax, force_fmz=a.force_fmz)
     work = BUILD / "xlate"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
@@ -191,7 +197,7 @@ def main() -> None:
         sys.exit("dotnet publish failed")
     exe = BUILD / EXE
     shutil.copy2(out / EXE, exe)
-    write_identity(exe, defined_float_minmax=a.defined_float_minmax)
+    write_identity(exe, defined_float_minmax=a.defined_float_minmax, force_fmz=a.force_fmz)
     print(f"built {exe} ({exe.stat().st_size / 1e6:.1f} MB) in {time.time() - started:.0f} s")
 
 

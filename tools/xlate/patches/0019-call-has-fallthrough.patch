@@ -1,0 +1,12 @@
+--- a/src/Ryujinx.Graphics.Shader/Decoders/Decoder.cs
++++ b/src/Ryujinx.Graphics.Shader/Decoders/Decoder.cs
+@@ -500,6 +500,8 @@ namespace Ryujinx.Graphics.Shader.Decoders
+ 
+         public static bool IsUnconditionalBranch(ref InstOp op)
+         {
+-            return IsUnconditional(ref op) && op.Props.HasFlag(InstProps.Bra);
++            // CAL has Bra only so the decoder discovers its target. It returns to the next instruction,
++            // so an unpredicated call must retain that fall-through edge.
++            return IsUnconditional(ref op) && op.Props.HasFlag(InstProps.Bra) && op.Name != InstName.Cal;
+         }
+ 
