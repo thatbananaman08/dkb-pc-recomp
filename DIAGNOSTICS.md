@@ -48,6 +48,13 @@ names it from the exit code.
 On `VK_ERROR_DEVICE_LOST` the runtime logs what `VK_EXT_device_fault` reports, when the driver supports it
 (`runtime/vk_device.c` vk_device_fault_report): its description, the faulting addresses and the vendor codes.
 
+## Which code opens a file
+
+`DKB_FS_BACKTRACE=<text>` logs, for the first 64 RomFS opens whose path contains text, the open and the guest call
+stack (`fs backtrace:` lines; `runtime/romfs.c` fs_backtrace), independently of `TOTK_TRACE=fs`. Files the game
+streams (stages, models) are opened on its resource loader thread, so their stacks end in the loader; the code that
+asked for the file posted a request earlier.
+
 ## Crash reproduction and frame history
 
 `TOTK_FLIGHT=1` enables a bounded in-memory frame history; F8 requests a dump, and `TOTK_FLIGHT_AT` accepts frame numbers for unattended runs. It can also trigger on slow frames. See `runtime/flight.c` for ring size, thumbnail and trigger settings. Dump files are not automatically retained or pruned. This is not a crash handler: it may not finish writing after a crash or device loss. Preserve logs and any existing completed capture, exception information and reproduction steps separately; never infer that a GPU capture completed from a crash alone.

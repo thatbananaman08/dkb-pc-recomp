@@ -21,12 +21,22 @@ skip_world = 5        # seconds of game time left out at the start (the scene lo
 perf = "SLOW"         # fail on a SLOW verdict; "HITCHY" fails on short dips too; leave it out to not judge speed
 max_black = 0.10      # fail when more of the last frame below the HUD is near-black
 hud_band = 0.15       # the top share of the frame that holds the HUD
-min_hud_bright = 0.005  # under this the last frame is not gameplay (a loading screen), and is not judged
+min_hud_bright = 0.005  # under this the last frame is not gameplay (a black loading screen), and is not judged;
+                        # a bright sky passes it too, so outdoors it does not tell gameplay from a bright menu
+warp = "HillLevelStage" # optional: start in this stage instead of the save's (tools/save_warp.py)
 
 [variants.native_gs]  # --ab native_gs alternates these
 off = { DKB_NATIVE_GS = "0" }
 on = { DKB_NATIVE_GS = "1" }
 ```
+
+## Another area without another save
+
+`warp = "<stage>"` in the file (or `--warp <stage>` on the command line) starts each run in that stage: the runner
+rewrites the stage in the run's copy of the save with `tools/save_warp.py`. `--sweep <regex>` runs once per matching
+stage (`'LevelStage$'`: the 20 layers). `python tools/save_warp.py --stages` lists the names. Measured on 1.0.0: the
+tutorial-cave save warped to `HillLevelStage` loads that stage and reaches gameplay. The source save's progress comes
+along, so a later stage may not start as real play would; for those, a real save from that point is still better.
 
 ## The save
 

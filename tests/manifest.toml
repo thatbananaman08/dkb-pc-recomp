@@ -89,6 +89,12 @@ area = "tools"
 cmd = ["{python}", "tests/scenario_test.py"]
 
 [[test]]
+name = "save-warp"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/save_warp_test.py"]
+
+[[test]]
 name = "installer"
 tier = 0
 area = "installer"

@@ -47,7 +47,17 @@ python tools/scenario.py tutorial-cave                            one run with b
 python tools/scenario.py tutorial-cave --repeat 3                 three runs
 python tools/scenario.py tutorial-cave --ab native_gs --repeat 2  off, on, off, on
 python tools/scenario.py tutorial-cave --build build/<other> --env TOTK_VK_VALIDATION=1
+python tools/scenario.py tutorial-cave --warp HillLevelStage             start in another stage (any of the 232)
+python tools/scenario.py tutorial-cave --sweep 'LevelStage$'             once per layer: the 20 main stages
+python tools/save_warp.py --stages                                       the stage names
 ```
+
+**One save reaches every area.** `--warp <stage>` rewrites the stage in that run's copy of the save
+(`tools/save_warp.py`: three fixed fields of `progress.sav`, checked before anything is written); the private save in
+`build/saves/` is never changed. `--sweep <regex>` runs the scenario once per matching stage and combines with `--ab`
+and `--repeat`. The warped game keeps the source save's progress, items and story flags, so a stage it has not reached
+may start as unvisited or differently from real play; a stage that will not load from a warp is itself worth a look.
+The first run in a stage translates its shaders, so judge its speed on a second run.
 
 Each run prints one line: PASS or FAIL, how it ended, the perf verdict with the cause of any major slowdown, the mean
 frame rate, and the near-black share of the last frame. Its folder `build/scenarios/<stamp>-<name>/<variant>-<n>/` has
@@ -64,7 +74,7 @@ frame rate, and the near-black share of the last frame. Its folder `build/scenar
 
 | Check failure | Meaning |
 |---|---|
-| `not in the scene at the end` | the last frame has no HUD: still a loading screen or a menu. The run is not judged; give it more time with `--seconds`. On a busy machine loading takes longer. |
+| `not in the scene at the end` | the top band of the last frame has no bright pixels: still a black loading screen or a fade. The run is not judged; give it more time with `--seconds`. On a busy machine loading takes longer. The check only catches dark screens: a bright sky fills the band too, so in outdoor stages it always passes. |
 | `near-black N% > M%` | the last frame is mostly black below the HUD: the black destructible terrain (#45), or a missing pass |
 | `perf SLOW` | a major slowdown (see the next section) |
 
@@ -106,7 +116,10 @@ A slowdown is only real when it repeats on a quiet machine. Compare against a ba
 
 ## Making a scenario
 
-A scenario is `tests/scenarios/<name>.toml` plus a private save. See `tests/scenarios/README.md`.
+A scenario is `tests/scenarios/<name>.toml` plus a private save. See `tests/scenarios/README.md`. For another area you
+usually need no new save: give the scenario `warp = "<stage>"` (or run with `--warp`). To find which game code opens a
+file, run with `--env DKB_FS_BACKTRACE=<part of the path>`: the log gets the guest call stack of the first 64 matching
+opens (`fs backtrace:` lines). Most stage files are opened by the resource loader thread, whose stack ends in the loader.
 
 ## Rules for changes
 

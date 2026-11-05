@@ -5,6 +5,8 @@
     python tools/scenario.py tutorial-cave --repeat 3       three runs
     python tools/scenario.py tutorial-cave --ab native_gs   variants of the scenario, alternating: off, on, off, on, ...
     python tools/scenario.py tutorial-cave --build build/dkb100-pr67 --env TOTK_VK_VALIDATION=1
+    python tools/scenario.py tutorial-cave --warp HillLevelStage    start in another stage (tools/save_warp.py)
+    python tools/scenario.py tutorial-cave --sweep 'LevelStage$'    once per matching stage (the 20 layers)
 
 A scenario is tests/scenarios/<name>.toml: which private save to start from, the scripted input that gets from the title
 screen into it, how long to run, and what must hold afterwards. The save itself is never in the repository: it is the
@@ -55,6 +57,7 @@ WIN = os.name == 'nt'
 GAME_EXES = ('dkb.exe', 'totk.exe') if WIN else ('dkb', 'totk')
 sys.path.insert(0, str(ROOT / 'tools'))
 import perf_check  # noqa: E402
+import save_warp  # noqa: E402
 
 SKIP = 77
 BUSY_PRIVATE_MIB = 1024      # another program with this much private memory makes the machine busy
@@ -193,15 +196,19 @@ def black_share(png, hud_band, threshold=8):
     return frame_stats(png, hud_band, threshold)[0]
 
 
-def run_once(s, exe, out, env_extra, args):
+def run_once(s, exe, out, env_extra, args, warp=None):
     out.mkdir(parents=True)
     prof = out / 'profile'
     shutil.copytree(save_dir(s), prof)
+    warp = warp or args.warp or s.get('warp')
+    if warp:   # this run's profile copy starts in another stage (tools/save_warp.py); the private save is unchanged
+        save_warp.warp_profile(prof, warp)
     env = dict(os.environ)
     env['TOTK_INPUT_SCRIPT'] = str(ROOT / s['input'])
-    env['TOTK_TRACE'] = ','.join(sorted(set(filter(None, env.get('TOTK_TRACE', '').split(',') + ['perf']))))
     env.update({k: str(v) for k, v in s['env'].items()})
     env.update(env_extra)
+    # perf is always traced (the perf verdict needs it); categories asked for here or by the caller are added to it.
+    env['TOTK_TRACE'] = ','.join(sorted(set(filter(None, env.get('TOTK_TRACE', '').split(',') + ['perf']))))
     seconds = args.seconds or s['seconds']
     cmd = [str(exe), '--profile', str(prof), '--seconds', str(seconds), '--shot', str(out / 'last.png')]
     limit = seconds * 6 + 180
@@ -253,7 +260,7 @@ def run_once(s, exe, out, env_extra, args):
     if not args.keep_profile:
         shutil.rmtree(prof, ignore_errors=True)
     busy = busy_reasons(m)
-    r = dict(scenario=s['name'], variant=out.name, env=env_extra, exe=str(exe), seconds=seconds, wall_s=round(wall, 1),
+    r = dict(scenario=s['name'], variant=out.name, warp=warp, env=env_extra, exe=str(exe), seconds=seconds, wall_s=round(wall, 1),
              exit_code=code, ending=kind, ending_detail=detail, perf=perf['verdict'], fps=perf['fps'],
              slow_windows=perf['slow_windows'], worst_frame_ms=perf['worst_ms'],
              major_episode_causes=sorted({e['cause'] for e in perf['episodes'] if e['major']}),
@@ -286,6 +293,10 @@ def main(argv=None):
     ap.add_argument('--seconds', type=float, help="override the scenario's game time")
     ap.add_argument('--keep-profile', action='store_true', help='keep the run\'s profile copy (for a save to inspect)')
     ap.add_argument('--force', action='store_true', help='run even while another game process is running')
+    ap.add_argument('--sweep', metavar='REGEX', help='run once per stage whose name matches, e.g. LevelStage$ for the '
+                    '20 layers (combines with --ab and --repeat)')
+    ap.add_argument('--warp', metavar='STAGE', help="start each run in this stage instead of the save's "
+                    '(tools/save_warp.py; `python tools/save_warp.py --stages` lists them)')
     a = ap.parse_args(argv)
 
     if a.list:
@@ -317,9 +328,28 @@ def main(argv=None):
         table = s['variants'].get(a.ab)
         if not table:
             ap.error(f'scenario {s["name"]} has no variants "{a.ab}" (has: {", ".join(s["variants"]) or "none"})')
-        variants = [(name, {**extra, **{k: str(v) for k, v in env.items()}}) for name, env in table.items()]
+        variants = [(name, {**extra, **{k: str(v) for k, v in env.items()}}, None) for name, env in table.items()]
     else:
-        variants = [('run', extra)]
+        variants = [('run', extra, None)]
+    warp = a.warp or s.get('warp')
+    known = save_warp.stages() if warp or a.sweep else None
+    if warp and known is not None and warp not in known:
+        close = [k for k in known if warp.lower() in k.lower()][:8]
+        print(f'scenario: no stage "{warp}" in the RomFS' + (f' (did you mean {", ".join(close)}?)' if close else ''))
+        return 2
+    if a.sweep:   # one variant per matching stage, each with every --ab variant
+        if known is None:
+            print('scenario: --sweep needs the RomFS index (build/extracted/dkb100/romfs/index.json) for the stage list')
+            return 2
+        try:
+            pick = [k for k in known if re.search(a.sweep, k)]
+        except re.error as e:
+            ap.error(f'--sweep: {e}')
+        if not pick:
+            print(f'scenario: no stage matches {a.sweep!r} (python tools/save_warp.py --stages lists them)')
+            return 2
+        variants = [(stage if name == 'run' else f'{stage}-{name}', env, stage)
+                    for stage in pick for name, env, _ in variants]
     m = machine_state()
     if m['games'] and not a.force:
         print('scenario: another game process is running (' + ', '.join(f'{g["name"]} {g["id"]}' for g in m['games'])
@@ -335,13 +365,14 @@ def main(argv=None):
           f'game time with {_rel(exe)}; results in '
           f'{_rel(base)}')
     results = []
+    width = max(12, max(len(v[0]) for v in variants) + 2)
     for n in range(1, a.repeat + 1):
-        for name, env in variants:
-            r = run_once(s, exe, base / f'{name}-{n}', env, a)
+        for name, env, stage in variants:
+            r = run_once(s, exe, base / f'{name}-{n}', env, a, stage)
             results.append(r)
             causes = f' ({", ".join(r["major_episode_causes"])})' if r['major_episode_causes'] else ''
             fps = '-' if r['fps'] is None else f'{r["fps"]:.1f}'
-            print(f'  {r["variant"]:12} {"PASS" if r["ok"] else "FAIL":4}  {r["ending"]:18} perf {r["perf"]:7}{causes:16}'
+            print(f'  {r["variant"]:{width}} {"PASS" if r["ok"] else "FAIL":4}  {r["ending"]:18} perf {r["perf"]:7}{causes:16}'
                   f' {fps:>5} fps  near-black {_pct(r["black_share"]):>6}  {r["wall_s"]:.0f} s'
                   + (f'  [{r["ending_detail"]}]' if r['ending_detail'] else '')
                   + ('' if r['timings_reliable'] else '  [busy machine]'))
@@ -351,12 +382,12 @@ def main(argv=None):
                    ok=all(r['ok'] for r in results), timings_reliable=all(r['timings_reliable'] for r in results))
     (base / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
     if len(variants) > 1:
-        print('\n  variant      runs  pass  median fps  median near-black')
-        for name, _ in variants:
+        print(f'\n  {"variant":{width - 2}} runs  pass  median fps  median near-black')
+        for name, _, _ in variants:
             rs = [r for r in results if r['variant'].rsplit('-', 1)[0] == name]
             fps = sorted(r['fps'] for r in rs if r['fps'] is not None)
             blk = sorted(r['black_share'] for r in rs if r['black_share'] is not None)
-            print(f'  {name:12} {len(rs):4} {sum(r["ok"] for r in rs):5} '
+            print(f'  {name:{width - 2}} {len(rs):4} {sum(r["ok"] for r in rs):5} '
                   f'{fps[len(fps) // 2] if fps else float("nan"):11.1f} {_pct(blk[len(blk) // 2] if blk else None):>18}')
     if not summary['timings_reliable']:
         print('  timings unreliable: other programs were using the machine (result.json "busy_machine")')
