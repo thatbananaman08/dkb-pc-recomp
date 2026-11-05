@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('build_xlate', ROOT / 'tools/build_xlate.py')
 builder = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(builder)
-OPTIONAL = '0014-numeric-float-minmax-and-saturation.patch'
+OPTIONAL = ('0014-numeric-float-minmax-and-saturation.patch', '0020-force-fmz.patch')
 
 
 class TranslatorOptions(unittest.TestCase):
@@ -30,11 +30,9 @@ class TranslatorOptions(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.work = Path(self.temp.name)
 
-    def prepare(self, opt_in=False):
+    def prepare(self, opt_in=False, force_fmz=False):
         with patch.object(builder, 'BUILD', self.work), contextlib.redirect_stdout(io.StringIO()):
-            if opt_in:
-                return builder.prepare_sources(defined_float_minmax=True)
-            return builder.prepare_sources()
+            return builder.prepare_sources(defined_float_minmax=opt_in, force_fmz=force_fmz)
 
     def test_default_keeps_fast_shader_operations(self):
         source = self.prepare()
@@ -54,8 +52,18 @@ class TranslatorOptions(unittest.TestCase):
         self.assertIn('context.Bitcast(isFP64 ? context.TypeFP64() : context.TypeFP32(), selected)', instructions)
         self.assertIn('float.MinNumber(float.MaxNumber(x, y), z)', folding)
 
+    def test_fmz_is_opt_in_and_changes_multiplication(self):
+        plain = self.prepare()
+        name = 'src/Ryujinx.Graphics.Shader/Translation/EmitterContextInsts.cs'
+        plain_instructions = (plain / name).read_text()
+        forced = self.prepare(force_fmz=True)
+        self.assertNotIn('private static bool ForceFmz(', plain_instructions)
+        self.assertIn('private static bool ForceFmz(', (forced / name).read_text())
+        self.assertIn('return true;', (forced / 'src/Ryujinx.Graphics.Shader/IGpuAccessor.cs').read_text())
+
     def test_modes_cannot_share_a_cache_identity(self):
         self.assertNotEqual(builder.identity(), builder.identity(defined_float_minmax=True))
+        self.assertNotEqual(builder.identity(), builder.identity(force_fmz=True))
 
     def test_unused_patch_does_not_change_default_identity(self):
         xlate = self.work / 'xlate'
@@ -63,7 +71,7 @@ class TranslatorOptions(unittest.TestCase):
         with patch.object(builder, 'XLATE', xlate):
             fast = builder.identity()
             defined = builder.identity(defined_float_minmax=True)
-            optional = xlate / 'patches' / OPTIONAL
+            optional = xlate / 'patches' / OPTIONAL[0]
             optional.write_bytes(optional.read_bytes() + b'\n')
             self.assertEqual(fast, builder.identity())
             self.assertNotEqual(defined, builder.identity(defined_float_minmax=True))
@@ -79,15 +87,28 @@ class TranslatorOptions(unittest.TestCase):
             self.assertNotEqual(fast, builder.identity())
             self.assertNotEqual(defined, builder.identity(defined_float_minmax=True))
 
+    def test_fmz_patch_only_changes_fmz_identity(self):
+        xlate = self.work / 'xlate'
+        shutil.copytree(builder.XLATE, xlate)
+        with patch.object(builder, 'XLATE', xlate):
+            fast = builder.identity()
+            forced = builder.identity(force_fmz=True)
+            optional = xlate / 'patches' / OPTIONAL[1]
+            optional.write_bytes(optional.read_bytes() + b'\n')
+            self.assertEqual(fast, builder.identity())
+            self.assertNotEqual(forced, builder.identity(force_fmz=True))
+
     def test_id_only_cli_uses_the_selected_mode(self):
-        for opt_in in (False, True):
+        for opt_in, fmz in ((False, False), (True, False), (False, True)):
             command = [sys.executable, '-B', str(ROOT / 'tools/build_xlate.py'), '--id-only', '--out', str(self.work)]
             if opt_in:
                 command.append('--defined-float-minmax')
+            if fmz:
+                command.append('--force-fmz')
             result = subprocess.run(command, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((self.work / 'totk_xlate.id').read_text().strip(),
-                             builder.identity(defined_float_minmax=opt_in))
+                             builder.identity(defined_float_minmax=opt_in, force_fmz=fmz))
 
 
 if __name__ == '__main__':

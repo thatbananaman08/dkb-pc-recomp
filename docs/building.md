@@ -81,6 +81,9 @@ of them.
    .venv\Scripts\python tools\build_xlate.py
    ```
 
+   `--force-fmz` builds a separate translator that forces Maxwell FMZ (zero multiplied by anything is zero) for every
+   FP32 multiply. It is a broad workaround for testing GPU faults, not a fix; do not use it as the normal build.
+
 5. Lift the modules to C, write the RomFS overlay (the frame-rate fix), then compile and link
    `build\<ver>\totk.exe`:
 
