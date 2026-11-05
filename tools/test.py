@@ -363,6 +363,98 @@ def write_junit(path, results, tests):
     Path(path).write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
+def stale_translator(exe):
+    """Why the translator exe is older than its sources (tools/xlate, the vendored Ryujinx, build_xlate.py), or None.
+    A test run against a stale translator tests the old shader code: after a merge or a patch, translator tests then
+    fail (or pass) for the wrong reason."""
+    if not exe or not Path(exe).is_file():
+        return None
+    built = Path(exe).stat().st_mtime
+    newest, which = 0.0, None
+    for rel in ('tools/xlate', 'tools/vendor/ryujinx', 'tools/build_xlate.py'):
+        p = ROOT / rel
+        for f in ([p] if p.is_file() else p.rglob('*') if p.is_dir() else []):
+            if f.is_file() and '__pycache__' not in f.parts and f.stat().st_mtime > newest:
+                newest, which = f.stat().st_mtime, f
+    if which is not None and newest > built + 2:
+        return (f'the translator {Path(exe)} is older than {which.relative_to(ROOT)}: its tests check old shader code. '
+                f'Rebuild it (python tools/build_xlate.py) or point at a newer one (--set xlate=build/<name>/totk_xlate.exe)')
+    return None
+
+
+# ---------------------------------------------------------------- --changed: the tests a change can affect
+
+# The source paths each area's tests cover (fnmatch on repository-relative paths with /). A test also covers the files
+# its command names and the fixtures beside its script (tests/<stem>*), and the ones its manifest entry lists in
+# `paths`. Keep these broad: a test run too often costs seconds, one skipped wrongly costs a regression.
+AREA_PATHS = {
+    'cpu': ['recomp/*', 'runtime/cpu.h', 'runtime/simd.h', 'runtime/excl.c', 'runtime/dispatch*', 'tests/diff/*',
+            'tools/spin_waits.py'],
+    'os': ['runtime/kernel*', 'runtime/ipc*', 'runtime/svc*', 'runtime/ov_*', 'runtime/fs*', 'runtime/romfs*',
+           'runtime/cfg*', 'runtime/main.c', 'runtime/loader*', 'runtime/hostfn*', 'runtime/host.h', 'runtime/platform/*',
+           'runtime/input*', 'runtime/boot*'],
+    'audio': ['runtime/audio*', 'runtime/audren*', 'runtime/ov_codec*'],
+    'nvn': ['runtime/nvn*', 'runtime/gfx*', 'runtime/vk_exec*'],
+    'geometry': ['runtime/vk_exec_draw.c', 'runtime/gfx_shader.c', 'runtime/nvn_geometry*', 'runtime/nvn2_lower*',
+                 'runtime/third_party/eglantine/*', 'tools/xlate/*', 'tools/vendor/ryujinx/*', 'tools/build_xlate.py'],
+    'shaders': ['tools/xlate/*', 'tools/vendor/ryujinx/*', 'tools/build_xlate.py', 'runtime/gfx_shader.c',
+                'runtime/nvn2_lower*', 'runtime/third_party/eglantine/*', 'tools/*shader*', 'tools/inspect_spirv*',
+                'tools/fragment_output*'],
+    'descriptors': ['runtime/vk_*', 'runtime/gfx*'],
+    'gfx': ['runtime/vk_*', 'runtime/gfx*', 'runtime/tex*', 'runtime/astc*', 'runtime/stencil*'],
+    'tools': ['tools/*.py', 'tools/input/*', 'tests/scenarios/*'],
+    'installer': ['installer/*', 'tools/build_game.py', 'tools/make_release*.py'],
+    'scenario': ['runtime/*', 'tools/xlate/*', 'tools/vendor/ryujinx/*', 'tools/scenario.py', 'tools/save_warp.py',
+                 'tools/perf_check.py', 'tests/scenarios/*', 'tools/input/*'],
+}
+# Changes that no test checks: documents and CI files. Anything else that matches no area or test runs everything.
+UNTESTED = ['*.md', 'docs/*', '.github/*', 'LICENSE*', '.gitignore', '.gitattributes', 'test.local.toml']
+# A change to the runner itself runs everything.
+RUNNER = ['tools/test.py', 'tests/manifest.toml']
+
+
+def changed_files(rev):
+    """Repository-relative paths changed since rev (HEAD by default): committed, staged, unstaged and untracked."""
+    def git(*a):
+        p = subprocess.run(['git', *a], cwd=ROOT, capture_output=True, text=True)
+        if p.returncode:
+            sys.exit(f'test.py: git {" ".join(a)} failed: {p.stderr.strip()}')
+        return [line.strip() for line in p.stdout.splitlines() if line.strip()]
+    return sorted(set(git('diff', '--name-only', rev) + git('ls-files', '--others', '--exclude-standard')))
+
+
+def covers(t):
+    """The path patterns test t covers: its area's, its own files and fixtures, and its manifest `paths`."""
+    pats = list(AREA_PATHS.get(t['area'], [])) + list(t.get('paths', []))
+    for part in t['cmd']:
+        if PLACEHOLDER.search(part) or not ('/' in part and part.endswith(('.py', '.c', '.cpp', '.h'))):
+            continue
+        pats.append(part)
+        stem = Path(part).stem.removesuffix('_test').removesuffix('_check')
+        if part.startswith('tests/'):
+            pats.append(f'tests/{stem}*')
+    return pats
+
+
+def select_changed(tests, files):
+    """(tests to run, reason) for a change touching files. All tests when the runner or an unmapped file changed."""
+    hit = lambda f, pats: any(fnmatch.fnmatchcase(f, p) for p in pats)
+    if not files:
+        return [], 'nothing changed'
+    if any(hit(f, RUNNER) for f in files):
+        return list(tests), 'the test runner or the manifest changed: running everything'
+    relevant = [f for f in files if not hit(f, UNTESTED)]
+    if not relevant:
+        return [], 'only documents or CI files changed'
+    cov = {t['name']: covers(t) for t in tests}
+    unmapped = [f for f in relevant if not any(hit(f, c) for c in cov.values())]
+    if unmapped:
+        shown = ', '.join(unmapped[:5]) + (f' and {len(unmapped) - 5} more' if len(unmapped) > 5 else '')
+        return list(tests), f'no test is mapped to {shown}: running everything (map it in tools/test.py AREA_PATHS)'
+    picked = [t for t in tests if any(hit(f, cov[t['name']]) for f in relevant)]
+    return picked, f'{len(relevant)} changed file(s) select {len(picked)} test(s)'
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('names', nargs='*', help='test names or fnmatch globs (default: all)')
@@ -372,6 +464,9 @@ def main():
                          'tools, installer)')
     ap.add_argument('--set', action='append', default=[], metavar='NAME=PATH', help='tool path override')
     ap.add_argument('--jobs', '-j', type=int, default=max(1, (os.cpu_count() or 4) // 2))
+    ap.add_argument('--changed', nargs='?', const='HEAD', metavar='REV',
+                    help='only the tests the changes since REV (default HEAD, with uncommitted and untracked files) can '
+                         'affect; see AREA_PATHS')
     ap.add_argument('--list', action='store_true', help='list the selected tests with their state, run nothing')
     ap.add_argument('--tools', action='store_true', help='show where each tool was found, run nothing')
     ap.add_argument('--junit', type=Path, help='also write JUnit XML here')
@@ -400,6 +495,11 @@ def main():
         for n in args.names:
             if not any(fnmatch.fnmatchcase(t['name'], n) for t in tests):
                 sys.exit(f'test.py: no test matches {n!r} (see --list)')
+    if args.changed:
+        selected, why = select_changed(selected, changed_files(args.changed))
+        print(f'--changed {args.changed}: {why}')
+        if not selected:
+            return 0
     if not selected:
         sys.exit('test.py: no tests selected')
 
@@ -427,6 +527,9 @@ def main():
     gpu_desc = ', '.join(f'{d["name"]} (driver {d["driver"]})' for d in gpu) if gpu else (gpu_reason or 'not needed')
     print(f'DKB tests at {git_revision()}: {len(todo)} to run, {len(results)} skipped; tiers {args.tier}; '
           f'GPU: {gpu_desc}', flush=True)
+    old = stale_translator(tools.get('xlate')) if any('xlate' in t['tools'] for t in todo) else None
+    if old:
+        print(f'warning: {old}', flush=True)
 
     lock = threading.Lock()
     width = max(len(t['name']) for t in selected)

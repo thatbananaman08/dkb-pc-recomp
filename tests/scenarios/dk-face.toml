@@ -1,8 +1,13 @@
-# Tutorial cave save with the camera turned toward DK's face for the NaN dump.
-description = "tutorial cave from a save, camera turned toward DK's face for NaN evidence"
+# Tutorial cave save with the camera turned toward DK's face: the headlamp halo and black blot of #69/#70 were NaN from
+# a signed-byte tangent read as unsigned (fixed by #72). Measured on an RTX 5060: 24,708 and 4,857 NaN values over the
+# dumped images before the fix, 0 after.
+description = "tutorial cave from a save, camera turned toward DK's face; no NaN in the scene (#70)"
 save = "tutorial-cave"
 input = "tools/input/dkb-face-camera.txt"
 seconds = 100
 
 [checks]
 min_hud_bright = 0.005
+dump_frame = 4300     # the camera faces DK by then
+dump_passes = "30-45" # the scene passes (their numbers move a little between runs)
+max_nan = 0

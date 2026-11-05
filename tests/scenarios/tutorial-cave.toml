@@ -5,6 +5,9 @@ save = "tutorial-cave"
 input = "tools/input/dkb-title-to-save.txt"
 seconds = 75
 
+[env]
+DKB_NATIVE_GS = "1"   # the destructible terrain needs the native geometry stage (#45, #67); the variants override it
+
 [checks]
 min_fps = 50        # a 60-frame window under this is slow (tools/perf_check.py)
 hitch_ms = 100

@@ -95,6 +95,12 @@ area = "tools"
 cmd = ["{python}", "tests/save_warp_test.py"]
 
 [[test]]
+name = "fast-checks"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/fast_checks_test.py"]
+
+[[test]]
 name = "installer"
 tier = 0
 area = "installer"
@@ -512,6 +518,16 @@ cmd = ["{python}", "tests/diff/func.py", "--exefs", "{exefs}", "--modules", "mai
 needs = ["cc"]
 exclusive = true
 timeout = 3600
+
+[[test]]
+name = "diff-func-quick"
+tier = 3
+area = "cpu"
+# A fifth of diff-func's functions, for tools/check.py --standard: about a minute instead of four or five.
+cmd = ["{python}", "tests/diff/func.py", "--exefs", "{exefs}", "--modules", "main,sdk", "--functions", "80"]
+needs = ["cc"]
+exclusive = true
+timeout = 1200
 
 [[test]]
 name = "jumptables"

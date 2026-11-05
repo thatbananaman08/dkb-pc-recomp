@@ -5,16 +5,31 @@ with the project's Python, `.venv\Scripts\python` (Windows) or `.venv/bin/python
 under `build/`, which git ignores. Logs, screenshots, minidumps and saves hold game-derived data: they stay on your
 machine and never go into a commit, an issue or a pull request (see "Game content boundary" in `AGENTS.md`).
 
-## The three commands
+## Checking a change: three levels
+
+| Command | What it runs | Time |
+|---|---|---|
+| `python tools/check.py --quick` | the tests your change can affect (`tools/test.py --changed`), and the cave scenario | ~5 min |
+| `python tools/check.py --standard` | tests tiers 0-2, a short tier 3, the cave in three stages at once, DK's face | ~20-30 min |
+| `python tools/check.py --full` | tiers 0-3, the 20 layers twice, the face twice, native GS off and on | hours |
+
+Use `--quick` while working, `--standard` before a commit, `--full` before a pull request. Add `--build build/<name>`
+for the build you changed (the game steps use `build/dkb100` otherwise). It refuses to run the game steps on a build
+older than its source (`runtime/`, `recomp/`, the translator), because they would test old code; rebuild, or pass
+`--allow-stale-build` if you know why. Each step's log is in `build/check/<stamp>-<level>/`.
+
+The pieces it runs, for when you need one alone:
 
 | Command | What it answers | Time |
 |---|---|---|
-| `python tools/test.py` | Do the checks that need no game still pass? (tiers 0-2: Python, compiler, GPU) | ~3 min |
-| `python tools/test.py --tier 0-3` | Also the checks that read the dump or run the built game's probes | ~4 min, ~10 with the dump |
-| `python tools/scenario.py tutorial-cave` | Does the game load a save, run 75 s, keep its frame rate and draw the terrain? | ~2 min a run |
+| `python tools/test.py --changed` | the tests that cover the files changed since HEAD (committed, uncommitted, untracked) | seconds to minutes |
+| `python tools/test.py` | do the checks that need no game still pass? (tiers 0-2: Python, compiler, GPU) | ~3 min |
+| `python tools/test.py --tier 0-3` | also the checks that read the dump or run the built game's probes | ~10 min with the dump |
+| `python tools/scenario.py tutorial-cave` | does the game load a save, run 75 s and draw the terrain? | ~2 min a run |
 
-Run the first before and after every change. Run the second after a change to `runtime/`, `recomp/` or the translator.
-Run a scenario after a change that the game itself must show (rendering, performance, crashes).
+`--changed` maps each test's area to source paths (`AREA_PATHS` in `tools/test.py`) plus the test's own files. A change
+to the runner or the manifest, or to a file no area covers, runs everything and names the file; documents and CI files
+run nothing. When you add a source folder, map it there.
 
 ### Reading `tools/test.py`
 
@@ -49,6 +64,7 @@ python tools/scenario.py tutorial-cave --ab native_gs --repeat 2  off, on, off, 
 python tools/scenario.py tutorial-cave --build build/<other> --env TOTK_VK_VALIDATION=1
 python tools/scenario.py tutorial-cave --warp HillLevelStage             start in another stage (any of the 232)
 python tools/scenario.py tutorial-cave --sweep 'LevelStage$'             once per layer: the 20 main stages
+python tools/scenario.py tutorial-cave --sweep 'LevelStage$' --jobs 3    three games at once (up to 3; timings unreliable)
 python tools/save_warp.py --stages                                       the stage names
 ```
 
@@ -79,7 +95,7 @@ frame rate, and the near-black share of the last frame. Its folder `build/scenar
 | `perf SLOW` | a major slowdown (see the next section) |
 
 `[busy machine]` after a run means other programs used over 1 GiB of memory or commit memory was low. The picture and
-the crash checks still count; **the frame rates do not**. Close the other programs (editors, browsers, other games,
+the crash checks still count; **the frame rates do not**, so a scenario's speed check does not fail such a run. Close the other programs (editors, browsers, other games,
 builds) and rerun before you draw any conclusion about speed. A scenario will not start while another game process runs.
 
 ## Symptom to command

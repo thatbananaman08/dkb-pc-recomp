@@ -7,6 +7,7 @@
     python tools/scenario.py tutorial-cave --build build/dkb100-pr67 --env TOTK_VK_VALIDATION=1
     python tools/scenario.py tutorial-cave --warp HillLevelStage    start in another stage (tools/save_warp.py)
     python tools/scenario.py tutorial-cave --sweep 'LevelStage$'    once per matching stage (the 20 layers)
+    python tools/scenario.py tutorial-cave --sweep 'LevelStage$' --jobs 3   three games at once (timings unreliable)
     python tools/scenario.py tutorial-cave --repeat 2 --env TOTK_DUMP=4300 --env TOTK_DUMP_DIR={run}/dump
                                                          {run} in a value: that run's own folder
 
@@ -36,10 +37,11 @@ high share).
 
 Before each run the machine is checked: another game process running stops the run (two games share the GPU); other
 programs using more than 1 GiB of memory or less than 4 GiB of free commit memory mark the run as on a busy machine, and
-its timings as unreliable. The exit code is 0 when every run completed and every check held, 1 otherwise, 2 for a usage
+its timings as unreliable; a SLOW verdict then does not fail the run (parallel runs, --jobs, likewise). The exit code is 0 when every run completed and every check held, 1 otherwise, 2 for a usage
 or setup error, 77 when the scenario's private save is missing (tools/test.py reports that as a skip).
 """
 import argparse
+import concurrent.futures
 import datetime
 import json
 import os
@@ -47,6 +49,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -62,6 +65,8 @@ import perf_check  # noqa: E402
 import save_warp  # noqa: E402
 
 SKIP = 77
+STAGGER_S = 20             # seconds between the starts of parallel runs
+MAX_JOBS = 3               # games at once; more exhausts an 8 GiB GPU (tools/run_game.py found the same)
 BUSY_PRIVATE_MIB = 1024      # another program with this much private memory makes the machine busy
 MIN_FREE_COMMIT_GIB = 4.0    # less free commit memory than this makes it busy
 
@@ -219,6 +224,28 @@ def perf_fails(checks, verdict):
     return want == 'SLOW' and verdict == 'SLOW' or want == 'HITCHY' and verdict in ('SLOW', 'HITCHY')
 
 
+def dump_env(checks):
+    """The frame dump a scenario's checks ask for: dump_frame = N dumps that present into the run's dump/ folder,
+    dump_passes = "A-B" limits the copies to those passes (runtime/vk_dump.c, DIAGNOSTICS.md). --env overrides it."""
+    if 'dump_frame' not in checks:
+        return {}
+    env = {'TOTK_DUMP': str(checks['dump_frame']), 'TOTK_DUMP_DIR': '{run}/dump'}
+    if 'dump_passes' in checks:
+        env['DKB_DUMP_PASS'] = str(checks['dump_passes'])
+    return env
+
+
+def dump_nan(folder):
+    """NaN pixels over every image a frame dump copied (the "nan N" fields of its images.txt files); None without one."""
+    files = sorted(Path(folder).rglob('images.txt')) if Path(folder).is_dir() else []
+    if not files:
+        return None
+    total = 0
+    for f in files:
+        total += sum(int(n) for n in re.findall(r'\bnan (\d+)', f.read_text(encoding='utf-8', errors='replace')))
+    return total
+
+
 def run_once(s, exe, out, env_extra, args, warp=None):
     out.mkdir(parents=True)
     prof = out / 'profile'
@@ -226,7 +253,7 @@ def run_once(s, exe, out, env_extra, args, warp=None):
     warp = warp or args.warp or s.get('warp')
     if warp:   # this run's profile copy starts in another stage (tools/save_warp.py); the private save is unchanged
         save_warp.warp_profile(prof, warp)
-    env = run_env(s, env_extra, out, os.environ)
+    env = run_env(s, {**dump_env(s['checks']), **env_extra}, out, os.environ)
     seconds = args.seconds or s['seconds']
     cmd = [str(exe), '--profile', str(prof), '--seconds', str(seconds), '--shot', str(out / 'last.png')]
     limit = seconds * 6 + 180
@@ -261,7 +288,10 @@ def run_once(s, exe, out, env_extra, args, warp=None):
     failed = []
     if kind != 'completed':
         failed.append(kind)
-    if perf_fails(checks, perf['verdict']):
+    busy = busy_reasons(m)
+    # Speed counts only when the timings do: on a busy machine a SLOW verdict is reported, not failed.
+    perf_judged = not busy
+    if perf_judged and perf_fails(checks, perf['verdict']):
         failed.append(f'perf {perf["verdict"]}')
     if kind == 'completed' and perf['verdict'] == 'no data':
         failed.append('no perf data')
@@ -274,14 +304,20 @@ def run_once(s, exe, out, env_extra, args, warp=None):
             failed.append('no last frame to check')
         elif black > checks['max_black']:
             failed.append(f'near-black {black * 100:.1f}% > {checks["max_black"] * 100:.0f}%')
+    nan = dump_nan(out / 'dump') if 'dump_frame' in checks else None
+    if 'max_nan' in checks and kind == 'completed':
+        if nan is None:
+            failed.append(f'no frame dump (the run ended before frame {checks.get("dump_frame")}, or the dump failed)')
+        elif nan > checks['max_nan']:
+            failed.append(f'{nan} NaN pixels in the dumped frame > {checks["max_nan"]}')
     if not args.keep_profile:
         shutil.rmtree(prof, ignore_errors=True)
-    busy = busy_reasons(m)
-    r = dict(scenario=s['name'], variant=out.name, warp=warp, env=env_extra, exe=str(exe), seconds=seconds, wall_s=round(wall, 1),
+    r = dict(perf_judged=perf_judged,scenario=s['name'], variant=out.name, warp=warp, env=env_extra, exe=str(exe), seconds=seconds, wall_s=round(wall, 1),
              exit_code=code, ending=kind, ending_detail=detail, perf=perf['verdict'], fps=perf['fps'],
              slow_windows=perf['slow_windows'], worst_frame_ms=perf['worst_ms'],
              major_episode_causes=sorted({e['cause'] for e in perf['episodes'] if e['major']}),
-             black_share=black, hud_bright=hud, in_scene=in_scene, failed=failed, ok=not failed, busy_machine=busy,
+             black_share=black, hud_bright=hud, in_scene=in_scene, nan_pixels=nan, failed=failed, ok=not failed,
+             busy_machine=busy,
              timings_reliable=not busy, machine=m)
     (out / 'result.json').write_text(json.dumps(r, indent=2) + '\n', encoding='utf-8')
     return r
@@ -305,6 +341,9 @@ def main(argv=None):
     ap.add_argument('--list', action='store_true', help='list the scenarios and whether their save is present')
     ap.add_argument('--build', type=Path, default=ROOT / 'build' / 'dkb100', help='build folder with dkb.exe')
     ap.add_argument('--repeat', type=int, default=1, help='runs per variant (default 1)')
+    ap.add_argument('--jobs', '-j', type=int, default=1,
+                    help=f'games at once (default 1, at most {MAX_JOBS}); for crash, device-lost, NaN and picture checks: '
+                         'the runs are marked as having unreliable timings')
     ap.add_argument('--ab', metavar='VARIANTS', help='the scenario\'s [variants.<name>] table to alternate')
     ap.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='extra environment for every run')
     ap.add_argument('--seconds', type=float, help="override the scenario's game time")
@@ -341,6 +380,8 @@ def main(argv=None):
         if not sep:
             ap.error(f'--env needs KEY=VALUE, got {item!r}')
         extra[k] = v
+    if not 1 <= a.jobs <= MAX_JOBS:
+        ap.error(f'--jobs takes 1 to {MAX_JOBS}')
     if a.ab:
         table = s['variants'].get(a.ab)
         if not table:
@@ -381,20 +422,39 @@ def main(argv=None):
     print(f'scenario {s["name"]}: {s["description"]}\n  {len(variants) * a.repeat} runs of {a.seconds or s["seconds"]} s '
           f'game time with {_rel(exe)}; results in '
           f'{_rel(base)}')
-    results = []
     width = max(12, max(len(v[0]) for v in variants) + 2)
-    for n in range(1, a.repeat + 1):
-        for name, env, stage in variants:
-            r = run_once(s, exe, base / f'{name}-{n}', env, a, stage)
-            results.append(r)
-            causes = f' ({", ".join(r["major_episode_causes"])})' if r['major_episode_causes'] else ''
-            fps = '-' if r['fps'] is None else f'{r["fps"]:.1f}'
+    plan = [(name, env, stage, n) for n in range(1, a.repeat + 1) for name, env, stage in variants]
+    lock = threading.Lock()
+
+    def one(job, slot):
+        name, env, stage, n = job
+        if slot:   # stagger the start of parallel runs, so their loads and shader translation do not all collide
+            time.sleep(min(slot, a.jobs - 1) * STAGGER_S)
+        r = run_once(s, exe, base / f'{name}-{n}', env, a, stage)
+        if a.jobs > 1:   # runs that share the GPU and the CPU: their frame rates say nothing about speed
+            r['timings_reliable'] = False
+            r['perf_judged'] = False
+            r['busy_machine'] = r['busy_machine'] + [f'{a.jobs} runs in parallel']
+            r['failed'] = [f for f in r['failed'] if not f.startswith('perf ')]
+            r['ok'] = not r['failed']
+            (base / f'{name}-{n}' / 'result.json').write_text(json.dumps(r, indent=2) + '\n', encoding='utf-8')
+        causes = f' ({", ".join(r["major_episode_causes"])})' if r['major_episode_causes'] else ''
+        fps = '-' if r['fps'] is None else f'{r["fps"]:.1f}'
+        with lock:
             print(f'  {r["variant"]:{width}} {"PASS" if r["ok"] else "FAIL":4}  {r["ending"]:18} perf {r["perf"]:7}{causes:16}'
                   f' {fps:>5} fps  near-black {_pct(r["black_share"]):>6}  {r["wall_s"]:.0f} s'
                   + (f'  [{r["ending_detail"]}]' if r['ending_detail'] else '')
-                  + ('' if r['timings_reliable'] else '  [busy machine]'))
+                  + ('' if r['timings_reliable'] else '  [busy machine]'), flush=True)
             if r['failed']:
-                print(f'    failed: {", ".join(r["failed"])}')
+                print(f'    failed: {", ".join(r["failed"])}', flush=True)
+        return r
+
+    if a.jobs > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as pool:
+            futures = [pool.submit(one, job, i) for i, job in enumerate(plan)]
+            results = [f.result() for f in futures]   # in plan order, whatever order they finished in
+    else:
+        results = [one(job, 0) for job in plan]
     summary = dict(scenario=s['name'], build=str(a.build), runs=results,
                    ok=all(r['ok'] for r in results), timings_reliable=all(r['timings_reliable'] for r in results))
     (base / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')

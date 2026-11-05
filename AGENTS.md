@@ -38,9 +38,10 @@ This repository is public. Game data lives outside it and every derived file sta
 The playbook is [DEBUGGING.md](DEBUGGING.md): what each command answers, how to read its output, and which command to
 run for a crash, a slowdown, a rendering fault or a CPU-translation suspicion. The rules:
 
-- Before and after every change, run `.venv\Scripts\python tools\test.py` and report the summary line of both runs. Add
-  `--tier 0-3` after a change to `runtime/`, `recomp/` or the translator. Never call a change done with a FAIL or a
-  TIMEOUT in the run, and never remove a test or add `known_failure` to make a run pass without saying so.
+- While working, check with `.venv\Scripts\python tools\check.py --quick --build build\<your build>` (~5 min);
+  before a commit, `--standard` (~20-30 min). Report the summary of the runs before and after your change. Never call
+  a change done with a FAIL or a TIMEOUT in the run, and never remove a test or add `known_failure` to make a run pass
+  without saying so.
 - A change the game must show (rendering, speed, a crash) is checked with `tools/scenario.py`: build it into its own
   folder (`tools/build_game.py ... --out build/<name>`) and run the scenario on the old and the new build. Do not judge
   the game from one run, from a run marked `[busy machine]`, or from a last frame reported as not in the scene.
