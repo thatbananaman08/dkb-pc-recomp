@@ -41,6 +41,19 @@ class Ending(unittest.TestCase):
         text = PERF + '[host] vk: device lost; fault: instruction pointer (invalid)\n'
         self.assertEqual(sc.ending(70, text, False)[0], 'device lost')
 
+    def test_device_lost_before_fatal(self):
+        text = (PERF + '[host] vk: device fault address 0: instruction pointer (invalid) at 0x2004f1cf0, precision 0x10\n'
+                '[host] FATAL: vk: upload submit failed (-4)\n')
+        kind, detail = sc.ending(70, text, False)
+        self.assertEqual(kind, 'device lost')
+        self.assertIn('instruction pointer (invalid)', detail)
+
+    def test_vram_peak(self):
+        text = ('[host] perf: frame 60: gpu avg 1.0 ms; vram 1302 of 7127 MiB; bound: pace\n'
+                '[host] vk: device lost: heap 0 usage 2947 MiB of budget 2763 MiB (VMA blocks 2836 MiB)\n')
+        self.assertEqual(sc.vram(text), (2947, 2763))
+        self.assertEqual(sc.vram('nothing'), (None, None))
+
     def test_hung_and_not_started(self):
         self.assertEqual(sc.ending(None, PERF, True)[0], 'hung')
         self.assertEqual(sc.ending(None, 'scenario: could not start: [WinError 2]\n', False)[0], 'did not start')

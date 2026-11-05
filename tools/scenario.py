@@ -148,14 +148,17 @@ def ending(code, text, timed_out):
     """(kind, detail) for how a run ended, from its exit code and output."""
     if code is None and not timed_out:
         return 'did not start', text.strip()[-300:]
-    lost = re.search(r'.*(device lost|VK_ERROR_DEVICE_LOST|upload wait failed \(-4\)).*', text)
+    # A lost device is checked before FATAL: the runtime stops on it with "FATAL: vk: upload submit failed (-4)"
+    # (-4 is VK_ERROR_DEVICE_LOST), which is a GPU fault, not a crash of the game's code.
+    lost = re.search(r'.*(device lost|VK_ERROR_DEVICE_LOST|failed \(-4\)).*', text)
     m = FATAL.search(text)
     if timed_out:
         return 'hung', 'no exit within the time limit; killed'
+    if lost:
+        fault = re.search(r'.*device fault address \d+: .*', text)
+        return 'device lost', (fault or lost).group(0).strip()
     if m:
         return 'crashed', m.group(1).strip()
-    if lost:
-        return 'device lost', lost.group(0).strip()
     if code == 0:
         if 'frametime: exit' not in text and 'perf: frame' not in text:
             return 'completed', 'exited 0 without perf output (TOTK_TRACE=perf missing?)'
@@ -163,6 +166,14 @@ def ending(code, text, timed_out):
     u = code & 0xFFFFFFFF
     name = NTSTATUS.get(u)
     return 'crashed, no report', f'exit {u:#x}' + (f' ({name})' if name else '') + '; no FATAL line in the log'
+
+
+def vram(text):
+    """(peak MiB used, its budget) of device-local memory over a run's log: the perf lines' "vram U of B MiB" and the
+    "heap 0 usage U MiB of budget B MiB" a device loss logs. (None, None) without either."""
+    pairs = [(int(u), int(b)) for u, b in re.findall(r'vram (\d+) of (\d+) MiB', text)]
+    pairs += [(int(u), int(b)) for u, b in re.findall(r'heap 0 usage (\d+) MiB of budget (\d+) MiB', text)]
+    return max(pairs) if pairs else (None, None)
 
 
 def crash_excerpt(text):
@@ -277,6 +288,7 @@ def run_once(s, exe, out, env_extra, args, warp=None):
     wall = time.monotonic() - start
     text = (out / 'game.log').read_text(encoding='utf-8', errors='replace')
     kind, detail = ending(code, text, timed_out)
+    vram_used, vram_budget = vram(text)
     if kind == 'crashed':
         (out / 'crash.txt').write_text(crash_excerpt(text), encoding='utf-8')
     checks = s['checks']
@@ -312,7 +324,8 @@ def run_once(s, exe, out, env_extra, args, warp=None):
             failed.append(f'{nan} NaN pixels in the dumped frame > {checks["max_nan"]}')
     if not args.keep_profile:
         shutil.rmtree(prof, ignore_errors=True)
-    r = dict(perf_judged=perf_judged,scenario=s['name'], variant=out.name, warp=warp, env=env_extra, exe=str(exe), seconds=seconds, wall_s=round(wall, 1),
+    r = dict(perf_judged=perf_judged, vram_peak_mib=vram_used, vram_budget_mib=vram_budget,
+             vram_over_budget=bool(vram_used and vram_budget and vram_used > vram_budget),scenario=s['name'], variant=out.name, warp=warp, env=env_extra, exe=str(exe), seconds=seconds, wall_s=round(wall, 1),
              exit_code=code, ending=kind, ending_detail=detail, perf=perf['verdict'], fps=perf['fps'],
              slow_windows=perf['slow_windows'], worst_frame_ms=perf['worst_ms'],
              major_episode_causes=sorted({e['cause'] for e in perf['episodes'] if e['major']}),
@@ -342,8 +355,9 @@ def main(argv=None):
     ap.add_argument('--build', type=Path, default=ROOT / 'build' / 'dkb100', help='build folder with dkb.exe')
     ap.add_argument('--repeat', type=int, default=1, help='runs per variant (default 1)')
     ap.add_argument('--jobs', '-j', type=int, default=1,
-                    help=f'games at once (default 1, at most {MAX_JOBS}); for crash, device-lost, NaN and picture checks: '
-                         'the runs are marked as having unreliable timings')
+                    help=f'games at once (default 1, at most {MAX_JOBS}); for crash, NaN and picture checks: the runs are marked '
+                         'as having unreliable timings. Big stages need about 3 GiB of video memory each: on an 8 GiB card a '
+                         'device loss with 3 at once may be the memory; confirm it with --jobs 1')
     ap.add_argument('--ab', metavar='VARIANTS', help='the scenario\'s [variants.<name>] table to alternate')
     ap.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='extra environment for every run')
     ap.add_argument('--seconds', type=float, help="override the scenario's game time")
@@ -436,6 +450,10 @@ def main(argv=None):
             r['perf_judged'] = False
             r['busy_machine'] = r['busy_machine'] + [f'{a.jobs} runs in parallel']
             r['failed'] = [f for f in r['failed'] if not f.startswith('perf ')]
+            if r['ending'] == 'device lost' and r['vram_over_budget']:
+                # The games share one GPU's memory; a stage that needs about 3 GiB, three times, passes an 8 GiB card.
+                r['ending_detail'] += (f' [video memory {r["vram_peak_mib"]} of {r["vram_budget_mib"]} MiB with '
+                                       f'{a.jobs} games at once: may come from running in parallel; rerun with --jobs 1]')
             r['ok'] = not r['failed']
             (base / f'{name}-{n}' / 'result.json').write_text(json.dumps(r, indent=2) + '\n', encoding='utf-8')
         causes = f' ({", ".join(r["major_episode_causes"])})' if r['major_episode_causes'] else ''
