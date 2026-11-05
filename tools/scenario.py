@@ -396,6 +396,11 @@ def main(argv=None):
         extra[k] = v
     if not 1 <= a.jobs <= MAX_JOBS:
         ap.error(f'--jobs takes 1 to {MAX_JOBS}')
+    faulting = {e.partition('=')[0]: e.partition('=')[2] for e in a.env}.get('TOTK_FIX_VS_FAULT') == '0'
+    if a.jobs > 1 and faulting and not a.force:
+        # TOTK_FIX_VS_FAULT=0 makes known stages lose the GPU; several of those at once crashed Windows (bugcheck 0x119).
+        ap.error('--jobs > 1 with TOTK_FIX_VS_FAULT=0 runs GPU faults in parallel, which crashed Windows on an RTX 5060; '
+                 'use --jobs 1 (or --force if you accept the risk)')
     if a.ab:
         table = s['variants'].get(a.ab)
         if not table:

@@ -65,6 +65,15 @@ python tools/scenario.py tutorial-cave --build build/<other> --env TOTK_VK_VALID
 python tools/scenario.py tutorial-cave --warp HillLevelStage             start in another stage (any of the 232)
 python tools/scenario.py tutorial-cave --sweep 'LevelStage$'             once per layer: the 20 main stages
 python tools/scenario.py tutorial-cave --sweep 'LevelStage$' --jobs 3    three games at once (up to 3; timings unreliable)
+python tools/fmz_bisect.py --bad build/<x> --good build/<y> --stage <S>   find the shader a GPU fault depends on
+```
+
+**Never run tests that are expected to lose the GPU in parallel.** Each lost device makes the NVIDIA driver reset
+the GPU; three at once (a parallel bisection with `TOTK_FIX_VS_FAULT=0`) reset it three times in seven minutes and
+then stopped Windows with bugcheck 0x119 (VIDEO_SCHEDULER_INTERNAL_ERROR). `tools/scenario.py` refuses `--jobs > 1`
+with `TOTK_FIX_VS_FAULT=0`, and `tools/fmz_bisect.py` runs one test at a time with a 90 s pause after every fault.
+
+```text
 python tools/save_warp.py --stages                                       the stage names
 ```
 
