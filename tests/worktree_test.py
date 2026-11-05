@@ -18,7 +18,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import worktree  # noqa: E402
 
-IGNORED = '\n'.join('/' + d + '/' for d in worktree.LINK_DIRS) + '\n/' + worktree.LINK_FILES[0] + '\n/.worktrees/\n'
+# Every linked folder and file is ignored, as in the real .gitignore.
+IGNORED = ''.join('/' + d + '/\n' for d in worktree.LINK_DIRS) + ''.join('/' + f + '\n' for f in worktree.LINK_FILES) + \
+    '/.worktrees/\n'
 
 
 def git(cwd, *a):
