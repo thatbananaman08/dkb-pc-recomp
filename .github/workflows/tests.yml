@@ -1,0 +1,60 @@
+name: Tests
+
+# Tiers 0 and 1 of tools/test.py: Python-only checks and the host-toolchain checks (Clang, SPIR-V tools, the shader
+# translator). No game files and no GPU exist on the runner; tests that need them are reported as skipped.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-vulkan-devel
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-spirv-tools
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Python packages
+        run: python -m pip install -r tools/requirements.txt
+
+      - name: Shader translator
+        # The translator tests are skipped when this fails, so the rest still runs; the step stays red.
+        continue-on-error: true
+        run: python tools/build_xlate.py
+
+      - name: Run tiers 0-1
+        env:
+          MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+        run: python tools/test.py --tier 0-1 --junit build/test/runner/junit.xml --verbose
+
+      - name: Keep logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            build/test/runner/*.log
+            build/test/runner/report.json
+            build/test/runner/junit.xml

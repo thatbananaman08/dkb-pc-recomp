@@ -1,0 +1,504 @@
+# The tests tools/test.py runs. One [[test]] per check:
+#
+#   name           unique, used on the command line and for build/test/runner/<name>/
+#   tier           0 Python only, 1 host toolchain, 2 Vulkan device, 3 your dump or your build, 4 scripted game runs
+#   area           cpu, os, audio, nvn, geometry, descriptors, shaders, gfx, tools, installer
+#   cmd            argv, run from the repository root. {tool} placeholders are tools found by test.py (--tools lists
+#                  them); a test whose tools are missing is skipped with the reason. {out} is the test's own output folder
+#                  (removed before the run; the test creates it), {root} the repository root, {gpu_name} the first Vulkan 1.3 device's name (implies a GPU).
+#   needs          optional: extra tools the test finds by itself (it is skipped without them), or "gpu"
+#   platform       optional: "windows" or "linux"
+#   timeout        optional, seconds (default 600)
+#   exclusive      optional: run alone, after the parallel tests (default: true for GPU tests)
+#   known_failure  optional: why it fails today. It is reported as XFAIL and does not fail the run; remove the line once
+#                  the test passes (the runner reports it as XPASS).
+
+# ------------------------------------------------------------------ tier 0: Python only
+
+[[test]]
+name = "check-content"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/check_content_test.py"]
+
+[[test]]
+name = "compare-screenshots"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/compare_screenshots_test.py"]
+
+[[test]]
+name = "nup-extract"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/nup_extract_check.py"]
+
+[[test]]
+name = "worktree"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/worktree_test.py"]
+known_failure = "with git 2.52, a plain git worktree remove --force follows the build/ junction and deletes the main checkout's files (tools/worktree.py remove is safe)"
+
+[[test]]
+name = "spin-waits"
+tier = 0
+area = "cpu"
+cmd = ["{python}", "tests/spin_waits_test.py"]
+
+[[test]]
+name = "pack-shader-cache"
+tier = 0
+area = "shaders"
+cmd = ["{python}", "tests/pack_shader_cache_test.py"]
+
+[[test]]
+name = "build-xlate-options"
+tier = 0
+area = "shaders"
+cmd = ["{python}", "tests/build_xlate_options_test.py"]
+
+[[test]]
+name = "fragment-output-flow"
+tier = 0
+area = "shaders"
+cmd = ["{python}", "tests/fragment_output_flow_test.py"]
+
+[[test]]
+name = "inspect-spirv-outputs"
+tier = 0
+area = "shaders"
+cmd = ["{python}", "tests/inspect_spirv_outputs_test.py"]
+
+[[test]]
+name = "geometry-body-footprint"
+tier = 0
+area = "geometry"
+cmd = ["{python}", "tests/geometry_body_footprint_test.py", "--out", "{out}"]
+
+[[test]]
+name = "installer"
+tier = 0
+area = "installer"
+cmd = ["{python}", "tests/installer_test.py"]
+
+[[test]]
+name = "installer-bananza"
+tier = 0
+area = "installer"
+cmd = ["{python}", "tests/installer_bananza_test.py"]
+
+[[test]]
+name = "installer-gui"
+tier = 0
+area = "installer"
+cmd = ["{python314}", "tests/installer_gui_test.py"]
+
+# ------------------------------------------------------------------ tier 1: CPU translation (Unicorn, no game files)
+
+[[test]]
+name = "flags-check"
+tier = 1
+area = "cpu"
+cmd = ["{python}", "tests/flags_check.py"]
+needs = ["cc"]
+
+[[test]]
+name = "excl-mt"
+tier = 1
+area = "cpu"
+cmd = ["{python}", "tests/excl_mt.py"]
+needs = ["cc"]
+exclusive = true
+
+[[test]]
+name = "diff-simd"
+tier = 1
+area = "cpu"
+cmd = ["{python}", "tests/diff/simd.py"]
+needs = ["cc"]
+exclusive = true
+timeout = 3600
+
+[[test]]
+name = "diff-atomic"
+tier = 1
+area = "cpu"
+cmd = ["{python}", "tests/diff/atomic.py"]
+needs = ["cc"]
+exclusive = true
+timeout = 1800
+
+# ------------------------------------------------------------------ tier 1: runtime seams (Clang, no GPU)
+
+[[test]]
+name = "audio-splitter-order"
+tier = 1
+area = "audio"
+cmd = ["{python}", "tests/audio_splitter_order_test.py", "--cc", "{cc}", "--opt", "2", "--out", "{out}"]
+
+[[test]]
+name = "nvn-mode-trace"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/nvn_mode_trace_test.py", "--cc", "{cc}"]
+platform = "windows"
+
+[[test]]
+name = "nvn-push-constants"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/nvn_push_constants_test.py", "--cc", "{cc}"]
+
+[[test]]
+name = "nvn-submit-ticks"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/nvn_submit_ticks_test.py", "--cc", "{cc}", "--vulkan-include", "{vulkan_include}"]
+
+[[test]]
+name = "nvn-wait-sync"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/nvn_wait_sync_test.py", "--cc", "{cc}"]
+
+[[test]]
+name = "nvn2-compute-c0"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/nvn2_compute_c0_test.py", "--cc", "{cc}"]
+
+[[test]]
+name = "nvn2-indirect-c0"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/nvn2_indirect_c0_test.py", "--cc", "{cc}"]
+
+[[test]]
+name = "nvn2-shader-control"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/nvn2_shader_control_test.py", "--cc", "{cc}"]
+
+[[test]]
+name = "indirect-reset"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/indirect_reset_test.py", "--cc", "{cc}"]
+
+[[test]]
+name = "stencil-clear"
+tier = 1
+area = "gfx"
+cmd = ["{python}", "tests/stencil_clear_test.py", "--cc", "{cc}", "--deps", "{deps}"]
+
+[[test]]
+name = "vk-memory-inspect"
+tier = 1
+area = "gfx"
+cmd = ["{python}", "tests/vk_memory_inspect_test.py", "--cc", "{cc}", "--deps", "{deps}"]
+
+[[test]]
+name = "vk-prefix-read"
+tier = 1
+area = "gfx"
+cmd = ["{python}", "tests/vk_prefix_read_test.py", "--cc", "{cc}", "--deps", "{deps}"]
+
+[[test]]
+name = "vk-resource-frontier"
+tier = 1
+area = "gfx"
+cmd = ["{python}", "tests/vk_resource_frontier_test.py", "--cc", "{cc}", "--vulkan-include", "{vulkan_include}",
+       "--out", "{out}"]
+
+[[test]]
+name = "descriptor-empty-set"
+tier = 1
+area = "descriptors"
+cmd = ["{python}", "tests/descriptor_empty_set_test.py", "--cc", "{cc}", "--deps", "{deps}", "--out", "{out}"]
+
+[[test]]
+name = "descriptor-pool-cache"
+tier = 1
+area = "descriptors"
+cmd = ["{python}", "tests/descriptor_pool_cache_test.py", "--cc", "{cc}", "--deps", "{deps}"]
+
+[[test]]
+name = "descriptor-pool-registry"
+tier = 1
+area = "descriptors"
+cmd = ["{python}", "tests/descriptor_pool_registry_test.py", "--cc", "{cc}", "--deps", "{deps}"]
+
+[[test]]
+name = "storage-candidates-runtime"
+tier = 1
+area = "descriptors"
+cmd = ["{python}", "tests/storage_candidates_runtime_test.py", "--cc", "{cc}", "--deps", "{deps}"]
+
+[[test]]
+name = "geometry-context-log"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_context_log_test.py", "--cc", "{cc}", "--deps", "{deps}"]
+
+[[test]]
+name = "geometry-ordering-probe"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_ordering_probe_test.py", "--cc", "{cc}", "--out", "{out}"]
+
+[[test]]
+name = "geometry-program-control"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_program_control_test.py", "--cc", "{cc}", "--out", "{out}"]
+
+[[test]]
+name = "geometry-replay"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_replay_test.py", "--cc", "{cc}", "--deps", "{deps}"]
+
+[[test]]
+name = "native-exit-capture"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/native_exit_capture_test.py", "--cxx", "{cxx}", "--out", "{out}"]
+
+[[test]]
+name = "spirv-interface"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/spirv_interface_test.py", "--cc", "{cc}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+# ------------------------------------------------------------------ tier 1: shader translator and SPIR-V
+
+[[test]]
+name = "xlate-smoke"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tools/xlate_smoke.py"]
+needs = ["xlate", "spirv_val"]
+
+[[test]]
+name = "fragment-nonfinite-fixture"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/fragment_nonfinite_fixture_test.py", "--glslc", "{glslc}", "--spirv-val", "{spirv_val}"]
+
+[[test]]
+name = "float-minmax"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/float_minmax_test.py", "--translator", "{xlate_defined_minmax}", "--spirv-val", "{spirv_val}"]
+
+[[test]]
+name = "shader-failure-replay"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/shader_failure_replay_test.py", "--cc", "{cc}", "--translator", "{xlate}"]
+
+[[test]]
+name = "xlate-geometry"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/xlate_geometry_test.py", "--xlate", "{xlate}", "--dotnet", "{dotnet}",
+       "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+[[test]]
+name = "xlate-storage-candidates"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/xlate_storage_candidates_test.py", "--xlate", "{xlate}", "--dotnet", "{dotnet}",
+       "--ryu-src", "{ryu_src}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+[[test]]
+name = "geometry-passthrough"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_passthrough_test.py", "--xlate", "{xlate}", "--baseline", "{xlate_baseline}",
+       "--dotnet", "{dotnet}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+[[test]]
+name = "geometry-passthrough-body"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_passthrough_body_test.py", "--xlate", "{xlate}", "--spirv-val", "{spirv_val}",
+       "--cc", "{cc}", "--out", "{out}"]
+
+[[test]]
+name = "geometry-passthrough-cache"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_passthrough_cache_test.py", "--cc", "{cc}", "--translator", "{xlate}",
+       "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+[[test]]
+name = "geometry-pipeline"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_pipeline_test.py", "--cc", "{cc}", "--deps", "{deps}", "--translator", "{xlate}",
+       "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+[[test]]
+name = "geometry-shader-cache"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_shader_cache_test.py", "--cc", "{cc}", "--translator", "{xlate}",
+       "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+[[test]]
+name = "geometry-subgroup"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/geometry_subgroup_test.py", "--cc", "{cc}", "--deps", "{deps}", "--spirv-val", "{spirv_val}",
+       "--out", "{out}", "--validate"]
+
+[[test]]
+name = "vk-geometry-probe"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/vk_geometry_probe_test.py", "--cc", "{cc}", "--xlate", "{xlate}", "--spirv-val", "{spirv_val}",
+       "--out", "{out}"]
+
+[[test]]
+name = "vk-geometry-passthrough-probe"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/vk_geometry_passthrough_probe_test.py", "--cc", "{cc}", "--xlate", "{xlate}",
+       "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+[[test]]
+name = "vk-pool-probe"
+tier = 1
+area = "descriptors"
+cmd = ["{python}", "tests/vk_pool_probe_test.py", "--xlate", "{xlate}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+[[test]]
+name = "installer-dotnet"
+tier = 1
+area = "installer"
+cmd = ["{python}", "tests/installer_dotnet_test.py", "--dotnet", "{dotnet}"]
+
+# ------------------------------------------------------------------ tier 2: a Vulkan device
+
+[[test]]
+name = "fragment-nonfinite-gpu"
+tier = 2
+area = "shaders"
+cmd = ["{python}", "tests/fragment_nonfinite_gpu_test.py", "--cc", "{cc}", "--glslc", "{glslc}",
+       "--spirv-val", "{spirv_val}", "--layer-path", "{layer_path}", "--out", "{out}"]
+needs = ["gpu"]
+
+[[test]]
+name = "float-minmax-gpu"
+tier = 2
+area = "shaders"
+cmd = ["{python}", "tests/float_minmax_gpu_test.py", "--translator", "{xlate_defined_minmax}", "--spirv-val", "{spirv_val}",
+       "--cc", "{cc}", "--vulkan-include", "{vulkan_include}", "--vulkan-library", "{vulkan_library}",
+       "--device-name", "{gpu_name}", "--out", "{out}", "--run"]
+
+[[test]]
+name = "storage-candidates-gpu"
+tier = 2
+area = "descriptors"
+cmd = ["{python}", "tests/storage_candidates_gpu_test.py", "--translator", "{xlate}", "--spirv-val", "{spirv_val}",
+       "--cc", "{cc}", "--vulkan-include", "{vulkan_include}", "--vulkan-library", "{vulkan_library}",
+       "--device-name", "{gpu_name}", "--out", "{out}", "--run"]
+
+# ------------------------------------------------------------------ tier 3: your build of the game (no game files read)
+
+[[test]]
+name = "exe-selftest"
+tier = 3
+area = "os"
+cmd = ["{game_exe}", "--selftest"]
+exclusive = true
+
+[[test]]
+name = "exe-probe-cfg"
+tier = 3
+area = "os"
+cmd = ["{game_exe}", "--probe-cfg"]
+exclusive = true
+
+[[test]]
+name = "exe-probe-dpi"
+tier = 3
+area = "os"
+cmd = ["{game_exe}", "--probe-dpi"]
+exclusive = true
+platform = "windows"
+
+[[test]]
+name = "exe-probe-kernel"
+tier = 3
+area = "os"
+cmd = ["{game_exe}", "--probe-kernel"]
+exclusive = true
+
+[[test]]
+name = "exe-probe-ipc-lifetime"
+tier = 3
+area = "os"
+cmd = ["{game_exe}", "--probe-ipc-lifetime"]
+exclusive = true
+
+[[test]]
+name = "exe-probe-ipc"
+tier = 3
+area = "os"
+cmd = ["{game_exe}", "--probe-ipc"]
+exclusive = true
+known_failure = "audren frame event period 9.8 ms against 5 ms expected, then an access violation reading 0x38"
+
+[[test]]
+name = "exe-probe-services"
+tier = 3
+area = "os"
+cmd = ["{game_exe}", "--probe-services"]
+exclusive = true
+known_failure = "segmentation fault after the nv/vi setup"
+
+[[test]]
+name = "exe-probe-gfx-abi"
+tier = 3
+area = "nvn"
+cmd = ["{game_exe}", "--probe-gfx-abi"]
+exclusive = true
+
+[[test]]
+name = "exe-probe-astc"
+tier = 3
+area = "gfx"
+cmd = ["{game_exe}", "--probe-astc"]
+exclusive = true
+needs = ["gpu"]
+
+# ------------------------------------------------------------------ tier 3: your dump
+
+[[test]]
+name = "diff-lift"
+tier = 3
+area = "cpu"
+cmd = ["{python}", "tests/diff/lift.py", "--exefs", "{exefs}", "--modules", "main,sdk"]
+needs = ["cc"]
+exclusive = true
+timeout = 3600
+
+[[test]]
+name = "diff-func"
+tier = 3
+area = "cpu"
+cmd = ["{python}", "tests/diff/func.py", "--exefs", "{exefs}", "--modules", "main,sdk"]
+needs = ["cc"]
+exclusive = true
+timeout = 3600
+
+[[test]]
+name = "jumptables"
+tier = 3
+area = "cpu"
+cmd = ["{python}", "tests/jumptables_check.py", "--exefs", "{exefs}", "--modules", "main,sdk"]
+exclusive = true
+timeout = 3600

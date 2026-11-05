@@ -177,6 +177,16 @@ The Deck's GPU (Van Gogh) has no native ASTC, so its textures go through the com
 
 ## Checks
 
+`.venv\Scripts\python tools\test.py` runs every check listed in `tests\manifest.toml` that this machine can run, and
+names the missing tool or device for each one it skips. Tiers: 0 Python only, 1 host toolchain (Clang, SPIR-V tools,
+the translator), 2 a Vulkan device, 3 your dump or your build of the game. The default is `--tier 0-2`; add
+`--tier 0-3` for the game-file checks, `--area geometry` or test names to narrow it, `--list` to see what would run,
+and `--tools` to see where each tool was found. Tool paths come from `--set name=path`, `DKB_TEST_<NAME>`, or a
+`[tools]` table in `test.local.toml` (ignored by git), else the MSYS2 UCRT64 defaults. Logs go to
+`build\test\runner\<name>.log` and the summary to `build\test\runner\report.json`. CI runs tiers 0 and 1
+(`.github/workflows/tests.yml`). A new test gets an entry in the manifest; a test that fails today for a known reason
+gets `known_failure`, so it shows as XFAIL until it passes.
+
 Before a commit:
 
 - `python tools/check_content.py --staged`: nothing game-derived is staged. CI runs the same check;
