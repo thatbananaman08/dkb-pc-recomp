@@ -1,6 +1,6 @@
 ﻿# Developer diagnostics
 
-This document describes the currently available diagnostics. The requested unified diagnostics system is not yet complete: structured event logging, configurable diagnostic levels, Vulkan draw labels, automatic crash bundles, synchronization/GPU-assisted validation controls, and a developer panel are not implemented here. Existing controls below are independent and opt-in.
+This document describes the individual diagnostic controls. For what to run when, start with [DEBUGGING.md](DEBUGGING.md): `tools/test.py` runs the checks, `tools/scenario.py` runs the game on a save and judges the run, and `tools/perf_check.py` finds and explains slowdowns. Not implemented yet: structured event logging, configurable diagnostic levels, Vulkan draw labels, synchronization/GPU-assisted validation controls, and a developer panel. The controls below are independent and opt-in, except the crash reports, which are always on.
 
 Outputs can contain game-derived data, memory contents, and screenshots. Keep them under ignored build directories and do not commit them. Record the source revision (`git rev-parse HEAD`), GPU and driver, settings, game version, scene, save and reproduction steps alongside a capture; do not include keys or proprietary content in public reports.
 
@@ -31,6 +31,22 @@ The independent fragment-output reporting fixture can be tested on the RTX 5060 
 ```
 
 It tests two synthetic ordinary descriptor-set arrangements with the Khronos validation layer, GPU output and report-buffer readback. It is not connected to game shader translation or replay; it does not instrument arbitrary SPIR-V, track components or exercise independent graphics pipeline library layouts. Successful fixture results do not identify a faulty game draw.
+
+## Crash reports and device loss
+
+Always on. A fault in the game's own code (lifted or host) is reported by the crash reporter (`runtime/main.c`
+crash_handler): a `FATAL:` line with the host address, the lifted function `f_<addr>` it is in, the guest registers and
+the guest frames, then the process exits with code 71. A fault in another module that nothing handles (a driver, a
+Vulkan layer, the C runtime) is reported the same way from the last-chance filter (`runtime/platform/win32.c`
+crash_unhandled), with the module named: `(ucrtbase.dll+0x48ca7)` in place of `(totk+...)`. `abort()` and invalid C
+runtime parameters are reported with the host frames that called them. Each report is followed by `minidump:` and the
+path of a minidump (`logs\crash-<pid>-<tick>.dmp` beside the exe: thread stacks, registers and modules, no heap, under
+100 KiB) for WinDbg or Visual Studio. The minidump holds game stack memory and stays private like the logs. A stack
+overflow or a fast fail that ends the process before any handler runs still leaves no report; `tools/scenario.py`
+names it from the exit code.
+
+On `VK_ERROR_DEVICE_LOST` the runtime logs what `VK_EXT_device_fault` reports, when the driver supports it
+(`runtime/vk_device.c` vk_device_fault_report): its description, the faulting addresses and the vendor codes.
 
 ## Crash reproduction and frame history
 

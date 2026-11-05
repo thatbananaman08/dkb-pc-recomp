@@ -1,0 +1,50 @@
+# Scenarios
+
+A scenario is a scripted game run that `tools/scenario.py` checks without anyone playing. This folder holds its
+description, `<name>.toml`; the save it starts from is private and lives in `build/saves/<save>/`, which git ignores.
+
+## The file
+
+```toml
+description = "what the run shows, in one line"
+save = "tutorial-cave"                       # build/saves/tutorial-cave/
+input = "tools/input/dkb-title-to-save.txt"  # button timings from the title screen into the save (no game data)
+seconds = 75                                 # game time to run; the last frame is checked
+
+[env]                                        # optional: settings for every run of this scenario
+# TOTK_FIX_VS_FAULT = "0"
+
+[checks]
+min_fps = 50          # a 60-frame window under this is slow
+hitch_ms = 100        # a frame over this is a hitch (counted, not failed)
+skip_world = 5        # seconds of game time left out at the start (the scene loading)
+perf = "SLOW"         # fail on a SLOW verdict; "HITCHY" fails on short dips too; leave it out to not judge speed
+max_black = 0.10      # fail when more of the last frame below the HUD is near-black
+hud_band = 0.15       # the top share of the frame that holds the HUD
+min_hud_bright = 0.005  # under this the last frame is not gameplay (a loading screen), and is not judged
+
+[variants.native_gs]  # --ab native_gs alternates these
+off = { DKB_NATIVE_GS = "0" }
+on = { DKB_NATIVE_GS = "1" }
+```
+
+## The save
+
+1. Get the game to the point you want, on your console or in a run, and save.
+2. Copy that profile's `account.uid` and `save/` folder into `build/saves/<save>/`. A run's profile is kept with
+   `python tools/scenario.py <name> --keep-profile` (in `build/scenarios/.../profile/`).
+3. `python tools/scenario.py --list` says whether the save is found.
+
+Without its save a scenario is skipped (exit 77, SKIP in `tools/test.py`), never failed.
+
+## The input
+
+`tools/input/*.txt`: one step per line, `<frame> <buttons> <frames held>`, for `TOTK_INPUT_SCRIPT`. Frames count from
+the start of the process, so a slow start (a cold shader cache, a busy machine) shifts where they land. Record a session
+with `TOTK_INPUT_RECORD` (see `tools/run_game.py`) to get one from real play.
+
+## Choosing the checks
+
+Calibrate on a known-good and a known-bad run: run the scenario with `--repeat 2` on both builds, read
+`result.json`'s `black_share`, `hud_bright` and `fps`, and put the limits between them with room on both sides. Note the
+measured values in a comment, as `tutorial-cave.toml` does.

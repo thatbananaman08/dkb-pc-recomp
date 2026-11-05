@@ -33,6 +33,24 @@ This repository is public. Game data lives outside it and every derived file sta
 - Bananza bugs (NVN 2, the GPU, Switch 2 services such as `nn::codec`): first read how `refs/eglantine` handles the same point. That emulator plays the game, so it is the default reference. Where it departs from the hardware on purpose (Eden's default GPU accuracy skips texture downloads on CPU reads, `RasterizerVulkan::MustFlushRegion`), say so instead of copying the shortcut.
 - Comments say what the code does and why, in words that stand on their own. Cite our code by file plus function (a line number may follow as a hint) and upstream code by project, file and function: `refs/` moves, so its line numbers rot. Commit hashes belong to the attribution of copied code.
 
+## Testing and debugging
+
+The playbook is [DEBUGGING.md](DEBUGGING.md): what each command answers, how to read its output, and which command to
+run for a crash, a slowdown, a rendering fault or a CPU-translation suspicion. The rules:
+
+- Before and after every change, run `.venv\Scripts\python tools\test.py` and report the summary line of both runs. Add
+  `--tier 0-3` after a change to `runtime/`, `recomp/` or the translator. Never call a change done with a FAIL or a
+  TIMEOUT in the run, and never remove a test or add `known_failure` to make a run pass without saying so.
+- A change the game must show (rendering, speed, a crash) is checked with `tools/scenario.py`: build it into its own
+  folder (`tools/build_game.py ... --out build/<name>`) and run the scenario on the old and the new build. Do not judge
+  the game from one run, from a run marked `[busy machine]`, or from a last frame reported as not in the scene.
+- New behaviour gets a test in `tests/` and an entry in `tests/manifest.toml`; a new game situation to check gets a
+  scenario in `tests/scenarios/` (its save stays in `build/saves/`, never in the repository).
+- A crash report (`FATAL` in the log, `crash.txt` in a scenario run) names the lifted function or the DLL and the
+  minidump. Read it before guessing.
+- Logs, screenshots, dumps, minidumps and saves are game-derived: they stay under `build/` and out of commits, issues
+  and pull requests.
+
 ## Writing
 
 Code, comments, docs and commit messages are in English. Commit messages are plain sentences without type prefixes.

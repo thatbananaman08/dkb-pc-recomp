@@ -9,7 +9,8 @@
 
 Tiers: 0 = Python only, 1 = host toolchain (Clang, spirv-val, the shader translator), 2 = a Vulkan device,
 3 = your dump or your build of the game, 4 = scripted game runs. A test whose tools or device are missing is reported as
-SKIP with the reason; it never passes silently. A test with `known_failure` in the manifest is XFAIL while it fails and
+SKIP with the reason; it never passes silently. A test that exits 77 is skipped too, with its last
+output line as the reason. A test with `known_failure` in the manifest is XFAIL while it fails and
 XPASS (reported, not an error) once it passes, so the entry can be removed.
 
 Tools are found in this order: --set NAME=PATH, the environment variable DKB_TEST_<NAME>, the [tools] table of
@@ -45,6 +46,7 @@ WIN = os.name == 'nt'
 EXE = '.exe' if WIN else ''
 MSYS = Path(os.environ.get('MSYS2_ROOT', 'C:/msys64')) / 'ucrt64'
 TIER_NAMES = {0: 'python', 1: 'host', 2: 'gpu', 3: 'game', 4: 'scenario'}
+SKIP_EXIT = 77   # a test that exits 77 is skipped, with its last output line as the reason (the automake convention)
 
 
 # ---------------------------------------------------------------- tools
@@ -309,6 +311,10 @@ def run_one(t, tools, gpu, verbose):
     if code is None:
         status = 'TIMEOUT'
         note = f'over {t["timeout"]} s'
+    elif code == SKIP_EXIT:
+        # The test found it cannot run here (tools/scenario.py without its private save): its last line says why.
+        status = 'SKIP'
+        note = ([ln.strip() for ln in text.splitlines() if ln.strip()][-1:] or ['skipped'])[0][:200]
     elif code == 0:
         status = 'XPASS' if t.get('known_failure') else 'PASS'
     else:

@@ -77,6 +77,18 @@ area = "geometry"
 cmd = ["{python}", "tests/geometry_body_footprint_test.py", "--out", "{out}"]
 
 [[test]]
+name = "perf-check"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/perf_check_test.py"]
+
+[[test]]
+name = "scenario-runner"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/scenario_test.py"]
+
+[[test]]
 name = "installer"
 tier = 0
 area = "installer"
@@ -450,7 +462,7 @@ tier = 3
 area = "os"
 cmd = ["{game_exe}", "--probe-ipc"]
 exclusive = true
-known_failure = "audren frame event period 9.8 ms against 5 ms expected, then an access violation reading 0x38"
+known_failure = "audren frame event period 9.8 ms against 5 ms expected, then an access violation in dkb.exe reading address 0x38"
 
 [[test]]
 name = "exe-probe-services"
@@ -458,7 +470,7 @@ tier = 3
 area = "os"
 cmd = ["{game_exe}", "--probe-services"]
 exclusive = true
-known_failure = "segmentation fault after the nv/vi setup"
+known_failure = "unhandled access violation in ucrtbase.dll writing address 0x14 after the nv/vi setup (reported from the last-chance filter)"
 
 [[test]]
 name = "exe-probe-gfx-abi"
@@ -502,3 +514,14 @@ area = "cpu"
 cmd = ["{python}", "tests/jumptables_check.py", "--exefs", "{exefs}", "--modules", "main,sdk"]
 exclusive = true
 timeout = 3600
+
+# ------------------------------------------------------------------ tier 4: scripted game runs (tools/scenario.py)
+# Each needs your build and the scenario's private save under build/saves/; without the save it is skipped (exit 77).
+
+[[test]]
+name = "scenario-tutorial-cave"
+tier = 4
+area = "scenario"
+cmd = ["{python}", "tools/scenario.py", "tutorial-cave"]
+needs = ["game_exe", "gpu"]
+timeout = 900
