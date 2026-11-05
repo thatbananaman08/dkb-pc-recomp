@@ -113,6 +113,23 @@ class Files(unittest.TestCase):
             self.assertEqual(code, sc.SKIP)
             self.assertIn(str(Path(d) / s['save']), out.getvalue())   # the message names the folder to create
 
+    def test_run_env_placeholder_and_trace(self):
+        s = dict(input='tools/input/dkb-title-to-save.txt', env={'TOTK_FLIGHT_DIR': '{run}/flight'})
+        out = Path('build') / 'scenarios' / 'x' / 'run-1'
+        env = sc.run_env(s, {'TOTK_DUMP_DIR': '{run}/dump', 'TOTK_TRACE': 'fs'}, out, {'TOTK_TRACE': 'gfx', 'KEEP': '1'})
+        self.assertEqual(env['TOTK_DUMP_DIR'], f'{out}/dump')
+        self.assertEqual(env['TOTK_FLIGHT_DIR'], f'{out}/flight')
+        self.assertEqual(env['TOTK_TRACE'], 'fs,perf')   # --env replaces the caller's value, perf is added
+        self.assertEqual(env['KEEP'], '1')
+        self.assertTrue(env['TOTK_INPUT_SCRIPT'].endswith('dkb-title-to-save.txt'))
+
+    def test_perf_is_judged_only_when_asked(self):
+        self.assertFalse(sc.perf_fails({}, 'SLOW'))
+        self.assertTrue(sc.perf_fails({'perf': 'SLOW'}, 'SLOW'))
+        self.assertFalse(sc.perf_fails({'perf': 'SLOW'}, 'HITCHY'))
+        self.assertTrue(sc.perf_fails({'perf': 'HITCHY'}, 'HITCHY'))
+        self.assertFalse(sc.perf_fails({'perf': 'HITCHY'}, 'OK'))
+
     def test_busy_reasons(self):
         m = dict(games=[], heavy=[dict(name='godot', id=1, mib=6191)], free_commit_gib=2.5, checked=True)
         self.assertEqual(sc.busy_reasons(m), ['godot (6191 MiB)', 'only 2.5 GiB of commit memory free'])

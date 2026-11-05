@@ -19,6 +19,7 @@ min_fps = 50          # a 60-frame window under this is slow
 hitch_ms = 100        # a frame over this is a hitch (counted, not failed)
 skip_world = 5        # seconds of game time left out at the start (the scene loading)
 perf = "SLOW"         # fail on a SLOW verdict; "HITCHY" fails on short dips too; leave it out to not judge speed
+                      # (the verdict is still reported). In [env] and --env values, {run} is the run's folder
 max_black = 0.10      # fail when more of the last frame below the HUD is near-black
 hud_band = 0.15       # the top share of the frame that holds the HUD
 min_hud_bright = 0.005  # under this the last frame is not gameplay (a black loading screen), and is not judged;

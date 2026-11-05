@@ -7,6 +7,8 @@
     python tools/scenario.py tutorial-cave --build build/dkb100-pr67 --env TOTK_VK_VALIDATION=1
     python tools/scenario.py tutorial-cave --warp HillLevelStage    start in another stage (tools/save_warp.py)
     python tools/scenario.py tutorial-cave --sweep 'LevelStage$'    once per matching stage (the 20 layers)
+    python tools/scenario.py tutorial-cave --repeat 2 --env TOTK_DUMP=4300 --env TOTK_DUMP_DIR={run}/dump
+                                                         {run} in a value: that run's own folder
 
 A scenario is tests/scenarios/<name>.toml: which private save to start from, the scripted input that gets from the title
 screen into it, how long to run, and what must hold afterwards. The save itself is never in the repository: it is the
@@ -196,6 +198,27 @@ def black_share(png, hud_band, threshold=8):
     return frame_stats(png, hud_band, threshold)[0]
 
 
+def run_env(s, env_extra, out, base):
+    """The environment of one run: base, the scenario's [env], then env_extra (--env and the variant). {run} in a value
+    is the run's folder, so repeated runs do not overwrite each other's outputs (TOTK_DUMP_DIR={run}/dump). perf is
+    always traced, because the perf verdict needs it; other TOTK_TRACE categories asked for are added to it."""
+    env = dict(base)
+    env['TOTK_INPUT_SCRIPT'] = str(ROOT / s['input'])
+    env.update({k: str(v) for k, v in s['env'].items()})
+    env.update({k: str(v) for k, v in env_extra.items()})
+    for k in set(s['env']) | set(env_extra):
+        env[k] = env[k].replace('{run}', str(out))
+    env['TOTK_TRACE'] = ','.join(sorted(set(filter(None, env.get('TOTK_TRACE', '').split(',') + ['perf']))))
+    return env
+
+
+def perf_fails(checks, verdict):
+    """Speed is judged only when the scenario asks: perf = "SLOW" fails a SLOW run, "HITCHY" a SLOW or HITCHY one.
+    Without it the verdict is reported and nothing fails on it."""
+    want = checks.get('perf')
+    return want == 'SLOW' and verdict == 'SLOW' or want == 'HITCHY' and verdict in ('SLOW', 'HITCHY')
+
+
 def run_once(s, exe, out, env_extra, args, warp=None):
     out.mkdir(parents=True)
     prof = out / 'profile'
@@ -203,12 +226,7 @@ def run_once(s, exe, out, env_extra, args, warp=None):
     warp = warp or args.warp or s.get('warp')
     if warp:   # this run's profile copy starts in another stage (tools/save_warp.py); the private save is unchanged
         save_warp.warp_profile(prof, warp)
-    env = dict(os.environ)
-    env['TOTK_INPUT_SCRIPT'] = str(ROOT / s['input'])
-    env.update({k: str(v) for k, v in s['env'].items()})
-    env.update(env_extra)
-    # perf is always traced (the perf verdict needs it); categories asked for here or by the caller are added to it.
-    env['TOTK_TRACE'] = ','.join(sorted(set(filter(None, env.get('TOTK_TRACE', '').split(',') + ['perf']))))
+    env = run_env(s, env_extra, out, os.environ)
     seconds = args.seconds or s['seconds']
     cmd = [str(exe), '--profile', str(prof), '--seconds', str(seconds), '--shot', str(out / 'last.png')]
     limit = seconds * 6 + 180
@@ -243,8 +261,7 @@ def run_once(s, exe, out, env_extra, args, warp=None):
     failed = []
     if kind != 'completed':
         failed.append(kind)
-    if checks.get('perf', 'SLOW') == 'SLOW' and perf['verdict'] == 'SLOW' or \
-            checks.get('perf') == 'HITCHY' and perf['verdict'] in ('SLOW', 'HITCHY'):
+    if perf_fails(checks, perf['verdict']):
         failed.append(f'perf {perf["verdict"]}')
     if kind == 'completed' and perf['verdict'] == 'no data':
         failed.append('no perf data')
