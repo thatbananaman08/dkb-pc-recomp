@@ -584,6 +584,7 @@ void vk_exec_pass_begin(VkExec *ex) {
         want[nwant] = t->image, wasp[nwant++] = i < 8 ? VK_IMAGE_ASPECT_COLOR_BIT : t->img->aspect;
     }
     barrier_to(ex, want, wasp, nwant);   // passes, clears, copies and dispatches see each other's results
+    if (vk_dump_armed) vk_dump_boundary(ex, "pass_entry", fbl);
     ex->fbl_mask = fbl;
     ex->fb_dirty = 0;
     ex->pass_serial++;

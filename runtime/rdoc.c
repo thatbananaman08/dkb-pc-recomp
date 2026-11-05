@@ -33,10 +33,13 @@ static RdocApi *api;
 static uint64_t targets[RDOC_MAX_FRAMES];
 static int n_targets;
 static int capturing;
+static uint32_t captures_before;
 
 int rdoc_active(void) { return api != NULL; }
 
 void rdoc_init(void) {
+    if (api) return;  // Vulkan initialization may be retried after a failed device selection.
+    n_targets = 0;
     const char *e = cfg_get("TOTK_RDOC");
     if (!e || !*e) return;
     for (const char *p = e; *p && n_targets < RDOC_MAX_FRAMES;) {
@@ -63,8 +66,8 @@ void rdoc_init(void) {
     // Option ids of eRENDERDOC_CaptureOption: 8 RefAllResources, 9 SaveAllInitials, 12 AllowUnsupportedVendorExtensions.
     // The back end imports guest pages with VK_EXT_external_memory_host, which RenderDoc hides unless 12 is set.
     rt_log("rdoc: AllowUnsupportedVendorExtensions -> %u", api->SetCaptureOptionU32(12, 1));
-    api->SetCaptureOptionU32(8, 1);
-    api->SetCaptureOptionU32(9, 1);
+    // Capturing every live resource can consume enormous amounts of memory and disk.
+    // Use RenderDoc's default (referenced resources only).
     const char *dir = cfg_get("TOTK_RDOC_DIR");
     char full[PLAT_PATH_MAX], tmpl[PLAT_PATH_MAX + 16];
     if (!plat_full_path(dir && *dir ? dir : "build/captures", full, sizeof full)) return;
@@ -79,13 +82,19 @@ void rdoc_init(void) {
 void rdoc_after_present(uint64_t frame) {
     if (!api) return;
     if (capturing) {
-        api->EndFrameCapture(NULL, NULL);
+        uint32_t ended = api->EndFrameCapture(NULL, NULL);
         capturing = 0;
         char path[PLAT_PATH_MAX];
         uint32_t len = sizeof path, n = api->GetNumCaptures();
-        if (n && api->GetCapture(n - 1, path, &len, NULL)) rt_log("rdoc: frame %llu captured: %s", (unsigned long long)frame, path);
+        if (ended && n > captures_before && api->GetCapture(n - 1, path, &len, NULL)) rt_log("rdoc: frame %llu captured: %s", (unsigned long long)frame, path);
         else rt_log("rdoc: frame %llu capture failed", (unsigned long long)frame);
     }
     for (int i = 0; i < n_targets; i++)
-        if (targets[i] == frame + 1) { api->StartFrameCapture(NULL, NULL); capturing = 1; rt_log("rdoc: capture of frame %llu started", (unsigned long long)(frame + 1)); }
+        if (targets[i] == frame + 1) {
+            captures_before = api->GetNumCaptures();
+            api->StartFrameCapture(NULL, NULL);
+            capturing = api->IsFrameCapturing() != 0;
+            rt_log("rdoc: capture of frame %llu %s", (unsigned long long)(frame + 1), capturing ? "started" : "failed to start");
+            break;
+        }
 }

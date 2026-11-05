@@ -49,8 +49,15 @@ int vk_dump_armed;
 static uint64_t dump_frame, log_from;   // log_from: TOTK_DUMP_LOG, first frame logged to passes.txt without images
 static char dir[400];
 static FILE *passes_f, *images_f;
+static FILE *ordered_f;
+static unsigned ordered_count;
+#define ORDERED_CAP 16384
 static int seq, finished, copied;      // copied: passes and dispatches of the dump frame whose images were copied
 static int skip_runs, dump_ubo;        // TOTK_DUMP_SKIP_RUNS, TOTK_DUMP_UBO
+static int select_pass = -1;          // optional single pass/dispatch snapshot
+static int select_pass_end = -1;
+static int boundary_on;
+static unsigned boundary_count;
 static uint32_t want_tex[16][2];       // TOTK_DUMP_TEX: slot id and 0, or width and height
 static int nwant_tex;
 static uint64_t last_targets;          // targets_sig of the last render pass; 0 after a dispatch
@@ -223,7 +230,7 @@ static void write_images(const Job *j) {
     uint8_t *out = malloc(n * 4), *nanm = calloc(n, 1);
     if (!px || !out || !nanm) rt_fatal("vk_dump: out of memory for %s", j->name);
     float mn[4] = {INFINITY, INFINITY, INFINITY, INFINITY}, mx[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
-    uint64_t nans = 0;
+    uint64_t nans = 0, infs = 0;
     for (uint32_t z = 0; z < j->d; z++)
         for (uint32_t y = 0; y < j->h; y++)
             for (uint32_t x = 0; x < j->w; x++) {
@@ -231,6 +238,7 @@ static void write_images(const Job *j) {
                 decode(j->f, j->map + (((uint64_t)z * j->h + y) * j->w + x) * j->f->bytes, o);
                 for (int c = 0; c < 4; c++) {
                     if (isnan(o[c])) { nans++, o[c] = 0, nanm[(uint64_t)y * pw + (uint64_t)z * j->w + x] = 1; continue; }
+                    if (isinf(o[c])) { infs++; o[c] = 0; continue; }
                     if (o[c] < mn[c]) mn[c] = o[c];
                     if (o[c] > mx[c]) mx[c] = o[c];
                 }
@@ -270,9 +278,9 @@ static void write_images(const Job *j) {
     uint64_t all = distinct(j, 0, j->h), top = distinct(j, 0, j->h / 4 ? j->h / 4 : 1);
     plat_mutex_lock(&img_lock);
     if (images_f) {
-        fprintf(images_f, "%s %ux%ux%u min %g %g %g %g max %g %g %g %g distinct %llu top-quarter %llu nan %llu\n", j->name,
+        fprintf(images_f, "%s %ux%ux%u min %g %g %g %g max %g %g %g %g distinct %llu top-quarter %llu nan %llu inf %llu\n", j->name,
                 j->w, j->h, j->d, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], (unsigned long long)all,
-                (unsigned long long)top, (unsigned long long)nans);
+                (unsigned long long)top, (unsigned long long)nans, (unsigned long long)infs);
         fflush(images_f);
     }
     plat_mutex_unlock(&img_lock);
@@ -329,8 +337,8 @@ static const char *copy_region(VkExec *ex, VkImage image, VkFormat vf, VkImageAs
     VkMemoryBarrier2 post = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                              .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
                              .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                             .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
-                             .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+                             .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                             .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &pre};
     vkCmdPipelineBarrier2(ex->cb, &di);
     VkBufferImageCopy r = {.imageSubresource = {aspect, level, layer, 1}, .imageOffset = {0, 0, (int32_t)z},
@@ -457,6 +465,32 @@ static int active(void) {
     return !finished && (f == dump_frame || (log_from && f >= log_from && f < dump_frame));
 }
 static uint64_t frame_now(void) { return __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1; }
+
+// The caller has ended rendering and placed non-feedback attachments in GENERAL.
+// Only the first color target is sampled; unsupported subresources are explicitly reported.
+void vk_dump_boundary(VkExec *ex, const char *tag, uint32_t feedback_mask) {
+    if (!boundary_on) return;
+    plat_mutex_lock(&rec_lock);
+    if (!active() || frame_now() != dump_frame || boundary_count >= 32 ||
+        (select_pass >= 0 && (seq < select_pass || seq > select_pass_end))) goto out;
+    const VkExecTarget *t = &ex->color[0];
+    const char *why = NULL;
+    if (ex->in_pass) why = "inside rendering";
+    else if (feedback_mask & 1) why = "feedback layout";
+    else if (!t->tex || !t->image || !t->img) why = "no resolved target";
+    else if (t->samples != 1 || t->is3d || t->blocks) why = "unsupported subresource";
+    char name[128];
+    snprintf(name, sizeof name, "boundary_%04d_%02u_%s", seq, boundary_count++, tag);
+    if (!why) why = copy_out(ex, t->image, t->format, t->aspect, t->level, t->base_layer, t->width, t->height, 1, name);
+    fprintf(passes_f, "boundary %s frame=%llu image=%p addr=%#llx format=%d aspect=%#x level=%u layer=%u layout=%s%s%s\n",
+            name, (unsigned long long)frame_now(), (void *)t->image,
+            (unsigned long long)(t->img ? t->img->addr : 0), (int)t->format, t->aspect, t->level, t->base_layer,
+            feedback_mask & 1 ? "FEEDBACK" : "GENERAL",
+            why ? " skipped: " : "", why ? why : "");
+    fflush(passes_f);
+out:
+    plat_mutex_unlock(&rec_lock);
+}
 
 typedef struct { char *s; size_t n, cap; } Str;
 
@@ -650,6 +684,7 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             for (int k = 0; k < nwant_tex; k++)
                 wanted |= want_tex[k][1] ? want_tex[k][0] == t->width && want_tex[k][1] == t->height
                                          : want_tex[k][0] == (uint32_t)NVN_HANDLE_TEX(h);
+            if (select_pass >= 0 && !wanted) continue; // selected-pass diagnosis copies attachments, not sampled resources
             if (t->type == VK_IMAGE_TYPE_3D) queue_lut(t, NVN_HANDLE_TEX(h));
             else if (wanted && t->type == VK_IMAGE_TYPE_2D && t->samples == 1) queue_lut(t, NVN_HANDLE_TEX(h));
             else if (!img && t->type == VK_IMAGE_TYPE_2D && t->samples == 1 && (uint64_t)t->width * t->height <= TEX2D_CAP &&
@@ -677,11 +712,44 @@ static uint64_t bindings_hash(const VkExec *ex, const VkPipeInfo *info) {
     return h;
 }
 
-void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info) {
+void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeInfo *info, int op, const void *payload) {
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
     pass_draws++;
     uint64_t th = bindings_hash(ex, info);
+    if (ordered_f && frame_now() == dump_frame && ordered_count < ORDERED_CAP) {
+        unsigned id = ++ordered_count;
+        fprintf(ordered_f, "draw id=%u frame=%llu pass=%d ordinal=%d op=%d pipeline=%p program=%llu vs=%016llx fs=%016llx bindings=%016llx",
+                id, (unsigned long long)frame_now(), seq, pass_draws, op, (void *)p,
+                (unsigned long long)(ex->prog ? ex->prog->serial : 0),
+                (unsigned long long)shader_hash(s->vs), (unsigned long long)shader_hash(s->fs), (unsigned long long)th);
+        if (op == OP_DRAW) {
+            const p_draw *d = payload;
+            fprintf(ordered_f, " prim=%d first=%d count=%d instances=%d base_instance=%d", d->prim, d->first, d->count, d->instances, d->base_instance);
+        } else if (op == OP_DRAW_IDX) {
+            const p_draw_idx *d = payload;
+            fprintf(ordered_f, " prim=%d count=%d instances=%d base_vertex=%d base_instance=%d index_type=%d index_addr=%#llx", d->prim, d->count, d->instances, d->base_vertex, d->base_instance, d->itype, (unsigned long long)d->ibuf);
+        } else if (op == OP_DRAW_IDX_IND) {
+            const p_draw_idx_ind *d = payload;
+            fprintf(ordered_f, " prim=%d index_type=%d index_addr=%#llx indirect_addr=%#llx", d->prim, d->itype, (unsigned long long)d->ibuf, (unsigned long long)d->ind);
+        }
+        for (uint32_t k = 0; ex->prog && k < ex->prog->nstage && k < 6; k++)
+            fprintf(ordered_f, " origin%u=%016llx", k, (unsigned long long)nvn2_origin((const uint8_t *)(uintptr_t)ex->prog->sd[k].data));
+        for (int k = 0; k < 8; k++) if (ex->color[k].image)
+            fprintf(ordered_f, " target%d=%#llx:fmt%d", k, (unsigned long long)(ex->color[k].img ? ex->color[k].img->addr : 0), (int)ex->color[k].format);
+        fputc('\n', ordered_f);
+        for (uint32_t k = 0; k < info->n_bindings; k++) {
+            const VkPipeBinding *bd = &info->bindings[k];
+            if (!bd->res) continue;
+            int st = nvn_stage(bd->stage), slot = bd->res->slot;
+            if (bd->kind == GFX_RES_TEX || bd->kind == GFX_RES_IMG)
+                for (uint32_t n = 0; n < (bd->count ? bd->count : 1u); n++)
+                    fprintf(ordered_f, "  binding draw=%u stage=%d kind=%d slot=%d handle=%#llx\n", id, st, bd->kind, slot + (int)n, (unsigned long long)handle_of(ex, st, slot + (int)n, bd->kind == GFX_RES_IMG));
+            if (bd->kind == GFX_RES_SSBO && slot >= 0 && slot < 16)
+                fprintf(ordered_f, "  buffer draw=%u stage=%d slot=%d addr=%#llx size=%#llx\n", id, st, slot, (unsigned long long)ex->ssbo[st][slot].addr, (unsigned long long)ex->ssbo[st][slot].size);
+        }
+        if (ordered_count == ORDERED_CAP) fputs("truncated: draw limit reached\n", ordered_f);
+    }
     for (int i = 0; i < nents; i++)
         if (ents[i].p == p && ents[i].th == th) {
             ents[i].draws++;
@@ -718,7 +786,9 @@ static void target_line(VkExec *ex, const VkExecTarget *t, const char *tag, int 
     uint32_t tw = t->tex->d.width >> t->level ? t->tex->d.width >> t->level : 1;
     uint32_t th = t->tex->d.height >> t->level ? t->tex->d.height >> t->level : 1;
     (void)n;
-    const char *why = pass_skip ? pass_skip : t->samples > 1 ? "multisampled" :
+    int feedback = 0;
+    for (int i = 0; i < ex->nfbl; i++) feedback |= ex->fbl_img[i] == t->image;
+    const char *why = pass_skip ? pass_skip : feedback ? "feedback layout" : t->samples > 1 ? "multisampled" :
                       t->blocks ? copy_region(ex, t->image, t->format, t->aspect, t->level, t->is3d ? 0 : t->base_layer,
                                               t->is3d ? t->base_layer : 0, (VkExtent3D){tw, th, 1}, t->width,
                                               t->height, 1, name) :
@@ -741,9 +811,9 @@ static uint64_t targets_sig(const VkExec *ex) {
 }
 
 // Sets pass_skip for the pass or dispatch being logged and counts it when it copies.
-static void pass_decide(int same_targets) {
+static void pass_decide(int same_targets, int pass) {
     if (frame_now() != dump_frame) copied = 0;
-    pass_skip = copied >= MAX_PASSES ? "pass cap" : same_targets ? "same targets as the previous pass" : NULL;
+    pass_skip = select_pass >= 0 && (pass < select_pass || pass > select_pass_end) ? "pass filter" : copied >= MAX_PASSES ? "pass cap" : same_targets ? "same targets as the previous pass" : NULL;
     if (!pass_skip) copied++;
 }
 
@@ -752,7 +822,7 @@ void vk_dump_pass_end(VkExec *ex) {
     if (!active()) goto out;
     int n = seq++;
     uint64_t sig = targets_sig(ex);
-    pass_decide(skip_runs && sig == last_targets);
+    pass_decide(skip_runs && sig == last_targets, n);
     last_targets = sig;
     fprintf(passes_f, "pass %04d: render pass, draws %d, area %ux%u layers %u, fence %llu, frame %llu\n", n, pass_draws,
             ex->pass_w, ex->pass_h, ex->pass_layers, (unsigned long long)ex->fence, (unsigned long long)frame_now());
@@ -782,7 +852,7 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
     plat_mutex_lock(&rec_lock);
     if (!active()) goto out;
     int n = seq++;
-    pass_decide(0);
+    pass_decide(0, n);
     last_targets = 0;
     Str b = {0};
     describe_bindings(&b, ex, info);
@@ -880,6 +950,16 @@ static void make_dirs(char *path) { plat_file_mkdir_p(path); }
 void vk_dump_init(void) {
     const char *e = cfg_get("TOTK_DUMP");
     if (!e || !*e || !(dump_frame = strtoull(e, NULL, 10))) return;
+    boundary_on = getenv("DKB_DUMP_BOUNDARY") != NULL;
+    const char *spass = getenv("DKB_DUMP_PASS");
+    if (spass && *spass) {
+        char *end;
+        long n = strtol(spass, &end, 10);
+        long last = n;
+        if (*end == '-') last = strtol(end + 1, &end, 10);
+        if (*end || n < 0 || n > 1000000 || last < n || last > 1000000) rt_log("vk_dump: invalid DKB_DUMP_PASS; copying all passes");
+        else select_pass = (int)n, select_pass_end = (int)last;
+    }
     const char *lf = cfg_get("TOTK_DUMP_LOG");
     if (lf && *lf) log_from = strtoull(lf, NULL, 10);
     const char *sr = cfg_get("TOTK_DUMP_SKIP_RUNS");
@@ -900,6 +980,11 @@ void vk_dump_init(void) {
     passes_f = fopen(path, "w");
     snprintf(path, sizeof path, "%s/images.txt", dir);
     images_f = fopen(path, "w");
+    if (getenv("DKB_DUMP_ORDERED")) {
+        snprintf(path, sizeof path, "%s/draws.txt", dir);
+        ordered_f = fopen(path, "w");
+        if (!ordered_f) rt_log("vk_dump: cannot open ordered draw trace %s", path);
+    }
     if (!passes_f || !images_f) rt_fatal("vk_dump: cannot write to %s", dir);
     const char *bf = cfg_get("TOTK_DUMP_BUF");
     if (bf && *bf) {
@@ -931,6 +1016,7 @@ void vk_dump_present(uint64_t frame) {
     plat_mutex_unlock(&img_lock);
     fclose(passes_f);
     passes_f = NULL;
+    if (ordered_f) fclose(ordered_f), ordered_f = NULL;
     rt_log("vk_dump: frame %llu: %d passes and dispatches, about %llu MB of PNGs in %s", (unsigned long long)frame, seq,
            (unsigned long long)(png_bytes >> 20), dir);
 }

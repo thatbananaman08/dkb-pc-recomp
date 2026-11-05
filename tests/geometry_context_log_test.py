@@ -139,6 +139,13 @@ int main(int argc,char **argv) {
     } else if(!strcmp(mode,"zero-filter-no-program")) {
         ex.prog=NULL;geometry_context_log(&ex,OP_DRAW,&direct);zero_queries();
         ex=saved;
+    } else if(!strcmp(mode,"no-geometry")) {
+        uint32_t stage=NVN_STAGE_VS;memcpy(controls[1]+0x714,&stage,4);
+        geometry_context_log(&ex,OP_DRAW,&direct);
+        CHECK(!contexts && !buffer_logs && !passive_queries,"non-geometry draws do not consume the bounded log");
+        stage=NVN_STAGE_GS;memcpy(controls[1]+0x714,&stage,4);
+        geometry_context_log(&ex,OP_DRAW,&direct);
+        CHECK(contexts==1 && buffer_logs==3,"a later geometry draw is still recorded");
     } else if(!strcmp(mode,"overstage") || !strcmp(mode,"compact")) {
         if(!strcmp(mode,"overstage"))program.nstage=7;
         else {
@@ -205,7 +212,7 @@ def main():
     cases += [("toggle-" + name, "off", value, None) for name, value in (
         ("empty", ""), ("zero", "0"), ("true", "true"), ("two", "2"), ("space", "1 "))]
     cases += [(name, name, "1", None) for name in (
-        "null-ex", "null-payload", "overstage", "compact", "cap", "empty-ranges", "indexed", "indirect", "inspect-failure")]
+        "null-ex", "null-payload", "overstage", "compact", "no-geometry", "cap", "empty-ranges", "indexed", "indirect", "inspect-failure")]
     cases += [("wrong-op", "wrong-op", "1", "not-hex")]
     cases += [("invalid-filter-" + name, "invalid-filter", "1", value) for name, value in (
         ("empty", ""), ("prefix", "0x"), ("nonhex", "not-hex"), ("space", " 1"),

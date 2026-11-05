@@ -2346,7 +2346,9 @@ unsupported:
 }
 
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
-static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
+typedef struct { VkPipeState state; VkPipeline pipeline; const VkPipeInfo *info; } DumpDrawState;
+
+static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart, DumpDrawState *dump) {
     if (ex->render_disabled) return 0;
     static int skip_all = -1;   // DKB_SKIP_DRAWS=1: drop every draw (bisecting GPU faults)
     if (skip_all < 0) skip_all = getenv("DKB_SKIP_DRAWS") != NULL;
@@ -2502,7 +2504,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
     feedback_written(ex, &s);
     bind_vertex_buffers(ex);
-    if (vk_dump_armed) vk_dump_draw(ex, &s, p, info);
+    if (vk_dump_armed) *dump = (DumpDrawState){s, p, info};
     vk_exec_oq_draw(ex);
     return 1;
 }
@@ -2553,7 +2555,8 @@ static int indirect_reset_draw(VkExec *ex, const p_draw *d) {
 static void op_draw(VkExec *ex, const p_draw *d) {
     c0_binst = (uint32_t)d->base_instance;
     if (indirect_reset_draw(ex, d)) return;
-    if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
+    DumpDrawState dump;
+    if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0, &dump)) return;
     vk_exec_frame.draws++;
     uint32_t inst = d->instances > 0 ? (uint32_t)d->instances : 1, first = (uint32_t)d->first, n = (uint32_t)d->count;
     if (d->prim == NVN_DRAW_PRIMITIVE_QUADS && n >= 4) {   // quads become two triangles each
@@ -2579,6 +2582,7 @@ static void op_draw(VkExec *ex, const p_draw *d) {
         vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
     }
     ex->recorded++;
+    if (vk_dump_armed) vk_dump_draw(ex, &dump.state, dump.pipeline, dump.info, OP_DRAW, d);
     note_work(ex, 0, (uint64_t)n * inst);
 }
 
@@ -2606,7 +2610,8 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     static const uint32_t isize[3] = {1, 2, 4};
     if (d->itype < 0 || d->itype > 2) return warn_once(W_INDEX, "index type %d is unknown: draw skipped", d->itype);
     int restart = restart_for(ex, d->prim, d->itype);
-    if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, restart)) return;
+    DumpDrawState dump;
+    if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, restart, &dump)) return;
     vk_exec_frame.draws++;
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
@@ -2635,6 +2640,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
     ex->recorded++;
+    if (vk_dump_armed) vk_dump_draw(ex, &dump.state, dump.pipeline, dump.info, OP_DRAW_IDX, d);
     note_work(ex, 0, (uint64_t)d->count * (uint64_t)(d->instances > 0 ? d->instances : 1));
 }
 
@@ -2650,13 +2656,15 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
         return warn_once(W_INDIRECT, "indirect draw arguments at %#llx are not backed or not aligned: draws skipped", (unsigned long long)d->ind);
     if (!vk_mem_resolve(d->ibuf, 1, &ib) || ib.offset % (d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 4))
         return warn_once(W_INDEX, "index buffer %#llx is not backed or not aligned: indirect draws skipped", (unsigned long long)d->ibuf);
-    if (!prepare_draw(ex, d->prim, 0x7fffffff, restart_for(ex, d->prim, d->itype))) return;
+    DumpDrawState dump;
+    if (!prepare_draw(ex, d->prim, 0x7fffffff, restart_for(ex, d->prim, d->itype), &dump)) return;
     vk_exec_frame.draws++;
     VK_MEM_USE(ip);
     VK_MEM_USE(ib);
     vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset, d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(ex->cb, ip.buffer, ip.offset, 1, sizeof(VkDrawIndexedIndirectCommand));
     ex->recorded += 2;
+    if (vk_dump_armed) vk_dump_draw(ex, &dump.state, dump.pipeline, dump.info, OP_DRAW_IDX_IND, d);
     note_work(ex, 1, 0);
     // An imported pool's GPU address is its host address (bind_range reads it the same way); device memory is not.
     if (!ip.alloc && vk_sync_noting()) vk_sync_note_args(d->ind);
@@ -2688,8 +2696,10 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
+    if (vk_dump_armed) vk_dump_boundary(ex, "dispatch_before", 0);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     ex->recorded++;
+    if (vk_dump_armed) vk_dump_boundary(ex, "dispatch_after", 0);
     note_work(ex, 2, (uint64_t)d->x * (uint64_t)d->y * (uint64_t)d->z);
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
 }
@@ -2812,6 +2822,9 @@ static void geometry_context_log(const VkExec *ex, uint32_t op, const void *payl
                 origin[stage] = nvn2_origin(code);   // pointer-to-origin lookup, no shader bytes read
             }
         }
+    // Reserve the bounded log for programs with a geometry stage. Retain unavailable metadata records so a
+    // failed native lowering is not silently hidden; never infer a stage from an unreadable control block.
+    if (metadata && !(present & (1u << NVN_STAGE_GS))) return;
     if (filtered && !((present & 1) && origin[0] == filter) &&
         !((present & 2) && origin[1] == filter) && !((present & 4) && origin[2] == filter)) return;
 

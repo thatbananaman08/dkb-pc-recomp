@@ -141,7 +141,12 @@ static int pick_device(void) {
         if (name && *name && !name_has(p.deviceName, name)) continue;
         if (p.apiVersion < VK_API_VERSION_1_3) { rt_log("vk: gpu %u skipped: Vulkan below 1.3", i); continue; }
         const char *miss = missing_required(pd[i]);
-        if (miss) { rt_log("vk: gpu %u skipped: missing extension %s", i, miss); continue; }
+        if (miss) {
+            rt_log("vk: gpu %u skipped: missing extension %s", i, miss);
+            if (rdoc_active() && !strcmp(miss, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
+                rt_log("vk: RenderDoc hides the required host-memory extension on this setup; capture cannot run");
+            continue;
+        }
         uint32_t nq = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(pd[i], &nq, NULL);
         VkQueueFamilyProperties *qp = calloc(nq ? nq : 1, sizeof *qp);
