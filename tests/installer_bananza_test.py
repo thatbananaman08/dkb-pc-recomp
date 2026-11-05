@@ -24,7 +24,9 @@ class InstallerTest(unittest.TestCase):
     def setUp(self):
         self.work = tempfile.TemporaryDirectory()
         self.addCleanup(self.work.cleanup)
-        base = Path(self.work.name)
+        # Resolved, like the installer's own paths: a TEMP with an 8.3 short name (C:\Users\RUNNER~1 on GitHub's
+        # Windows runners) would otherwise never compare equal to the long form the installer resolves it to.
+        base = Path(self.work.name).resolve()
         self.root, self.exefs, self.romfs = base / 'source', base / 'dump exefs', base / 'dump romfs'
         self.dest, self.temp = base / 'installed [game]', base / 'temporary'
         self.calls = []

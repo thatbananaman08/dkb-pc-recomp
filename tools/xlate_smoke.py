@@ -18,7 +18,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ROOT / "build" / "xlate" / ("totk_xlate.exe" if os.name == "nt" else "totk_xlate")
-SPIRV_VAL = (Path(r"C:\msys64\ucrt64\bin\spirv-val.exe") if os.name == "nt"
+# MSYS2 UCRT64's spirv-val (MSYS2_ROOT, default C:\msys64, as tools/test.py looks for it), else the one on PATH.
+_MSYS_VAL = Path(os.environ.get("MSYS2_ROOT", r"C:\msys64")) / "ucrt64" / "bin" / "spirv-val.exe"
+SPIRV_VAL = (_MSYS_VAL if os.name == "nt" and _MSYS_VAL.is_file()
              else Path(shutil.which("spirv-val") or "/usr/bin/spirv-val"))
 
 PT = 7 << 16  # predicate "always"
