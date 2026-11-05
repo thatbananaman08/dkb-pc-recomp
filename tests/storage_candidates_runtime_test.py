@@ -6,6 +6,7 @@ packing, pointer selection, range clipping and inline-update lookup are real.
 """
 import argparse
 from pathlib import Path
+import re
 import subprocess
 
 from nvn2_shader_control_test import function
@@ -21,9 +22,7 @@ def source():
 #include <string.h>
 #include "vk_exec.h"
 #define ZERO_BYTES 65536u
-#define NVN_STAGE_VS 0
-#define NVN_STAGE_FS 1
-#define NVN_STAGE_CS 5
+@NVN_STAGES@
 enum { W_SSBO_ALIGN, W_SSBO_SLOT };
 static const Nvn2C0Layout *c0_lay;
 static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
@@ -260,7 +259,11 @@ int main(void) {
     return failures!=0;
 }
 '''
-    return before + limits + '\n'.join(pieces) + after
+    # The stage numbers come from vk_exec_draw.c itself, so the copied functions see every stage they test for.
+    stages = re.findall(r'^#define NVN_STAGE_\w+ \d+$', draw, re.M)
+    if not stages:
+        raise SystemExit('storage_candidates_runtime_test: no NVN_STAGE_ defines in runtime/vk_exec_draw.c')
+    return before.replace('@NVN_STAGES@', '\n'.join(stages)) + limits + '\n'.join(pieces) + after
 
 
 def main():
