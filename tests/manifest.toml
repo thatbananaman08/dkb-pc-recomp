@@ -308,8 +308,7 @@ needs = ["xlate", "spirv_val"]
 name = "cal-flow"
 tier = 1
 area = "shaders"
-cmd = ["{python}", "tests/cal_flow_test.py", "--translator", "{xlate}"]
-needs = ["xlate"]
+cmd = ["{python}", "tests/cal_flow_test.py", "--translator", "{xlate}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
 
 [[test]]
 name = "fragment-nonfinite-fixture"
