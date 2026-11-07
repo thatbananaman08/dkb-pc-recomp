@@ -2301,9 +2301,17 @@ static int light_quad_fault_skip(const VkExec *ex, const GfxShader *vs, const Gf
     if (!on || !vs || !fs) return 0;
     const uint8_t *ctl, *code = NULL;
     uint32_t len;
-    if (find_stage(ex->prog, NVN_STAGE_VS, &ctl, &code, &len) && nvn2_origin(code) == 0xcae0ef8e9fe9147full) {
-        warn_once(W_FAULT_SKIP2, "the light quad of NVN 2 vertex stage cae0ef8e9fe9147f is skipped on NVIDIA (#9)");
-        return 1;
+    if (find_stage(ex->prog, NVN_STAGE_VS, &ctl, &code, &len)) {
+        uint64_t origin = nvn2_origin(code);
+        // cae0ef8e9fe9147f: the fault seven minutes in (above). 7a76ae8de5016fd9: the Ice stage's quad, a four-vertex
+        // strip with ten per-instance streams whose fragment stage does not read c0+0x530, so the family match below
+        // misses it. Creating its pipeline crashes the driver's compiler (nvgpucomp64.dll, reproduced from the captured
+        // pipeline alone), and with that avoided its draws lose the device. Skipping it here, before the pipeline is
+        // built, avoided both in the three 90 s Ice runs so far on an RTX 5060.
+        if (origin == 0xcae0ef8e9fe9147full || origin == 0x7a76ae8de5016fd9ull) {
+            warn_once(W_FAULT_SKIP2, "a light quad of a known faulting NVN 2 vertex stage is skipped on NVIDIA (#9)");
+            return 1;
+        }
     }
     const GfxShaderRes *r;
     int n = gfx_shader_resources(fs, GFX_RES_SSBO, &r), lights = 0;
