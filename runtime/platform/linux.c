@@ -698,6 +698,11 @@ PlatAppend *plat_append_open(const char *path) {
     return fd < 0 ? NULL : (PlatAppend *)(intptr_t)(fd + 1);
 }
 
+PlatAppend *plat_append_create_new(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_CLOEXEC, 0644);
+    return fd < 0 ? NULL : (PlatAppend *)(intptr_t)(fd + 1);
+}
+
 int plat_append_write(PlatAppend *f, const void *data, size_t n) {
     int fd = (int)(intptr_t)f - 1;
     ssize_t k;

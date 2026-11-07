@@ -42,6 +42,7 @@
 
 #include "cfg.h"
 #include "gfx.h"
+#include "event_log.h"
 #include "host.h"
 #include "nvn_geometry_control.h"
 #include "spirv_opt.h"
@@ -1633,6 +1634,7 @@ void gfx_shader_drop_memory(void) {
 static const GfxShader *fail(const char *why, const char *hex) {
     plat_inc64(&n_failures);
     rt_log("gfx_shader: translation failed (%s): %s", hex ? hex : "-", why);
+    rt_event_shader_failure(why, hex);
     return NULL;
 }
 

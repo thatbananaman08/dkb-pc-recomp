@@ -24,6 +24,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "event_log.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "sha256.h"
@@ -232,6 +233,8 @@ static void crash_handler(const PlatCrash *x) {
                 (unsigned long long)x->addr);
     rt_log_raw("\n", 1);
     if (x->dump) rt_logf("  minidump: %s\n", x->dump);
+    // Record the exception before reverse symbol lookup, which may allocate while the process is damaged.
+    rt_event_crash(x);
     uint64_t f = x->module ? 0 : lifted_function(rip);
     if (f) rt_logf("  in lifted function f_%llx = %s\n", (unsigned long long)f, ldr_describe(f, d, sizeof d));
     for (int i = 0; i < x->nframes; i++) {   // abort and invalid parameter: where the host code called it
@@ -486,6 +489,9 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     plat_crash_hook(crash_handler);
+    const char *event_path = cfg_get("TOTK_EVENT_LOG");
+    if (event_path && *event_path && !rt_event_open(event_path))
+        rt_log("event log: cannot create %s (the file must not already exist)", event_path);
     parse_trace();
     prof_start();
     // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait

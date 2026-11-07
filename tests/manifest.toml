@@ -28,6 +28,12 @@ area = "tools"
 cmd = ["{python}", "tests/compare_screenshots_test.py"]
 
 [[test]]
+name = "log-events"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/log_events_test.py"]
+
+[[test]]
 name = "nup-extract"
 tier = 0
 area = "tools"
@@ -154,6 +160,13 @@ exclusive = true
 timeout = 1800
 
 # ------------------------------------------------------------------ tier 1: runtime seams (Clang, no GPU)
+
+[[test]]
+name = "event-log"
+tier = 1
+area = "os"
+cmd = ["{python}", "tests/event_log_test.py", "--cc", "{cc}", "--deps", "{deps}", "--out", "{out}"]
+paths = ["runtime/event_log.c", "runtime/event_log.h", "runtime/gfx_shader.c", "runtime/vk_device.c", "runtime/dispatch.c"]
 
 [[test]]
 name = "audio-splitter-order"
@@ -513,6 +526,14 @@ exclusive = true
 needs = ["gpu"]
 
 # ------------------------------------------------------------------ tier 3: your dump
+
+[[test]]
+name = "event-log-runtime"
+tier = 3
+area = "os"
+cmd = ["{python}", "tests/event_log_runtime_test.py", "--exe", "{game_exe}", "--out", "{out}"]
+paths = ["runtime/event_log.c", "runtime/event_log.h", "runtime/main.c", "runtime/dispatch.c", "runtime/platform/*"]
+exclusive = true
 
 [[test]]
 name = "diff-lift"

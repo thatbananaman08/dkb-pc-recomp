@@ -61,6 +61,7 @@ uint32_t *spirv_opt_local_single_block(const uint32_t *w, uint64_t n, uint64_t *
     if (o) memcpy(o, w, n * 4), *out_n = n;
     return o;
 }
+void rt_event_shader_failure(const char *reason, const char *shader) { (void)reason; (void)shader; }
 _Noreturn void rt_fatal(const char *format, ...) { (void)format; forbidden("runtime fatal"); abort(); }
 void rt_sha256(const void *data, size_t size, uint8_t out[32]) { sha256(data, size, out); }
 int kern_core_away(void) { forbidden("guest-core release"); return 0; }

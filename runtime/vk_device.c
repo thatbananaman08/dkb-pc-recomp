@@ -9,6 +9,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "vk.h"
+#include "event_log.h"
 #include "platform/platform.h"
 
 static VkCtx g_vk;
@@ -412,6 +413,7 @@ void vk_device_fault_report(VkResult r) {
     plat_mutex_lock(&lock);
     if (done) { plat_mutex_unlock(&lock); return; }
     done = 1;
+    rt_event_device_lost((int32_t)r);
     vk_crumbs_report();
     VkCtx *c = vk_ctx();
     if (c && c->vma) {   // how full each heap was: a fault under memory pressure reads differently

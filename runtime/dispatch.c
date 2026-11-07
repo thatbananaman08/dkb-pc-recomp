@@ -11,6 +11,7 @@
 // locks or per-thread caches. Host (HLE) functions at addresses outside the modules live in a small hash table that
 // is also fixed at init; they are looked up only after the flat table misses.
 #include "dispatch.h"
+#include "event_log.h"
 #include "host.h"
 #include "platform/platform.h"
 
@@ -41,12 +42,15 @@ static struct { uint64_t addr; GuestFn fn; } g_host[HOST_CAP];
 static uint64_t g_nhost;
 
 void rt_fatal(const char *fmt, ...) {
+    rt_log_raw("FATAL: ", 7);
     va_list ap;
     va_start(ap, fmt);
-    rt_log_raw("FATAL: ", 7);
-    rt_vlogf(fmt, ap);
-    rt_log_raw("\n", 1);
+    char message[2048];
+    int n = vsnprintf(message, sizeof message, fmt, ap);
     va_end(ap);
+    if (n > 0) rt_log_raw(message, n < (int)sizeof message ? (size_t)n : sizeof message - 1);
+    rt_log_raw("\n", 1);
+    rt_event_fatal(n < 0 ? "could not format fatal message" : message);
     // A failed allocation (malloc, realloc, VirtualAlloc) means the commit limit was reached: this line tells a leak of
     // ours (process private bytes near the limit) from a machine short of page file.
     double proc, used, limit;
