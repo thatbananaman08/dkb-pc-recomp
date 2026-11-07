@@ -73,6 +73,24 @@ the GPU; three at once (a parallel bisection with `TOTK_FIX_VS_FAULT=0`) reset i
 then stopped Windows with bugcheck 0x119 (VIDEO_SCHEDULER_INTERNAL_ERROR). `tools/scenario.py` refuses `--jobs > 1`
 with `TOTK_FIX_VS_FAULT=0`, and `tools/fmz_bisect.py` runs one test at a time with a 90 s pause after every fault.
 
+**To chase a GPU fault without resetting the GPU, add `--safe-gpu`.** The run goes through the Khronos validation
+layer's GPU-assisted validation in safe mode (`tools/vk_gpuav_safe.txt`): every shader is instrumented, an access that
+would fault is skipped and reported in `game.log`, and the shader sanitizer reports NaN operands of min/max and other
+undefined results. Any skipped access fails the run; undefined results are listed per shader and stage in
+`result.json` (`gpuav`) but do not fail it. The game runs about ten times slower, so the time limit is longer and speed
+is not judged. Under the layer the process can hang on exit after the run is over; the runner kills it 120 s after the
+last frame is saved and counts the run as completed.
+
+What it showed on Ground (CAL build): with `TOTK_FIX_VS_FAULT=0`, which loses the device at about 42 s of game time,
+safe-mode runs reach the end with no driver reset, and from 43-44 s one fragment shader reports NaN operands of FMax
+(43 and 493 reports in two runs). With the light-quad skip on (the default) those reports do not appear; only six from
+another shader at 1.8 s, which every run has. So late undefined results stand in for the fault. GPU-AV reported no
+skipped access, so it does not name the faulting access itself.
+
+`tools/fmz_bisect.py --safe-gpu` uses that: every test runs in safe mode, and a test counts as faulting when a shader
+first reported at or after 30 s of game time (`--safe-gpu SECONDS` to change it) has undefined results. Its two sanity
+tests check that the signal holds on the stage before any bisecting. About 4 min a test once the shaders are cached.
+
 ```text
 python tools/save_warp.py --stages                                       the stage names
 ```

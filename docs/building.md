@@ -190,6 +190,10 @@ and `--tools` to see where each tool was found. Tool paths come from `--set name
 (`.github/workflows/tests.yml`). A new test gets an entry in the manifest; a test that fails today for a known reason
 gets `known_failure`, so it shows as XFAIL until it passes.
 
+Tier 3 executable probes default to `build/dkb100/dkb.exe` on Windows. When testing another build, pass
+`--set game_exe=build/<name>/dkb.exe` and, if applicable, `--set xlate=build/<name>/totk_xlate.exe`; otherwise the
+probes can test an older executable than the one just built.
+
 Before a commit:
 
 - `python tools/check_content.py --staged`: nothing game-derived is staged. CI runs the same check;
@@ -202,12 +206,34 @@ change passes these, all run with `.venv`:
 | Test | Checks | Game files |
 |---|---|---|
 | `tests\diff\lift.py` | instructions sampled from the extracted modules; `--coverage` lists every word the lifter rejects or traps | yes |
+| `tests\diff\mutation.py` | reruns the instruction comparison with isolated, deliberately faulty lifters and checks that each is detected | yes |
 | `tests\diff\simd.py` | the whole FP/SIMD encoding space | no |
 | `tests\diff\atomic.py` | exclusive load/store sequences and ARMv8.1 atomics | no |
 | `tests\diff\func.py` | whole functions as the generator emits them, loops, jump tables and calls included (calls go to a stub that checks the registers at the call) | yes |
+| `tests\diff\e2e.py` | small compiled programs with loops, branches and calls between real lifted functions, compared with Unicorn | no |
+| `tests\diff\corpus.py` | deterministic, fixed game-free instruction shapes compared against Unicorn | no |
 | `tests\flags_check.py` | the function-local flag helpers of `runtime\cpu.h` against its packed ones | no |
 | `tests\excl_mt.py` | the exclusive monitor helpers under contention and ABA, on several threads | no |
 | `tests\jumptables_check.py` | `recomp/jumptables.py` against a Unicorn oracle; must report 0 disagreements, on 1.4.3 too | yes |
+
+`python tools/test.py --tier 3 diff-mutation` runs the mutation check with the configured ExeFS. It first requires an
+unmodified control to pass, then checks four in-memory mutations one at a time. A surviving mutation fails the check;
+a harness or compiler error is not counted as detection. It tests the sampled instructions, not every instruction or
+all possible lifter faults, and its logs stay under `build/`.
+
+`python tools/test.py diff-e2e` compiles the game-free programs for AArch64 with Clang and LLD, discovers and emits
+their functions with the normal generator, and compares host execution and memory with Unicorn. It covers neither
+host services nor C++ exceptions or TLS; its switch currently uses conditional branches, not jump tables.
+
+`python tools/test.py diff-corpus` checks one word per supported A57 shape from the pinned corpus, with two generated
+states each. `python tests/diff/corpus.py --words-per-shape 0` checks all its words. The runner separately counts
+non-A57 shapes and system/atomic words outside its single-instruction scope; `diff-atomic` checks atomics separately.
+An unsupported selected word or a Unicorn execution failure fails the run. The corpus does not include all newer
+Switch 2 instruction families, and it does not provide pre-recorded input states. See `tests/data/README.md`.
+
+For a coarse local comparison against a dump, use `python tests/diff/corpus_coverage.py --exefs <exefs>`. Its report
+stays under `build/test/corpus-coverage/`: it compares mnemonic names only, so an instruction name appearing in both
+sets does not establish that its operand forms or encodings are covered.
 
 Runtime probes, each a mode of `totk.exe` (the list is at the top of `runtime/main.c`): `--probe-kernel`,
 `--probe-vkexec`, `--probe-nvn-tex` and `--probe-shader` cover most runtime changes. `--probe-shader` and the draw
