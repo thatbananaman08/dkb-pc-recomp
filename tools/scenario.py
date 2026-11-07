@@ -257,6 +257,33 @@ def black_share(png, hud_band, threshold=8):
     return frame_stats(png, hud_band, threshold)[0]
 
 
+def reference_check(png, spec):
+    """Compare a normalized frame region to a private reference; lower RGB error is closer."""
+    from PIL import Image, ImageChops, ImageStat
+
+    path = (ROOT / spec['reference']).resolve()
+    if not path.is_relative_to((ROOT / 'build').resolve()):
+        raise ValueError('reference image must be under build/')
+    box = spec['region']
+    if len(box) != 4 or not (0 <= box[0] < box[2] <= 1 and 0 <= box[1] < box[3] <= 1):
+        raise ValueError('reference region must be [left, top, right, bottom] in 0..1')
+    limit = spec['max_mean_error']
+    if not 0 <= limit <= 255:
+        raise ValueError('max_mean_error must be in 0..255')
+
+    def region(image):
+        with Image.open(image) as im:
+            w, h = im.size
+            rect = (int(box[0] * w), int(box[1] * h), int(box[2] * w), int(box[3] * h))
+            if rect[0] >= rect[2] or rect[1] >= rect[3]:
+                raise ValueError('reference region is empty')
+            return im.convert('RGB').crop(rect).resize((180, 100))
+
+    difference = ImageChops.difference(region(path), region(png))
+    score = sum(ImageStat.Stat(difference).mean) / 3
+    return {'mean_error': round(score, 3), 'max_mean_error': limit, 'passed': score <= limit}
+
+
 def run_env(s, env_extra, out, base):
     """The environment of one run: base, the scenario's [env], then env_extra (--env and the variant). {run} in a value
     is the run's folder, so repeated runs do not overwrite each other's outputs (TOTK_DUMP_DIR={run}/dump). perf is
@@ -378,6 +405,15 @@ def run_once(s, exe, out, env_extra, args, warp=None):
             failed.append(f'no frame dump (the run ended before frame {checks.get("dump_frame")}, or the dump failed)')
         elif nan > checks['max_nan']:
             failed.append(f'{nan} NaN pixels in the dumped frame > {checks["max_nan"]}')
+    reference = None
+    if 'reference_frame' in checks and kind == 'completed':
+        try:
+            reference = reference_check(out / 'last.png', checks['reference_frame'])
+            if not reference['passed']:
+                failed.append(f'reference frame mismatch: mean RGB error {reference["mean_error"]:.2f} '
+                              f'> {reference["max_mean_error"]:.2f}')
+        except (ImportError, OSError, ValueError, KeyError, TypeError) as e:
+            failed.append(f'reference frame check unavailable: {e}')
     if not args.keep_profile:
         shutil.rmtree(prof, ignore_errors=True)
     r = dict(perf_judged=perf_judged, vram_peak_mib=vram_used, vram_budget_mib=vram_budget,
@@ -386,7 +422,8 @@ def run_once(s, exe, out, env_extra, args, warp=None):
              exit_code=code, ending=kind, ending_detail=detail, perf=perf['verdict'], fps=perf['fps'],
              slow_windows=perf['slow_windows'], worst_frame_ms=perf['worst_ms'],
              major_episode_causes=sorted({e['cause'] for e in perf['episodes'] if e['major']}),
-             black_share=black, hud_bright=hud, in_scene=in_scene, nan_pixels=nan, failed=failed, ok=not failed,
+             black_share=black, hud_bright=hud, in_scene=in_scene, nan_pixels=nan, reference_frame=reference,
+             failed=failed, ok=not failed,
              busy_machine=busy,
              timings_reliable=not busy, machine=m)
     (out / 'result.json').write_text(json.dumps(r, indent=2) + '\n', encoding='utf-8')

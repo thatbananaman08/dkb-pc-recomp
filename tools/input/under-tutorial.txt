@@ -1,0 +1,20 @@
+# Timed input for the tutorial-cave save warped to UnderLevelStage. In the tested build the world clock starts
+# on the title screen, so title and tutorial presses use the same clock. Timings are provisional, not state-based.
+@25000 A 150
+@30000 A 150
+@35000 A 150
+@40000 A 150
+@45000 A 150
+@50000 A 150
+@60000 X 150
+@70000 X 150
+@80000 X 150
+@90000 X 150
+@100000 X 150
+@110000 X 150
+@120000 X 150
+@130000 X 150
+@140000 X 150
+@150000 X 150
+@160000 X 150
+@170000 X 150

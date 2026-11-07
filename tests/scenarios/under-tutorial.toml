@@ -1,0 +1,20 @@
+# The private reference checks the gameplay HUD; it does not assert movement or the precise stage.
+description = "Under tutorial from a warped save, with scripted prompt input and HUD check"
+save = "tutorial-cave"
+input = "tools/input/under-tutorial.txt"
+warp = "UnderLevelStage"
+seconds = 180
+
+[env]
+DKB_NATIVE_GS = "1"
+TOTK_INPUT = "none"  # isolate the script from physical controllers and keyboard
+TOTK_INPUT_RECORD = "{run}/input-record.txt"
+
+[checks]
+skip_world = 5
+
+[checks.reference_frame]
+reference = "build/scenario-references/under-gameplay.png"
+region = [0.03, 0.025, 0.12, 0.09]
+# Two held-out gameplay frames: 0; title: 53.1; two tutorial-prompt frames: 48.3 mean RGB error (0..255).
+max_mean_error = 18.0

@@ -66,6 +66,26 @@ class Ending(unittest.TestCase):
 
 
 class Image(unittest.TestCase):
+    def test_reference_frame_matches_region_and_rejects_other_state(self):
+        try:
+            from PIL import Image as PILImage
+        except ImportError:
+            self.skipTest('no Pillow')
+        with tempfile.TemporaryDirectory(dir=ROOT / 'build') as d:
+            ref, same, other = (Path(d) / n for n in ('ref.png', 'same.png', 'other.png'))
+            PILImage.new('RGB', (100, 100), (255, 0, 100)).save(ref)
+            PILImage.new('RGB', (200, 200), (255, 0, 100)).save(same)
+            PILImage.new('RGB', (100, 100), (0, 0, 0)).save(other)
+            spec = {'reference': str(ref), 'region': [0, 0, 0.5, 0.5], 'max_mean_error': 10}
+            self.assertTrue(sc.reference_check(same, spec)['passed'])
+            self.assertFalse(sc.reference_check(other, spec)['passed'])
+            with self.assertRaises(OSError):
+                sc.reference_check(Path(d) / 'missing.png', spec)
+            with self.assertRaises(ValueError):
+                sc.reference_check(same, {**spec, 'reference': str(ROOT / 'outside.png')})
+            with self.assertRaises(ValueError):
+                sc.reference_check(same, {**spec, 'region': [0, 0, 0, 1]})
+
     def test_black_share_below_the_hud(self):
         try:
             from PIL import Image as PILImage
