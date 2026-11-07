@@ -65,6 +65,18 @@ area = "cpu"
 cmd = ["{python}", "tests/spin_waits_test.py"]
 
 [[test]]
+name = "mutation-runner"
+tier = 0
+area = "cpu"
+cmd = ["{python}", "tests/diff_mutation_test.py"]
+
+[[test]]
+name = "corpus-helpers"
+tier = 0
+area = "cpu"
+cmd = ["{python}", "tests/diff_corpus_test.py"]
+
+[[test]]
 name = "pack-shader-cache"
 tier = 0
 area = "shaders"
@@ -168,6 +180,28 @@ tier = 1
 area = "cpu"
 cmd = ["{python}", "tests/diff/atomic.py"]
 needs = ["cc"]
+exclusive = true
+timeout = 1800
+
+[[test]]
+name = "diff-e2e"
+tier = 1
+area = "cpu"
+cmd = ["{python}", "tests/diff/e2e.py", "--cc", "{cc}", "--out", "{out}"]
+exclusive = true
+
+[[test]]
+name = "diff-e2e-oracle"
+tier = 1
+area = "cpu"
+cmd = ["{python}", "tests/diff_e2e_test.py", "--cc", "{cc}"]
+exclusive = true
+
+[[test]]
+name = "diff-corpus"
+tier = 1
+area = "cpu"
+cmd = ["{python}", "tests/diff/corpus.py", "--cc", "{cc}", "--out", "{out}"]
 exclusive = true
 timeout = 1800
 
@@ -553,6 +587,15 @@ area = "os"
 cmd = ["{python}", "tests/event_log_runtime_test.py", "--exe", "{game_exe}", "--out", "{out}"]
 paths = ["runtime/event_log.c", "runtime/event_log.h", "runtime/main.c", "runtime/dispatch.c", "runtime/platform/*"]
 exclusive = true
+
+[[test]]
+name = "diff-mutation"
+tier = 3
+area = "cpu"
+cmd = ["{python}", "tests/diff/mutation.py", "--exefs", "{exefs}", "--out", "{out}"]
+needs = ["cc"]
+exclusive = true
+timeout = 3600
 
 [[test]]
 name = "diff-lift"
