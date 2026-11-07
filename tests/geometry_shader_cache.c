@@ -54,6 +54,13 @@ int fixture_thread_spawn(PlatThreadFn fn, void *arg, const char *name, size_t si
 }
 const char *cfg_get(const char *name) { (void)name; return NULL; }
 void rt_log(const char *format, ...) { (void)format; }
+// The SPIR-V optimizer step (spirv_opt.cpp) has its own test (spirv_opt_test.py); here it hands the module back unchanged.
+uint32_t *spirv_opt_local_single_block(const uint32_t *w, uint64_t n, uint64_t *out_n, char *err, size_t cap) {
+    (void)err; (void)cap;
+    uint32_t *o = malloc(n * 4);
+    if (o) memcpy(o, w, n * 4), *out_n = n;
+    return o;
+}
 _Noreturn void rt_fatal(const char *format, ...) { (void)format; forbidden("runtime fatal"); abort(); }
 void rt_sha256(const void *data, size_t size, uint8_t out[32]) { sha256(data, size, out); }
 int kern_core_away(void) { forbidden("guest-core release"); return 0; }

@@ -93,6 +93,14 @@ static void build_key(const uint8_t *hash, const GfxShaderAnswers *answers, cons
 static void key_of_input(const uint8_t iid[32], uint8_t key[32]) { memcpy(key,iid,32); }
 static GfxShader *mem_find(const uint8_t key[32]) { (void)key; return NULL; }
 static int32_t plat_inc32(volatile int32_t *p) { return ++*p; }
+// The SPIR-V optimizer step (spirv_opt.cpp) has its own test (spirv_opt_test.py); here it hands the module back unchanged.
+static const char *cfg_get(const char *name) { (void)name; return NULL; }
+uint32_t *spirv_opt_local_single_block(const uint32_t *w, uint64_t n, uint64_t *out_n, char *err, size_t cap) {
+    (void)err; (void)cap;
+    uint32_t *o = malloc(n * 4);
+    if (o) memcpy(o, w, n * 4), *out_n = n;
+    return o;
+}
 static uint8_t *pack_read(int kind, const uint8_t key[32], uint64_t *size) {
     (void)kind; (void)key; (void)size; abort(); // This fixture owns loose files only.
 }
@@ -270,7 +278,11 @@ int main(void) {
     pieces.append(function(production[production.rindex('static int reflect('):], 'static int reflect('))
     pieces += [function(production,name) for name in (
         'static void shader_free(', 'static void key_hex(', 'static int reflection_valid(',
-        'static int spirv_complete(', 'static GfxShader *disk_load_from(', 'static GfxShader *disk_load(')]
+        'static int spirv_complete(')]
+    if 'static void spirv_optimize(' in production:
+        pieces.append(function(production, 'static void spirv_optimize('))
+    pieces += [function(production,name) for name in (
+        'static GfxShader *disk_load_from(', 'static GfxShader *disk_load(')]
     if 'static GfxShader *input_disk_load(' in production:
         # This compute-control fixture has no stored GS inputs. Fail loudly if
         # it ever reaches the separately tested v2 provenance branch; retain

@@ -44,6 +44,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_geometry_control.h"
+#include "spirv_opt.h"
 #include "platform/platform.h"
 
 #define CONTROL_SIZE 0x880
@@ -596,6 +597,35 @@ static int spirv_complete(const uint32_t *w, uint64_t n) {
     return i == n;
 }
 
+// The SPIR-V optimizer step (spirv_opt.cpp): every module goes through SPIRV-Tools' local single-block load/store
+// elimination as it is loaded, whether it was just translated or came from the cache or the pack. Applying it here, not
+// when the translator's output is written, means shaders cached before this step are covered without a cache-key
+// bump (a bump would retranslate every shader and orphan the read-only pack), and TOTK_SPIRV_OPT=0 switches it off for
+// A/B tests without touching the cache. The cost is one pass per shader per run. If the optimizer fails, the original
+// module is kept and one warning is logged.
+static void spirv_optimize(uint8_t **spv, uint64_t *size) {
+    static int on = -1;
+    static volatile int32_t failures;
+    if (on < 0) {
+        const char *v = cfg_get("TOTK_SPIRV_OPT");
+        on = !(v && !strcmp(v, "0"));
+    }
+    if (!on) return;
+    char err[256] = "";
+    uint64_t n = 0;
+    uint32_t *o = spirv_opt_local_single_block((const uint32_t *)*spv, *size / 4, &n, err, sizeof err);
+    if (!o || !spirv_complete(o, n)) {
+        if (o) snprintf(err, sizeof err, "malformed output");
+        free(o);
+        if (plat_inc32(&failures) == 1)
+            rt_log("gfx_shader: SPIR-V optimizer failed (%s); keeping the translator's module (TOTK_SPIRV_OPT=0 turns it off)", err);
+        return;
+    }
+    free(*spv);
+    *spv = (uint8_t *)o;
+    *size = n * 4;
+}
+
 // Reads <key>.spv and <key>.res.json from the pack (packed 1) or the loose files; NULL if either is missing or
 // malformed. iid: the input id, NULL when the caller sets it.
 static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int packed, int flags) {
@@ -620,6 +650,7 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
         free(res), free(spv);
         return NULL;
     }
+    spirv_optimize(&spv, &spv_size);
     GfxShader *s = calloc(1, sizeof *s);
     memcpy(s->key, key, 32);
     if (iid) memcpy(s->iid, iid, 32);

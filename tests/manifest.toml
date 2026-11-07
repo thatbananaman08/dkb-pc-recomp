@@ -295,6 +295,13 @@ tier = 1
 area = "shaders"
 cmd = ["{python}", "tests/spirv_interface_test.py", "--cc", "{cc}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
 
+[[test]]
+name = "spirv-opt"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/spirv_opt_test.py", "--cxx", "{cxx}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
+paths = ["runtime/spirv_opt.cpp", "runtime/spirv_opt.h"]
+
 # ------------------------------------------------------------------ tier 1: shader translator and SPIR-V
 
 [[test]]
