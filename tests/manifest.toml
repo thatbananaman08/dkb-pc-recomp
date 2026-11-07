@@ -16,6 +16,12 @@
 # ------------------------------------------------------------------ tier 0: Python only
 
 [[test]]
+name = "input-capture"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/input_capture_test.py"]
+
+[[test]]
 name = "check-content"
 tier = 0
 area = "tools"
