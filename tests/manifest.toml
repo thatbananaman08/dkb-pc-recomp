@@ -28,6 +28,12 @@ area = "tools"
 cmd = ["{python}", "tests/compare_screenshots_test.py"]
 
 [[test]]
+name = "compare-draws"
+tier = 0
+area = "tools"
+cmd = ["{python}", "tests/compare_draws_test.py"]
+
+[[test]]
 name = "log-events"
 tier = 0
 area = "tools"
@@ -295,6 +301,13 @@ name = "geometry-replay"
 tier = 1
 area = "geometry"
 cmd = ["{python}", "tests/geometry_replay_test.py", "--cc", "{cc}", "--deps", "{deps}"]
+
+[[test]]
+name = "draw-id"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/draw_id_test.py", "--cc", "{cc}", "--out", "{out}"]
+paths = ["runtime/draw_id.h", "runtime/vk_dump.c"]
 
 [[test]]
 name = "native-exit-capture"

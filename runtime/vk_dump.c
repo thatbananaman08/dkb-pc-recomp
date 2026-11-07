@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "draw_id.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
@@ -52,6 +53,7 @@ static FILE *passes_f, *images_f;
 static FILE *ordered_f;
 static unsigned ordered_count;
 #define ORDERED_CAP 16384
+static DrawIdSlot ordered_keys[ORDERED_CAP * 2];
 static int seq, finished, copied;      // copied: passes and dispatches of the dump frame whose images were copied
 static int skip_runs, dump_ubo;        // TOTK_DUMP_SKIP_RUNS, TOTK_DUMP_UBO
 static int select_pass = -1;          // optional single pass/dispatch snapshot
@@ -719,10 +721,17 @@ void vk_dump_draw(VkExec *ex, const VkPipeState *s, VkPipeline p, const VkPipeIn
     uint64_t th = bindings_hash(ex, info);
     if (ordered_f && frame_now() == dump_frame && ordered_count < ORDERED_CAP) {
         unsigned id = ++ordered_count;
-        fprintf(ordered_f, "draw id=%u frame=%llu pass=%d ordinal=%d op=%d pipeline=%p program=%llu vs=%016llx fs=%016llx bindings=%016llx",
+        uint64_t vs = shader_hash(s->vs), gs = shader_hash(s->gs), fs = shader_hash(s->fs);
+        uint32_t occurrence = draw_id_next(ordered_keys, ORDERED_CAP * 2, vs, gs, fs, (uint32_t)op);
+        fprintf(ordered_f, "draw id=%u frame=%llu pass=%d ordinal=%d op=%d pipeline=%p program=%llu vs=%016llx gs=%016llx fs=%016llx bindings=%016llx",
                 id, (unsigned long long)frame_now(), seq, pass_draws, op, (void *)p,
                 (unsigned long long)(ex->prog ? ex->prog->serial : 0),
-                (unsigned long long)shader_hash(s->vs), (unsigned long long)shader_hash(s->fs), (unsigned long long)th);
+                (unsigned long long)vs, (unsigned long long)gs, (unsigned long long)fs, (unsigned long long)th);
+        if (occurrence)
+            fprintf(ordered_f, " match_key=v1:%016llx:%016llx:%016llx:%u:%u", (unsigned long long)vs,
+                    (unsigned long long)gs, (unsigned long long)fs, (unsigned)op, occurrence);
+        else
+            fputs(" match_key=unavailable", ordered_f); // more unique groups than the table can hold
         if (op == OP_DRAW) {
             const p_draw *d = payload;
             fprintf(ordered_f, " prim=%d first=%d count=%d instances=%d base_instance=%d", d->prim, d->first, d->count, d->instances, d->base_instance);
@@ -981,6 +990,8 @@ void vk_dump_init(void) {
     snprintf(path, sizeof path, "%s/images.txt", dir);
     images_f = fopen(path, "w");
     if (getenv("DKB_DUMP_ORDERED")) {
+        memset(ordered_keys, 0, sizeof ordered_keys);
+        ordered_count = 0;
         snprintf(path, sizeof path, "%s/draws.txt", dir);
         ordered_f = fopen(path, "w");
         if (!ordered_f) rt_log("vk_dump: cannot open ordered draw trace %s", path);
