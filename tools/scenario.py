@@ -41,6 +41,7 @@ its timings as unreliable; a SLOW verdict then does not fail the run (parallel r
 or setup error, 77 when the scenario's private save is missing (tools/test.py reports that as a skip).
 """
 import argparse
+import bisect
 import concurrent.futures
 import datetime
 import json
@@ -144,6 +145,46 @@ NTSTATUS = {0xC0000005: 'access violation', 0xC00000FD: 'stack overflow', 0xC000
             0xC0000374: 'heap corruption', 0xC0000017: 'out of memory', 0x40010004: 'killed (debugger or Task Manager)'}
 
 
+EXIT_GRACE_S = 120   # a run that saved its last frame but has not exited this long after is killed and counted done
+GPUAV_SETTINGS = ROOT / 'tools' / 'vk_gpuav_safe.txt'
+VK_REPORT = re.compile(r'^\[host\] vk validation (error|warning): (.*)$', re.M)
+VK_SHADER = re.compile(r'Shader Module \(0x[0-9a-f]+\) \(internal ID (\d+)\)')
+VK_STAGE = re.compile(r'Stage = (\w+)')
+
+
+def safe_gpu_env():
+    """The environment for --safe-gpu: the Khronos validation layer from MSYS2 with tools/vk_gpuav_safe.txt."""
+    layer = Path(os.environ.get('MSYS2_ROOT', 'C:/msys64')) / 'ucrt64' / 'bin'
+    if not (layer / 'VkLayer_khronos_validation.json').is_file():
+        raise SystemExit(f'scenario: --safe-gpu needs the Vulkan validation layer in {layer} '
+                         '(pacman -S mingw-w64-ucrt-x86_64-vulkan-validation-layers)')
+    return ['TOTK_VK_VALIDATION=1', f'VK_LAYER_PATH={layer}', f'VK_LAYER_SETTINGS_PATH={GPUAV_SETTINGS}']
+
+
+def gpuav_reports(text):
+    """Sort the validation layer's reports in a --safe-gpu log. The shader sanitizer's undefined results (a NaN into
+    min/max and the like) are counted per shader and stage but do not fail a run: the game has some on real hardware
+    too. Every other error is GPU-AV catching an access that safe mode then skipped, which fails the run."""
+    nan, errors, first = {}, 0, None
+    clock = [(w.start(), float(w.group(1))) for w in re.finditer(r'\bworld ([0-9.]+) s\b', text)]
+    for m in VK_REPORT.finditer(text):
+        kind, msg = m.groups()
+        if kind != 'error' or 'duplicate_message_limit' in msg:
+            continue
+        follow = text[m.end():m.end() + 600].split('\n[', 1)[0]   # the report's own lines, up to the next log line
+        if 'has an undefined result' in msg:
+            sh, st = VK_SHADER.search(follow), VK_STAGE.search(follow)
+            key = f'{st.group(1) if st else "?"} shader {sh.group(1) if sh else "?"}'
+            if key not in nan:   # the game time of the last perf line before the first report: when it started
+                i = bisect.bisect(clock, (m.start(), float('inf')))
+                nan[key] = dict(count=0, from_world_s=clock[i - 1][1] if i else None)
+            nan[key]['count'] += 1
+        else:
+            errors += 1
+            first = first or msg.strip()[:200]
+    return dict(errors=errors, first_error=first, undefined_results=nan)
+
+
 def ending(code, text, timed_out):
     """(kind, detail) for how a run ended, from its exit code and output."""
     if code is None and not timed_out:
@@ -152,13 +193,15 @@ def ending(code, text, timed_out):
     # (-4 is VK_ERROR_DEVICE_LOST), which is a GPU fault, not a crash of the game's code.
     lost = re.search(r'.*(device lost|VK_ERROR_DEVICE_LOST|failed \(-4\)).*', text)
     m = FATAL.search(text)
-    if timed_out:
+    if timed_out is True:
         return 'hung', 'no exit within the time limit; killed'
     if lost:
         fault = re.search(r'.*device fault address \d+: .*', text)
         return 'device lost', (fault or lost).group(0).strip()
     if m:
         return 'crashed', m.group(1).strip()
+    if timed_out == 'exit':
+        return 'completed', f'finished the run, then did not exit within {EXIT_GRACE_S} s; killed'
     if code == 0:
         if 'frametime: exit' not in text and 'perf: frame' not in text:
             return 'completed', 'exited 0 without perf output (TOTK_TRACE=perf missing?)'
@@ -268,6 +311,8 @@ def run_once(s, exe, out, env_extra, args, warp=None):
     seconds = args.seconds or s['seconds']
     cmd = [str(exe), '--profile', str(prof), '--seconds', str(seconds), '--shot', str(out / 'last.png')]
     limit = seconds * 6 + 180
+    if args.safe_gpu:   # every shader is instrumented: the game runs at a fifth of its speed or less
+        limit = seconds * 30 + 600
     m = machine_state()
     start = time.monotonic()
     code, timed_out, text = None, False, ''
@@ -277,12 +322,20 @@ def run_once(s, exe, out, env_extra, args, warp=None):
         log.flush()
         try:
             p = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-            try:
-                code = p.wait(timeout=limit)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                p.kill()
-                p.wait()
+            finished = None   # when the game logged its end-of-run screenshot (runtime/boot.c)
+            while code is None:
+                try:
+                    code = p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    now = time.monotonic()
+                    if finished is None and b'boot: shot ' in (out / 'game.log').read_bytes()[-20000:]:
+                        finished = now
+                    if now - start > limit or finished is not None and now - finished > EXIT_GRACE_S:
+                        # Under the validation layer the process can hang in its teardown after the run is over.
+                        timed_out = 'exit' if finished is not None else True
+                        p.kill()
+                        p.wait()
+                        break
         except OSError as e:
             log.write(f'\nscenario: could not start: {e}\n')
     wall = time.monotonic() - start
@@ -302,7 +355,10 @@ def run_once(s, exe, out, env_extra, args, warp=None):
         failed.append(kind)
     busy = busy_reasons(m)
     # Speed counts only when the timings do: on a busy machine a SLOW verdict is reported, not failed.
-    perf_judged = not busy
+    perf_judged = not busy and not args.safe_gpu
+    gpuav = gpuav_reports(text) if args.safe_gpu else None
+    if gpuav and gpuav['errors']:   # safe mode skipped an access that would have faulted or read garbage
+        failed.append(f'GPU-AV: {gpuav["errors"]} error report(s), first: {gpuav["first_error"]}')
     if perf_judged and perf_fails(checks, perf['verdict']):
         failed.append(f'perf {perf["verdict"]}')
     if kind == 'completed' and perf['verdict'] == 'no data':
@@ -325,7 +381,8 @@ def run_once(s, exe, out, env_extra, args, warp=None):
     if not args.keep_profile:
         shutil.rmtree(prof, ignore_errors=True)
     r = dict(perf_judged=perf_judged, vram_peak_mib=vram_used, vram_budget_mib=vram_budget,
-             vram_over_budget=bool(vram_used and vram_budget and vram_used > vram_budget),scenario=s['name'], variant=out.name, warp=warp, env=env_extra, exe=str(exe), seconds=seconds, wall_s=round(wall, 1),
+             vram_over_budget=bool(vram_used and vram_budget and vram_used > vram_budget), gpuav=gpuav,
+             scenario=s['name'], variant=out.name, warp=warp, env=env_extra, exe=str(exe), seconds=seconds, wall_s=round(wall, 1),
              exit_code=code, ending=kind, ending_detail=detail, perf=perf['verdict'], fps=perf['fps'],
              slow_windows=perf['slow_windows'], worst_frame_ms=perf['worst_ms'],
              major_episode_causes=sorted({e['cause'] for e in perf['episodes'] if e['major']}),
@@ -367,6 +424,10 @@ def main(argv=None):
                     '20 layers (combines with --ab and --repeat)')
     ap.add_argument('--warp', metavar='STAGE', help="start each run in this stage instead of the save's "
                     '(tools/save_warp.py; `python tools/save_warp.py --stages` lists them)')
+    ap.add_argument('--safe-gpu', action='store_true',
+                    help='run under GPU-assisted validation in safe mode (tools/vk_gpuav_safe.txt): an access that '
+                    'would fault the GPU is skipped and reported in game.log, so the driver is never reset. About '
+                    'ten times slower; speed is not judged')
     a = ap.parse_args(argv)
 
     if a.list:
@@ -389,6 +450,8 @@ def main(argv=None):
         print(f'scenario: no dkb.exe in {a.build} (build it with tools/build_game.py)')
         return 2
     extra = {}
+    if a.safe_gpu:
+        a.env = safe_gpu_env() + a.env
     for item in a.env:
         k, sep, v = item.partition('=')
         if not sep:

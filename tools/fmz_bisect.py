@@ -108,10 +108,23 @@ def make_build(bad_build, bad, good, swap, dest):
             shutil.copy2(src, dest / 'shader-cache' / dst.name)
 
 
-def run(build, stage, env, seconds, log, force=False):
-    """'fault', 'ok' or 'unclear' for one run of the stage, and the run's result.json."""
+def safe_signal(r, after):
+    """The reset-free fault signal of a --safe-gpu run: accesses GPU-AV skipped, plus the shader sanitizer's
+    undefined results (NaN into min/max and the like) from shaders whose first report came at or after `after`
+    seconds of game time. Reports from before that (the title screen and the load) belong to every run."""
+    g = r.get('gpuav') or {}
+    late = sum(v['count'] for v in (g.get('undefined_results') or {}).values()
+               if v.get('from_world_s') is not None and v['from_world_s'] >= after)
+    return (g.get('errors') or 0) + late
+
+
+def run(build, stage, env, seconds, log, force=False, safe_after=None):
+    """'fault', 'ok' or 'unclear' for one run of the stage, and the run's result.json. With safe_after, the run
+    goes through GPU-AV safe mode (tools/scenario.py --safe-gpu) and 'fault' means safe_signal() found reports."""
     cmd = [sys.executable, 'tools/scenario.py', 'tutorial-cave', '--build', str(build), '--warp', stage,
            '--seconds', str(seconds)] + [a for e in env for a in ('--env', e)] + (['--force'] if force else [])
+    if safe_after is not None:
+        cmd.append('--safe-gpu')
     with open(log, 'a', encoding='utf-8') as f:
         f.write('$ ' + subprocess.list2cmdline(cmd) + '\n')
         out = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding='utf-8', errors='replace')
@@ -126,6 +139,8 @@ def run(build, stage, env, seconds, log, force=False):
     if r['ending'] in ('device lost', 'crashed', 'crashed, no report'):
         return 'fault', r
     if r['ending'] == 'completed' and r.get('in_scene') is not False:
+        if safe_after is not None and safe_signal(r, safe_after):
+            return 'fault', r
         return 'ok', r
     return 'unclear', r
 
@@ -143,6 +158,11 @@ def main(argv=None):
                     'into at least this many parts and runs them together; about a third of the time with 3')
     ap.add_argument('--candidates', metavar='RESULT_JSON', help='start from the remaining candidates of an earlier run')
     ap.add_argument('--cooldown', type=float, default=90, help='seconds to wait after a test that lost the GPU (default 90)')
+    ap.add_argument('--safe-gpu', dest='safe_after', type=float, nargs='?', const=30.0, metavar='SECONDS',
+                    help='reset-free: run every test under GPU-AV safe mode (tools/scenario.py --safe-gpu), which '
+                    'skips the faulting access, and count a test as faulting when the shader sanitizer reports '
+                    'undefined results from shaders first seen at or after SECONDS of game time (default 30, after '
+                    'the warp has loaded). About 4 min a test once the shaders are cached')
     ap.add_argument('--allow-parallel-faults', action='store_true', help='allow --jobs > 1 (risks a driver crash)')
     a = ap.parse_args(argv)
     if not 1 <= a.jobs <= 3:
@@ -175,10 +195,10 @@ def main(argv=None):
             time.sleep(slot * STAGGER_S)
         d = test_dir if a.jobs == 1 else test_dir.with_name(f'{test_dir.name}-{slot}')
         make_build(bad_build, bad, good, swap, d)
-        verdict, r = run(d, a.stage, a.env, a.seconds, log, a.jobs > 1)
+        verdict, r = run(d, a.stage, a.env, a.seconds, log, a.jobs > 1, a.safe_after)
         if verdict == 'unclear':   # one retry: a run that ended neither way says nothing
-            verdict, r = run(d, a.stage, a.env, a.seconds, log, a.jobs > 1)
-        if verdict == 'fault':     # let the driver settle after a GPU reset before the next test
+            verdict, r = run(d, a.stage, a.env, a.seconds, log, a.jobs > 1, a.safe_after)
+        if r and r['ending'] == 'device lost':   # let the driver settle after a GPU reset before the next test
             time.sleep(a.cooldown)
         with lock:
             tests.append(dict(why=why, swapped=len(swap), verdict=verdict, ending=r and r['ending'],

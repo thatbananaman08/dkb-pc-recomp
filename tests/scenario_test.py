@@ -148,6 +148,29 @@ class Files(unittest.TestCase):
         self.assertEqual(sc.busy_reasons(m), ['godot (6191 MiB)', 'only 2.5 GiB of commit memory free'])
         self.assertEqual(sc.busy_reasons(dict(games=[], heavy=[], free_commit_gib=20.0, checked=True)), [])
 
+    def test_gpuav_reports(self):
+        nan = ('[host] vk validation error: vkCmdDrawIndexed(): FMax (from GLSL.std.450) has an undefined result '
+               'because the y operand is NaN.\nStage = Fragment.  Fragment coord (x,y) = (1.5, 2.5). \n'
+               'Command buffer (0x1)\n\tDraw Index 52\nShader Module (0x1b72) (internal ID 59)\n')
+        oob = ('[host] vk validation error: vkCmdDraw(): Out of bounds access of buffer device address.\n'
+               'Stage = Vertex.\nShader Module (0x2a) (internal ID 7)\n')
+        text = ('[host] vk validation warning: vkCreateDevice(): Warning that validation is adjusting settings:\n'
+                + nan + nan + '[gfx] frame 10\n' + oob
+                + '[host] vk validation error: (Warning - This VUID has now been reported 50 times, which is the '
+                'duplicate_message_limit value, this will be the last time reporting it).\n')
+        r = sc.gpuav_reports(text)
+        self.assertEqual(r['undefined_results'], {'Fragment shader 59': dict(count=2, from_world_s=None)})
+        self.assertEqual(r['errors'], 1)
+        self.assertTrue(r['first_error'].startswith('vkCmdDraw(): Out of bounds'))
+        later = '[host] perf: frame 60: interval avg 16 ms; world 43.1 s\n' + nan
+        self.assertEqual(sc.gpuav_reports(later)['undefined_results'],
+                         {'Fragment shader 59': dict(count=1, from_world_s=43.1)})
+
+    def test_ending_after_a_stuck_exit(self):
+        self.assertEqual(sc.ending(None, 'boot: shot x.png', 'exit')[0], 'completed')
+        self.assertEqual(sc.ending(None, 'FATAL: vk: upload submit failed (-4)', 'exit')[0], 'device lost')
+        self.assertEqual(sc.ending(None, '', True)[0], 'hung')
+
 
 if __name__ == '__main__':
     unittest.main()
