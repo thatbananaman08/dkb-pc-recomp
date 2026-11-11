@@ -84,6 +84,8 @@ static void vkCmdDispatchIndirect(int cb, VkBuffer src, uint64_t offset) {
     (void)cb; memcpy(groups, src + offset, sizeof groups); dispatches++;
 }
 static void vk_mem_count(int cls, int use, uint64_t bytes) { (void)cls; (void)use; (void)bytes; }
+static uint64_t kern_now_ns(void) { return 0; }   // wait_log timing in op_dispatch_ind
+static void wait_log(const VkExec *ex, const char *what, const char *cause, int st, uint64_t ns) { (void)ex; (void)what; (void)cause; (void)st; (void)ns; }
 static void vk_dump_dispatch(VkExec *ex, const GfxShader *shader, VkPipeline pipe, const VkPipeInfo *info,
                              const p_dispatch *dispatch) { (void)ex; (void)shader; (void)pipe; (void)info; (void)dispatch; }
 '''

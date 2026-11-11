@@ -1,3 +1,5 @@
+int vkb_buf_mode(void) { return 0; }
+int gfx_shader_bindless_buffers(const GfxShader *s) { (void)s; return 0; }
 // Original CPU contract for real vk_pipeline.c functions; no loader/device is linked.
 // Included after actual GfxShader structure, reflector and accessor definitions.
 #include <stdarg.h>

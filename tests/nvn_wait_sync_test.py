@@ -34,7 +34,7 @@ def main():
     fixture.write_text(text)
     subprocess.run([args.cc, '-std=gnu11', '-O1', '-Wall', '-Wextra', '-fno-strict-aliasing',
                     '-ffunction-sections', '-fdata-sections', '-I', str(source/'runtime'), str(fixture),
-                    str(source/'runtime/nvn_api_cmd.c'), str(source/'runtime/nvn_api_core.c'),
+                    str(source/'runtime/nvn_api_cmd.c'), str(source/'runtime/nvn_api_core.c'), str(ROOT/'tests/census_stub.c'), str(ROOT/'tests/sync_late_stub.c'),
                     '-Wl,--gc-sections', *([] if os.name == 'nt' else ['-pthread']), '-o', str(exe)], check=True)
     return subprocess.run([str(exe)], timeout=20).returncode
 

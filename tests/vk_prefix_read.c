@@ -20,6 +20,15 @@ static _Thread_local int x_here;
 static int split_draws, part_start;
 static uint64_t part_t0, n_parts, n_subs;
 static PlatMutex sub_lock, st_lock;
+static volatile int64_t sub_calls_w, sub_wait_w, sub_wait_max_w, sub_hold_w, sub_hold_max_w;   // vk_sync.c: the submit-lock window
+uint64_t plat_now_ns(void) { static uint64_t t; return t += 1000; }   // the submit-lock timing only reads it
+static void resub_note(uint64_t handle) { (void)handle; }   // vk_exec.c TOTK_TRACE=perf resubmission census
+static struct { int on, active; } VR;   // vk_exec.c TOTK_REPLAY_VERIFY pre-pass (stubs: replay itself is not under test here)
+static void vr_prepass(const VkExec *ex, const uint64_t *handles, int n) { (void)ex, (void)handles, (void)n; }
+static struct { uint64_t sub_draws[8], sub_ns[8]; int nsub; } MS;   // vk_exec.c multithreading measurement
+void vk_exec_mt_begin(int work) { (void)work; }   // vk_exec_draw.c multithreaded replay (stubs: the draw path is not under test here)
+void vk_exec_mt_join(VkExec *ex) { (void)ex; }
+volatile int64_t perf_phase_ns[PH_N], perf_phase_n[PH_N];   // host.h perf_phase
 static PlatCond cv_work;
 static unsigned mirror_begin, mirror_end, snapshot_begin, snapshot_end, walked, worked;
 static unsigned expect_recorded;

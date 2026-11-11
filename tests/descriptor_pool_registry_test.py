@@ -267,7 +267,7 @@ static void *record_pool(void *cmd, uint32_t op, size_t size) {
             (obj, ('nvnTexturePoolInitialize', 'nvnTexturePoolFinalize', 'nvnTexturePoolRegisterTexture')),
             (cmd, ('nvnCommandBufferSetTexturePool', 'nvnCommandBufferSetSamplerPool'))):
         parts += [function(text, 'NVN_API(' + name + ')') for name in names]
-    cases = [next(line.strip() for line in replay.splitlines() if line.strip().startswith('case ' + name + ':'))
+    cases = [next(line.strip() for line in replay.splitlines() if line.strip().startswith('case ' + name + ':') and line.rstrip().endswith('break;') and 'vr_shadow' not in line)
              for name in ('OP_SET_TEX_POOL', 'OP_SET_SAMP_POOL')]
     parts += ['static void apply_pool_case(VkExec *ex, uint32_t op, const void *a) { switch(op) {\n' +
               '\n'.join(cases) + '\ndefault: rt_fatal("unexpected pool op\\n"); } }', FIXTURE]

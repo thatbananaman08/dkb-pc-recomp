@@ -21,7 +21,20 @@ void rec_end(void);                   // waits for the recorder; no-op when rec_
 // when it records cb, and the wait for it (1); otherwise rec_end and the breadcrumb, and the caller ends cb (0).
 int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n);
 void rec_drain(void);                 // waits until the recorder made every call queued so far
-void rec_stats_log(void);             // TOTK_TRACE=perf: packets, bytes, drains and waits since the last call
+void rec_stats_log(void);
+
+// TOTK_REPLAY_SPLIT (vk_exec_draw.c): a replay worker records its chunk's calls into a RecChunk, the walk thread puts the
+// chunk's place into the ring, the recorder makes the chunk's calls once it is published.
+typedef struct RecChunk RecChunk;
+int rec_split_ok(void);                 // the recorder thread is recording the part being replayed
+RecChunk *rec_chunk_alloc(void);
+void rec_chunk_begin(RecChunk *c);     // this thread's calls on the owned command buffer go into c
+void rec_chunk_end(void);
+int rec_chunk_active(void);
+uint64_t rec_chunk_packets(const RecChunk *c);
+void rec_chunk_publish(RecChunk *c);   // c is complete; the recorder may run it
+void rec_chunk_release(RecChunk *c);   // c was never enqueued
+void rec_chunk_enqueue(RecChunk *c);   // the walk thread (producer): c's place in the call order             // TOTK_TRACE=perf: packets, bytes, drains and waits since the last call
 
 // Extension commands called through device function pointers.
 void rec_crumb(VkCommandBuffer cb, int kind, uint64_t n);   // vk_crumb in order with this command buffer's packets

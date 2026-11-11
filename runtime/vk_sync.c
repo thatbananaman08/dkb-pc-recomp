@@ -33,6 +33,8 @@ static PlatThread *completion_thread;
 
 // Submissions: one at a time, so timeline values are signalled in the order they are handed out.
 static PlatMutex sub_lock = PLAT_MUTEX_INIT;
+// 60-frame window, for the perf line (gpu_stats): submissions, the time they waited for sub_lock and the time they held it.
+static volatile int64_t sub_calls_w, sub_wait_w, sub_wait_max_w, sub_hold_w, sub_hold_max_w;
 static VkCommandPool cmd_pool;
 static CmdSlot *slots;
 static int nslots;
@@ -273,6 +275,9 @@ static void gpu_stats(PerfGpu *g) {
     g->gpu_missed = (uint64_t)plat_xchg64(&ts_missed, 0);
     g->have_vram = vk_mem_vram(&g->vram_used, &g->vram_budget, &g->vram_exact);
     vk_upload_perf(&g->up_gpu_ns, &g->up_timed, &g->up_batches, &g->up_wait_ns, &g->up_bytes);
+    g->sub_calls = (uint64_t)plat_xchg64(&sub_calls_w, 0), g->sub_wait_ns = (uint64_t)plat_xchg64(&sub_wait_w, 0);
+    g->sub_wait_max_ns = (uint64_t)plat_xchg64(&sub_wait_max_w, 0), g->sub_hold_ns = (uint64_t)plat_xchg64(&sub_hold_w, 0);
+    g->sub_hold_max_ns = (uint64_t)plat_xchg64(&sub_hold_max_w, 0);
 }
 
 // Weak stand-in for vk_exec.c's replay: only empty recordings ({OP_BEGIN, OP_END}) can be submitted.
@@ -471,14 +476,19 @@ uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t su
     if (!record) rt_fatal("vk: submission without a recorder");
     vk_sync_start();
     VkCtx *c = vk_ctx();
+    const uint64_t lw0 = plat_now_ns();
     plat_mutex_lock(&sub_lock);
+    const uint64_t lw1 = plat_now_ns();
     vk_mem_dirty_submit();   // TOTK_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
     // A texture alias can retire an image or view used earlier in this recording. Collection must wait for this
     // submission, including every split part, before the first command can reference those objects.
     vk_mem_protect_until(fence);
+    const uint64_t ph_slot0 = plat_now_ns();
     CmdSlot *s = take_slot(c, fence);
+    const uint64_t ph_slot1 = plat_now_ns();
+    __atomic_add_fetch(&perf_phase_ns[PH_SLOT], (int64_t)(ph_slot1 - ph_slot0), __ATOMIC_RELAXED), __atomic_add_fetch(&perf_phase_n[PH_SLOT], 1, __ATOMIC_RELAXED);
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     uint64_t t0 = perf_begin();
@@ -486,7 +496,10 @@ uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t su
     vk_crumb(s->cb, VK_CRUMB_SUBMIT, fence);
     ts_begin(s->cb);
     rec_begin(s->cb);
+    const uint64_t ph_rec0 = plat_now_ns();
     int recorded = record(s->cb, fence, submitted_ticks, context);
+    perf_phase(PH_RECORD, ph_rec0);
+    const uint64_t ph_post0 = plat_now_ns();
     s = &slots[cur_slot];   // the last part (vk_sync_split)
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
@@ -505,9 +518,12 @@ uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t su
                         .commandBufferInfoCount = (pro ? 1u : 0u) + (recorded ? 1u : 0u),
                         .pCommandBufferInfos = pro ? cbi : cbi + 1, .signalSemaphoreInfoCount = 1,
                         .pSignalSemaphoreInfos = &sig};
+    perf_phase(PH_POST, ph_post0);
+    const uint64_t ph_q0 = plat_now_ns();
     vk_queue_lock();
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
+    perf_phase(PH_QSUBMIT, ph_q0);
     if (r != VK_SUCCESS) {
         vk_device_fault_report(r);
         rt_fatal("vk: vkQueueSubmit2 of value %llu failed (%d)", (unsigned long long)fence, (int)r);
@@ -519,6 +535,13 @@ uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t su
     plat_mutex_unlock(&st_lock);
     static unsigned subs;
     if (++subs % 4096 == 0) rec_stats_log();
+    {   // under sub_lock: the window's maxima need no atomics
+        const uint64_t lw2 = plat_now_ns();
+        __atomic_add_fetch(&perf_phase_ns[PH_PRE], (int64_t)((ph_slot0 - lw1) + (ph_rec0 - ph_slot1)), __ATOMIC_RELAXED);
+        plat_add64(&sub_calls_w, 1), plat_add64(&sub_wait_w, (int64_t)(lw1 - lw0)), plat_add64(&sub_hold_w, (int64_t)(lw2 - lw1));
+        if ((int64_t)(lw1 - lw0) > sub_wait_max_w) sub_wait_max_w = (int64_t)(lw1 - lw0);
+        if ((int64_t)(lw2 - lw1) > sub_hold_max_w) sub_hold_max_w = (int64_t)(lw2 - lw1);
+    }
     plat_mutex_unlock(&sub_lock);
     return fence;
 }

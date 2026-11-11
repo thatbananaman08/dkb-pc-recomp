@@ -390,6 +390,11 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb);
 // This process's memory in bytes: resident (the working set) and private (Windows: committed private bytes; Linux: the
 // resident anonymous pages). 0 when unknown.
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);
+// More of the process and the machine, in bytes (0 when unknown): faults is the process's page-fault count since it started (soft and hard
+// together), peak_resident its largest working set, avail_phys / total_phys the machine's free and installed physical memory, commit_used /
+// commit_limit the system's committed memory and its limit.
+typedef struct { uint64_t faults, peak_resident, avail_phys, total_phys, commit_used, commit_limit; } PlatVmStats;
+void plat_process_vm_stats(PlatVmStats *s);
 
 // ---- child processes: a program with stdin and stdout piped to us (stderr discarded), no console window.
 typedef struct PlatChild PlatChild;

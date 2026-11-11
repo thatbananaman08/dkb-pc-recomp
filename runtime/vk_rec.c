@@ -39,7 +39,7 @@ enum {
     R_SetDepthWriteEnable, R_SetFrontFace, R_SetPrimitiveRestartEnable, R_SetPrimitiveTopology,
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
-    R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb, R_Crumb,
+    R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb, R_Crumb, R_Chunk,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
@@ -91,8 +91,65 @@ static void wait_space(uint64_t need) {
     while (put_h + need - __atomic_load_n(&tail, __ATOMIC_ACQUIRE) > RING_WORDS) _mm_pause();
 }
 
+// ---- TOTK_REPLAY_SPLIT: per-chunk packet buffers. A replay worker records its chunk's calls into a RecChunk of its own
+// (rec_chunk_begin ... rec_chunk_end: the thread's calls on the owned command buffer go there instead of the ring) and the
+// walk thread puts a R_Chunk packet at the chunk's place in the ring; the recorder waits there until the worker published
+// the chunk, makes its calls in order, and gives the buffer back. A packet never crosses a block (as in the ring).
+#define CHUNK_BLOCK_WORDS (1u << 16)
+typedef struct RecBlock { struct RecBlock *next; uint64_t used; uint64_t w[CHUNK_BLOCK_WORDS]; } RecBlock;
+struct RecChunk { RecBlock *blocks, *last, *cur; volatile int state; struct RecChunk *next_free; uint64_t packets; };
+static _Thread_local RecChunk *sink;
+static PlatMutex chunk_lock = PLAT_MUTEX_INIT;
+static RecChunk *chunk_free;
+
+RecChunk *rec_chunk_alloc(void) {
+    plat_mutex_lock(&chunk_lock);
+    RecChunk *c = chunk_free;
+    if (c) chunk_free = c->next_free;
+    plat_mutex_unlock(&chunk_lock);
+    if (!c && !(c = calloc(1, sizeof *c))) rt_fatal("vk_rec: out of memory");
+    c->next_free = NULL, c->cur = NULL, c->packets = 0;
+    __atomic_store_n(&c->state, 0, __ATOMIC_RELAXED);
+    return c;
+}
+int rec_split_ok(void) { return rec_live; }
+void rec_chunk_begin(RecChunk *c) { sink = c; }
+void rec_chunk_end(void) { sink = NULL; }
+int rec_chunk_active(void) { return sink != NULL; }
+uint64_t rec_chunk_packets(const RecChunk *c) { return c->packets; }
+void rec_chunk_publish(RecChunk *c) { __atomic_store_n(&c->state, 1, __ATOMIC_RELEASE); }
+// A chunk that was never enqueued (the walk thread falls back to the serial path for it).
+void rec_chunk_release(RecChunk *c) {
+    plat_mutex_lock(&chunk_lock);
+    c->next_free = chunk_free, chunk_free = c;
+    plat_mutex_unlock(&chunk_lock);
+}
+
+static void *sink_put(uint32_t op, size_t bytes) {
+    RecChunk *c = sink;
+    uint64_t n = 1 + (bytes + 7) / 8;
+    if (n > CHUNK_BLOCK_WORDS) rt_fatal("vk_rec: a packet of %llu bytes", (unsigned long long)bytes);
+    RecBlock *b = c->cur;
+    if (!b || b->used + n > CHUNK_BLOCK_WORDS) {
+        b = b ? b->next : c->blocks;
+        if (!b) {
+            if (!(b = malloc(sizeof *b))) rt_fatal("vk_rec: out of memory");
+            b->next = NULL;
+            if (c->last) c->last->next = b; else c->blocks = b;
+            c->last = b;
+        }
+        b->used = 0, c->cur = b;
+    }
+    uint64_t *p = &b->w[b->used];
+    p[0] = (uint64_t)op | n << 32;
+    b->used += n;
+    c->packets++;
+    return p + 1;
+}
+
 // Room for a packet of bytes of arguments; the caller fills it and calls pub().
 static void *put(uint32_t op, size_t bytes) {
+    if (sink) return sink_put(op, bytes);
     uint64_t n = 1 + (bytes + 7) / 8, pos = put_h % RING_WORDS;
     if (n > RING_WORDS / 4) rt_fatal("vk_rec: a packet of %llu bytes", (unsigned long long)bytes);
     if (pos + n > RING_WORDS) {
@@ -109,6 +166,7 @@ static void *put(uint32_t op, size_t bytes) {
 }
 
 static void pub(void) {
+    if (sink) return;
     __atomic_store_n(&head, put_h, __ATOMIC_RELEASE);
     if (__atomic_load_n(&sleeping, __ATOMIC_RELAXED)) plat_event_set(&wake_ev);
 }
@@ -122,6 +180,13 @@ void rec_drain(void) {
         if (i < 20000) _mm_pause();
         else plat_yield();
     RS_.drains++, RS_.drain_ns += now_ns() - t0;
+}
+
+// The walk thread: the chunk's calls go here, in the ring's order (the recorder waits for the chunk to be published).
+void rec_chunk_enqueue(RecChunk *c) {
+    RecChunk **a = put(R_Chunk, sizeof *a);
+    *a = c;
+    pub();
 }
 
 void rec_begin(VkCommandBuffer cb) {
@@ -195,7 +260,7 @@ void rec_stats_log(void) {
 
 #define OWNED(cb) (rec_live && (cb) == rec_cb)
 // A call the ring takes no packet for: everything queued first, then the call here.
-#define FALLBACK() (rec_drain(), RS_.fallbacks++)
+#define FALLBACK() (sink ? rt_fatal("vk_rec: a call without a packet on a replay split worker") : (void)0, rec_drain(), RS_.fallbacks++)
 
 // Copies n elements of arr after the fixed part at *at and returns where they went (NULL for none).
 static void *tail_copy(uint8_t **at, const void *arr, size_t bytes) {
@@ -546,8 +611,31 @@ TARGET_CMD(rec_write_mask, R_WriteMask, PFN_vkCmdSetColorWriteMaskEXT, VkColorCo
 
 // ---- the recorder's side
 
+volatile uint64_t rec_last_bind[4];    // the last BindDescriptorSets: layout, first set, count, first set handle
+volatile uint32_t rec_last_op[2];   // the packets the recorder thread executed last (the crash report prints them)
+static void exec_chunk(RecChunk *c) {
+    for (int i = 0; __atomic_load_n(&c->state, __ATOMIC_ACQUIRE) == 0; i++)
+        if (i < 20000) _mm_pause();
+        else plat_yield();
+    for (RecBlock *b = c->blocks; b && c->cur; b = b->next) {
+        for (uint64_t t = 0; t < b->used;) {
+            uint64_t w = b->w[t];
+            exec_packet((uint32_t)(w & 0xffff), &b->w[t + 1]);
+            t += w >> 32;
+        }
+        if (b == c->cur) break;
+    }
+    rec_chunk_release(c);
+}
+
 static void exec_packet(uint32_t op, void *p) {
     VkCommandBuffer cb = rec_cb;
+    if (op == R_Chunk) { exec_chunk(*(RecChunk **)p); return; }
+    rec_last_op[1] = rec_last_op[0], rec_last_op[0] = op;
+    if (op == R_BindDescriptorSets) {
+        A_BindDescriptorSets *b = p;
+        rec_last_bind[0] = (uint64_t)(uintptr_t)b->l, rec_last_bind[1] = b->first, rec_last_bind[2] = b->n, rec_last_bind[3] = b->n ? (uint64_t)(uintptr_t)b->s[0] : 0;
+    }
     switch (op) {
 #define F(name, ...) case R_##name: { A_##name *a = p; vkCmd##name(cb, __VA_ARGS__); break; }
     F(BeginQuery, a->p, a->q, a->f)

@@ -27,6 +27,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "pace_log.h"
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
@@ -87,9 +88,13 @@ static void present_main(void *arg) {
         plat_cond_broadcast(&pcv);
         plat_mutex_unlock(&pl);
         uint64_t t0 = kern_now_ns();
-        if (present_hold()) wait_until(j.at);
+        if (vk_present_flip_queued()) {   // TOTK_PACE_FLIP=1: the flip thread presents at j.at (gfx_present.c)
+            vk_present_flip_at(j.at);
+        } else {
+            if (present_hold()) wait_until(j.at);
+            vk_present_flip();
+        }
         uint64_t t1 = kern_now_ns();
-        vk_present_flip();
         // TOTK_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
         if (rt_trace & RT_TRACE_PRESENT)

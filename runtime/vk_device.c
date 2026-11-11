@@ -208,6 +208,8 @@ typedef struct {
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl;
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
+    VkPhysicalDevicePresentIdFeaturesKHR pid;
+    VkPhysicalDevicePresentWaitFeaturesKHR pw;
 } FeatureChain;
 
 static int create_device(void) {
@@ -215,7 +217,7 @@ static int create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[28];
+    const char *ext[32];
     uint32_t n_ext = 0;
     for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++) ext[n_ext++] = k_required_ext[i];
 
@@ -252,6 +254,17 @@ static int create_device(void) {
         CHAIN(fbl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
+    // TOTK_PACE_LOG=1 only (diagnostics, pace_log.h): the display time of each frame from present_wait.
+    {
+        const char *pl = cfg_get("TOTK_PACE_LOG");
+        if (pl && !strcmp(pl, "1") && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
+            g_vk.has_present_wait = 1;
+            ext[n_ext++] = VK_KHR_PRESENT_ID_EXTENSION_NAME;
+            ext[n_ext++] = VK_KHR_PRESENT_WAIT_EXTENSION_NAME;
+            CHAIN(pid, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
+            CHAIN(pw, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR);
+        }
+    }
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
     // GPU breadcrumbs for a lost device (vk_crumbs.c): AMD's drivers and RADV report it.
     if (has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) { g_vk.has_buffer_marker = 1; ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME; }
@@ -270,6 +283,21 @@ static int create_device(void) {
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
     vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
+    // Diagnostic (DIAGNOSTICS.md): DKB_NO_ROBUSTNESS=1 creates the device without buffer and image robustness, to test
+    // whether the NVIDIA light-quad fault (#9) depends on the robust vertex-fetch path. Out-of-range guest reads are then
+    // undefined, so a device loss in such a run is not proof of anything; only a run that gets further is informative.
+    if (getenv("DKB_NO_ROBUSTNESS") && !strcmp(getenv("DKB_NO_ROBUSTNESS"), "1")) {
+        c->f2.features.robustBufferAccess = VK_FALSE;
+        c->rob2.robustBufferAccess2 = VK_FALSE;
+        c->rob2.robustImageAccess2 = VK_FALSE;
+        c->f13.robustImageAccess = VK_FALSE;
+        rt_log("vk: buffer and image robustness off (DKB_NO_ROBUSTNESS=1)");
+    }
+    // DKB_LQ_PATCH=demote (gfx_shader.c lq_patch) emits OpDemoteToHelperInvocation. The chain above enables everything the
+    // driver reports, this feature included; say so when it is absent.
+    if (getenv("DKB_LQ_PATCH") && strstr(getenv("DKB_LQ_PATCH"), "demote"))
+        rt_log("vk: shaderDemoteToHelperInvocation %s (DKB_LQ_PATCH=demote)",
+               c->f13.shaderDemoteToHelperInvocation ? "enabled" : "NOT supported: patched shaders will be rejected");
     if (gpl_link) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
@@ -290,6 +318,12 @@ static int create_device(void) {
     else if (!h->geometryShader) miss = "geometryShader";
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
+    if (getenv("DKB_LIGHT_QUAD_FETCH"))   // diagnostic (DIAGNOSTICS.md): the robustness features this device is created with
+        rt_log("light-fetch: device robustBufferAccess=%d robustBufferAccess2=%d robustImageAccess2=%d nullDescriptor=%d robustImageAccess=%d (robustness2 extension %s)",
+               (int)h->robustBufferAccess, (int)(g_vk.has_robustness2 && c->rob2.robustBufferAccess2),
+               (int)(g_vk.has_robustness2 && c->rob2.robustImageAccess2), (int)(g_vk.has_robustness2 && c->rob2.nullDescriptor),
+               (int)c->f13.robustImageAccess, g_vk.has_robustness2 ? "enabled" : "absent");
+    if (g_vk.has_present_wait && !(c->pid.presentId && c->pw.presentWait)) g_vk.has_present_wait = 0;
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;

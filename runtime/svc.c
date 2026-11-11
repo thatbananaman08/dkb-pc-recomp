@@ -8,6 +8,7 @@
 
 #include "fs.h"
 #include "host.h"
+#include "hostprof.h"
 #include "kernel.h"
 #include "vk.h"
 #include "platform/platform.h"
@@ -138,8 +139,38 @@ static void get_info(Cpu *c, uint64_t pc) {
 
 static void svc_body(Cpu *c, uint32_t imm, uint64_t pc);
 
+// TOTK_HOSTPROF: the SVC timed; the synchronisation SVCs (sleep, WaitSynchronization, ArbitrateLock, WaitProcessWideKeyAtomic,
+// WaitForAddress) count their whole time as waiting, per waited-on address (the first handle for WaitSynchronization).
+__attribute__((noinline)) static void svc_profiled(Cpu *c, uint32_t imm, uint64_t pc) {
+    uint64_t a0 = c->x[0], a1 = c->x[1];
+    int sync = imm == 0x0B || imm == 0x18 || imm == 0x1A || imm == 0x1C || imm == 0x34;
+    uint64_t obj = imm == 0x1A ? a1 : imm == 0x1C ? a1 : imm == 0x34 ? a0 : 0;
+    if (imm == 0x18 && a1 && plat_mem_readable(a1, 4)) {
+        uint32_t h;
+        memcpy(&h, (const void *)(uintptr_t)a1, 4);
+        obj = h;
+    }
+    HpT t = hp_begin();
+    void *th = c->thread;
+    if (kern_host_track && th) {
+        int *d = kern_host_depth(th);
+        __atomic_store_n(d, *d + 1, __ATOMIC_RELAXED);
+        svc_body(c, imm, pc);
+        int n = *d - 1;
+        __atomic_store_n(d, n, __ATOMIC_RELAXED);
+        if (!n && kern_preempt_pending(th)) kern_host_left(th);
+    } else {
+        svc_body(c, imm, pc);
+    }
+    hp_svc(imm, kern_now_ns() - t.t0, hp_wait_ns - t.w0, sync, obj);
+}
+
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     kern_checkpoint();
+    if (__builtin_expect(g_hostprof, 0)) {
+        svc_profiled(c, imm, pc);
+        return;
+    }
     if (__builtin_expect(!kern_host_track || !c->thread, 1)) {
         svc_body(c, imm, pc);
         return;

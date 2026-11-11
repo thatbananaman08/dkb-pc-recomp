@@ -1105,7 +1105,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
 
 void vk_texture_lock(void) { lock(); }
 void vk_texture_unlock(void) { unlock(); }
-uint32_t vk_texture_slots_gen(void) { return slots_gen; }
+uint32_t vk_texture_slots_gen(void) { return __atomic_load_n(&slots_gen, __ATOMIC_ACQUIRE); }
 
 uint64_t vk_texture_slot_token(const dpool_ref *pool, int id) {
     // tex_lock is recursive: callers may already hold it, or may be checking a cache before acquiring it.
@@ -1538,6 +1538,23 @@ static void wb_note(const Tex *e, int skipped) {
            e->t.d.format, (unsigned long long)e->t.L.size,
            !p ? "none" : (fl & NVN_MEMORY_POOL_FLAGS_CPU_CACHED) ? "cpu-cached" : (fl & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) ? "cpu-uncached" : "other",
            (unsigned long long)wb_limit);
+}
+
+// What vk_texture_write_back_small(fence) would copy back: 0 nothing (a CPU wait for fence has no GPU results to read),
+// 1 only targets of at most tiny bytes, 2 larger ones (TOTK_SYNC_EARLY, TOTK_SYNC_LATE_SMALL).
+int vk_texture_small_dirty_class(uint64_t fence, uint64_t tiny) {
+    if (!vk_texture_small_dirty()) return 0;
+    lock();
+    wb_cfg_init();
+    int cls = 0;
+    plat_mutex_lock_shared(&owned_lock);
+    for (int i = 0; i < nowned && cls < 2; i++) {
+        const Tex *e = owned[i];
+        if (e->gpu_dirty && e->t.L.size <= wb_limit && e->gpu_fence <= fence) cls = e->t.L.size <= tiny ? 1 : 2;
+    }
+    plat_mutex_unlock_shared(&owned_lock);
+    unlock();
+    return cls;
 }
 
 void vk_texture_write_back_small(uint64_t fence) {

@@ -2,7 +2,8 @@
 static Pipe *pipe_miss(const VkPipeState *,const GKey *,uint64_t,int,int *);
 static PlatCond work_cv=PLAT_COND_INIT;
 static unsigned layout_calls;
-static Layout *layout_get(Bindings *b) { (void)b;layout_calls++;return NULL; }
+static Layout *layout_get(Bindings *b, int gfx) { (void)b;(void)gfx;layout_calls++;return NULL; }
+int vkb_mode(void) { return 0; }
 static Layout *layout_pair(Bindings *b,Bindings *f) { (void)b;(void)f;layout_calls++;return NULL; }
 static int workers_start(void) { abort(); }
 static Pipe rejected;

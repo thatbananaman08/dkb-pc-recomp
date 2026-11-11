@@ -25,6 +25,7 @@
 #include "nvn_tex.h"
 #include "platform/platform.h"
 #include "tex.h"
+#include "mtstat.h"
 #include "vk.h"
 #include "vk_exec.h"
 
@@ -43,6 +44,9 @@ typedef struct {
 static VkExec X;
 static int x_ready;
 static _Thread_local int x_here;   // this thread is inside vk_exec_record (vk_exec_inline_begin)
+void vk_exec_split_log(uint64_t frame, double nf);
+void vk_exec_split_time(uint32_t op, uint64_t ns, int serial);
+static _Thread_local int x_worker;   // this thread is a TOTK_REPLAY_SPLIT worker replaying a chunk of the submission being recorded
 
 // ---- TOTK_TRACE=gfx frame counters
 
@@ -50,7 +54,8 @@ VkExecFrame vk_exec_frame;
 static struct { const uint8_t *mem; uint32_t w, h, fmt, n; } fw[64];   // textures written this frame
 static int nfw;
 
-uint64_t vk_exec_recording_fence(void) { return x_here ? X.fence : 0; }
+uint64_t vk_exec_recording_fence(void) { return x_here || x_worker ? X.fence : 0; }
+void vk_exec_set_worker(int on) { x_worker = on; }
 
 void vk_exec_frame_written(const tex_t *t) {
     if (!(rt_trace & RT_TRACE_GFX) || !t) return;
@@ -61,7 +66,198 @@ void vk_exec_frame_written(const tex_t *t) {
     fw[nfw++].n = 1;
 }
 
+// ---- TOTK_TRACE=perf: how often a submitted command buffer repeats an earlier one (measurement only, no behaviour change).
+// Each handle's ops (following jumps and calls) are hashed with their payloads, which carry every address the replay reads
+// from; the memory those addresses name is not hashed, so "identical" means identical NVN commands, not identical inputs.
+// Two comparisons: with the previous submission of the same handle address and op span, and with any submission whose hash
+// was seen in the last RESUB_SEEN entries (a recording the game re-records into another place still counts there).
+#define RESUB_KEYS 2048
+#define RESUB_SEEN 8192
+static struct { uint64_t key, hash; } resub_key[RESUB_KEYS];
+static uint64_t resub_seen[RESUB_SEEN];
+static struct { uint64_t subs, same_key, same_seen, draws, draws_key, draws_seen, ops; } resub_w;
+static uint64_t resub_frame0;
+
+static uint64_t resub_mix(uint64_t h, uint64_t w) {
+    h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+    return h ^ (h >> 29);
+}
+
+static uint64_t resub_hash(const op_hdr *h, int depth, uint64_t acc, uint64_t *draws, uint64_t *ops) {
+    for (int guard = 0; guard < (1 << 22); guard++) {
+        if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_) return resub_mix(acc, 0xbad);
+        const uint64_t *w = (const uint64_t *)(const void *)h;
+        for (uint32_t i = 0; i < h->size / 8; i++) acc = resub_mix(acc, w[i]);
+        ++*ops;
+        if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) ++*draws;
+        if (h->op == OP_END) return acc;
+        if (h->op == OP_JUMP) { h = (const op_hdr *)(uintptr_t)((const p_jump *)nvn_op_payload(h))->target; continue; }
+        if (h->op == OP_CALL && depth < 8)
+            acc = resub_hash(nvn_op_first(((const p_jump *)nvn_op_payload(h))->target), depth + 1, acc, draws, ops);
+        h = nvn_op_next(h);
+    }
+    return acc;
+}
+
+static void resub_note(uint64_t handle) {
+    uint64_t draws = 0, ops = 0;
+    uint64_t hash = resub_hash(nvn_op_first(handle), 0, 0x51ed, &draws, &ops) | 1;
+    uint64_t key = resub_mix(handle, ops);
+    uint64_t *k = &resub_key[key % RESUB_KEYS].key, *kh = &resub_key[key % RESUB_KEYS].hash;
+    int same_key = *k == key && *kh == hash;
+    *k = key, *kh = hash;
+    uint64_t *sn = &resub_seen[(hash >> 7) % RESUB_SEEN];
+    int same_seen = *sn == hash;
+    *sn = hash;
+    resub_w.subs++, resub_w.ops += ops, resub_w.draws += draws;
+    if (same_key) resub_w.same_key++, resub_w.draws_key += draws;
+    if (same_seen) resub_w.same_seen++, resub_w.draws_seen += draws;
+}
+
+_Thread_local uint64_t mt_cnt[MT_N];
+// Multithreaded-replay measurement: draws and time per submitted command buffer and per top-level CallCommands target.
+static struct {
+    uint64_t calls, call_draws, call_ns, hist_calls[5], hist_draws[5], hist_ns[5];
+    uint64_t sub_draws[8], sub_ns[8];
+    int nsub;
+} MS;
+static int mt_bucket(uint64_t d) { return d == 0 ? 0 : d < 10 ? 1 : d < 100 ? 2 : d < 1000 ? 3 : 4; }
+static void mt_log(uint64_t frame, double nf) {
+    static const char *const nm[MT_N] = {"mirror create", "mirror forget", "pool index change", "usnap drop", "gpu_wrote", "note_written", "view create",
+                                         "pipeline miss", "pipeline lookup", "tex slot new", "texinfo memo miss", "texinfo call", "scratch alloc", "scratch chunk", "volatile"};
+    char line[900];
+    int o = snprintf(line, sizeof line, "perf: mt measure frame %llu: per frame:", (unsigned long long)frame);
+    for (int k = 0; k < MT_N; k++) o += snprintf(line + o, sizeof line - (size_t)o, " %s %.1f,", nm[k], (double)mt_cnt[k] / nf);
+    rt_log("%s", line);
+    o = snprintf(line, sizeof line, "perf: mt measure frame %llu: top-level calls %.1f/frame (%.2f ms, %.0f draws); by draws per call 0/1-9/10-99/100-999/1000+: calls", (unsigned long long)frame,
+                 (double)MS.calls / nf, (double)MS.call_ns / nf / 1e6, (double)MS.call_draws / nf);
+    for (int b = 0; b < 5; b++) o += snprintf(line + o, sizeof line - (size_t)o, " %.1f", (double)MS.hist_calls[b] / nf);
+    o += snprintf(line + o, sizeof line - (size_t)o, "; draws");
+    for (int b = 0; b < 5; b++) o += snprintf(line + o, sizeof line - (size_t)o, " %.0f", (double)MS.hist_draws[b] / nf);
+    o += snprintf(line + o, sizeof line - (size_t)o, "; ms");
+    for (int b = 0; b < 5; b++) o += snprintf(line + o, sizeof line - (size_t)o, " %.2f", (double)MS.hist_ns[b] / nf / 1e6);
+    o += snprintf(line + o, sizeof line - (size_t)o, "; last %d submissions (draws/ms):", MS.nsub < 8 ? MS.nsub : 8);
+    for (int i = 0; i < MS.nsub && i < 8; i++) o += snprintf(line + o, sizeof line - (size_t)o, " %llu/%.2f", (unsigned long long)MS.sub_draws[i], (double)MS.sub_ns[i] / 1e6);
+    rt_log("%s", line);
+    memset(mt_cnt, 0, sizeof mt_cnt);
+    uint64_t keep_d[8], keep_n[8];
+    (void)keep_d, (void)keep_n;
+    memset(&MS, 0, sizeof MS);
+}
+
+// ---- replay pre-pass verifier (TOTK_REPLAY_VERIFY=1): the state a draw resolves its bindings from, rebuilt ahead of the replay by a pass
+// over the submission's flat op stream that applies only the binding state ops to a shadow state, compared at every draw with the live
+// replay state. A mismatch means the shadow (the basis of multithreaded resolution) misses state; the counts are logged per 60 frames.
+enum { VC_PROG, VC_UBO, VC_SSBO, VC_TEX, VC_SAMP, VC_IMG, VC_PUSH, VC_POOLS, VC_N };
+static struct {
+    int on, active;                      // on: the switch; active: this submission has a pre-pass table
+    uint64_t *h;                         // per draw, VC_N component hashes
+    uint64_t n, cap, next;               // draws in the table, its capacity, the next draw the replay reaches
+    uint64_t draws, bad_draws, bad[VC_N], subs, skipped_subs, prepass_ns;
+} VR;
+static uint64_t vr_mix(uint64_t h, uint64_t w) { h = (h ^ w) * 0x9E3779B97F4A7C15ull; return h ^ (h >> 29); }
+static void vr_hash(const VkExec *e, uint64_t o[VC_N]) {
+    uint64_t h = vr_mix(1, (uintptr_t)e->prog);
+    o[VC_PROG] = vr_mix(h, (uint64_t)(uint32_t)e->prog_stages);
+    h = 2;
+    for (int s = 0; s < 6; s++)
+        for (int i = 0; i < 18; i++) h = vr_mix(vr_mix(h, e->ubo[s][i].addr), e->ubo[s][i].size);
+    o[VC_UBO] = h, h = 3;
+    for (int s = 0; s < 6; s++)
+        for (int i = 0; i < 16; i++) h = vr_mix(vr_mix(h, e->ssbo[s][i].addr), e->ssbo[s][i].size);
+    o[VC_SSBO] = h, h = 4;
+    for (int s = 0; s < 6; s++)
+        for (int i = 0; i < 128; i++) h = vr_mix(h, e->tex[s][i]);
+    o[VC_TEX] = h, h = 5;
+    for (int s = 0; s < 6; s++)
+        for (int i = 0; i < 128; i++) h = vr_mix(h, e->samp[s][i]);
+    o[VC_SAMP] = h, h = 6;
+    for (int s = 0; s < 6; s++)
+        for (int i = 0; i < 32; i++) h = vr_mix(h, e->img[s][i]);
+    o[VC_IMG] = h, h = 7;
+    for (int k = 0; k < 2; k++)
+        for (int t = 0; t < NVN2_ROOT_TABLES; t++) {
+            h = vr_mix(h, e->push_set[k][t]);
+            for (int w = 0; w < NVN2_ROOT_WORDS; w++) h = vr_mix(h, e->push[k][t][w]);
+        }
+    o[VC_PUSH] = h;
+    o[VC_POOLS] = vr_mix(vr_mix(vr_mix(8, e->tex_pool.addr), e->tex_pool.count), vr_mix(e->samp_pool.addr, e->samp_pool.count));
+}
+static VkExec *vr_shadow;
+// Before the walk of a submission: apply the binding ops of its flat handles to a copy of the live state, hash it at each draw.
+static void vr_prepass(const VkExec *ex, const uint64_t *handles, int n) {
+    VR.active = 0, VR.n = VR.next = 0;
+    if (!VR.on) return;
+    uint64_t t0 = plat_now_ns();
+    if (!vr_shadow && !(vr_shadow = malloc(sizeof *vr_shadow))) return;
+    memcpy(vr_shadow, ex, sizeof *vr_shadow);
+    for (int i = 0; i < n; i++) {
+        const op_hdr *h = nvn_op_first(handles[i]);
+        for (;;) {
+            if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_ || h->op == OP_JUMP || h->op == OP_CALL) { VR.skipped_subs++; return; }
+            if (h->op == OP_END) break;
+            const void *a = nvn_op_payload(h);
+            switch (h->op) {
+            case OP_BIND_PROGRAM: case OP_BIND_UBO: case OP_PUSH_CONST: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG:
+                vk_exec_apply_binding(vr_shadow, h->op, a, 0);
+                break;
+            case OP_SET_TEX_POOL: vr_shadow->tex_pool = ((const p_set_pool *)a)->pool; break;
+            case OP_SET_SAMP_POOL: vr_shadow->samp_pool = ((const p_set_pool *)a)->pool; break;
+            case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_IDX_IND:
+                if (VR.n == VR.cap) {
+                    VR.cap = VR.cap ? VR.cap * 2 : 1 << 15;
+                    VR.h = realloc(VR.h, VR.cap * VC_N * sizeof *VR.h);
+                    if (!VR.h) rt_fatal("vk: out of memory");
+                }
+                vr_hash(vr_shadow, &VR.h[VR.n++ * VC_N]);
+                break;
+            default: break;
+            }
+            h = nvn_op_next(h);
+        }
+    }
+    VR.active = 1, VR.subs++, VR.prepass_ns += plat_now_ns() - t0;
+}
+static void vr_check(const VkExec *ex) {
+    if (!VR.active) return;
+    uint64_t live[VC_N];
+    VR.draws++;
+    if (VR.next >= VR.n) { VR.bad_draws++; return; }
+    vr_hash(ex, live);
+    const uint64_t *want = &VR.h[VR.next++ * VC_N];
+    int bad = 0;
+    for (int c = 0; c < VC_N; c++)
+        if (live[c] != want[c]) VR.bad[c]++, bad = 1;
+    if (bad && ++VR.bad_draws <= 5) rt_log("replay verify: draw %llu of the submission: shadow state differs from the live state (prog %d ubo %d ssbo %d tex %d samp %d img %d push %d pools %d)", (unsigned long long)VR.next - 1,
+                                         live[0] != want[0], live[1] != want[1], live[2] != want[2], live[3] != want[3], live[4] != want[4], live[5] != want[5], live[6] != want[6], live[7] != want[7]);
+}
+static void vr_log(void) {
+    if (!VR.on) return;
+    rt_log("perf: replay verify: %llu submissions pre-passed (%llu skipped), %llu draws checked, %llu differ (prog %llu ubo %llu ssbo %llu tex %llu samp %llu img %llu push %llu pools %llu); pre-pass %.2f ms per submission",
+           (unsigned long long)VR.subs, (unsigned long long)VR.skipped_subs, (unsigned long long)VR.draws, (unsigned long long)VR.bad_draws, (unsigned long long)VR.bad[0], (unsigned long long)VR.bad[1],
+           (unsigned long long)VR.bad[2], (unsigned long long)VR.bad[3], (unsigned long long)VR.bad[4], (unsigned long long)VR.bad[5], (unsigned long long)VR.bad[6], (unsigned long long)VR.bad[7],
+           VR.subs ? (double)VR.prepass_ns / (double)VR.subs / 1e6 : 0.0);
+}
+
+static void resub_log(uint64_t frame) {
+    if (!(rt_trace & RT_TRACE_PERF) || frame % 60 != 0 || frame <= resub_frame0) return;
+    double nf = (double)(frame - resub_frame0);
+    resub_frame0 = frame;
+    const double subs = (double)resub_w.subs, draws = (double)resub_w.draws;
+    rt_log("perf: resubmit frame %llu: command buffers %.1f/frame, same as the handle's last submission %.1f (%.0f%%), same as one seen before %.1f (%.0f%%); "
+           "draws %.0f/frame, in same-handle buffers %.0f (%.0f%%), in seen-before buffers %.0f (%.0f%%); ops %.0f/frame",
+           (unsigned long long)frame, subs / nf, (double)resub_w.same_key / nf, subs ? 100.0 * (double)resub_w.same_key / subs : 0.0,
+           (double)resub_w.same_seen / nf, subs ? 100.0 * (double)resub_w.same_seen / subs : 0.0, draws / nf, (double)resub_w.draws_key / nf,
+           draws ? 100.0 * (double)resub_w.draws_key / draws : 0.0, (double)resub_w.draws_seen / nf,
+           draws ? 100.0 * (double)resub_w.draws_seen / draws : 0.0, (double)resub_w.ops / nf);
+    mt_log(frame, nf);
+    vk_exec_split_log(frame, nf);
+    vr_log();
+    memset(&resub_w, 0, sizeof resub_w);
+}
+
 void vk_exec_frame_log(const tex_t *p, uint64_t frame) {
+    resub_log(frame);
     if (!(rt_trace & RT_TRACE_GFX)) return;
     VkExecFrame *f = &vk_exec_frame;
     int hit = 0;
@@ -636,6 +832,7 @@ void vk_exec_pass_end(VkExec *ex) {
 VkCommandBuffer vk_exec_inline_begin(int *reopen) {
     VkExec *ex = &X;
     *reopen = 0;
+    if (x_worker) { vk_exec_split_refused(); return VK_NULL_HANDLE; }   // a chunk cannot end the pass: the alias starts empty
     if (!x_here || !ex->cb) return VK_NULL_HANDLE;
     *reopen = ex->in_pass;
     vk_exec_barrier(ex);   // ends the pass; feedback-layout targets go back to GENERAL
@@ -804,6 +1001,14 @@ static void set_rt(VkExec *ex, const p_set_rt *r) {
 static int split_n = -1, split_draws, part_start;
 static uint64_t split_ns, part_t0;
 static uint64_t n_parts, n_subs;
+// TOTK_SUBMIT_EARLY=1 (default off): with TOTK_REPLAY_SPLIT, draws that went into chunks count towards a part, so a big
+// submission's finished prefix goes to the queue at a pass boundary (maybe_split, after a walk-thread op) while the
+// replay goes on, at most every TOTK_SUBMIT_EARLY_US (2500) of replay. The fence stays on the last part.
+static int submit_early(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_SUBMIT_EARLY"); on = e && *e && strcmp(e, "0") != 0; }
+    return on;
+}
 
 static void maybe_split(VkExec *ex) {
     if (split_n < 0) {
@@ -811,6 +1016,12 @@ static void maybe_split(VkExec *ex) {
         if (split_n < 0) split_n = 0;
         int us = cfg_int("TOTK_SPLIT_US");
         split_ns = us > 0 ? (uint64_t)us * 1000 : 0;
+        if (submit_early()) {
+            const char *e = getenv("TOTK_SUBMIT_EARLY_US");
+            uint64_t eu = e && atoi(e) > 0 ? (uint64_t)atoi(e) * 1000 : 2500000;
+            if (eu > split_ns) split_ns = eu;
+            rt_log("vk: TOTK_SUBMIT_EARLY: parts of at least %llu us", (unsigned long long)(split_ns / 1000));
+        }
         rt_log("vk: replay command buffer split every %d draws between passes, parts of at least %d us%s", split_n,
                us > 0 ? us : 0, split_n ? "" : " (off)");
     }
@@ -818,7 +1029,11 @@ static void maybe_split(VkExec *ex) {
     if (split_ns && kern_now_ns() - part_t0 < split_ns) return;   // split_draws stays: the next draw asks again
     split_draws = 0;
     if (ex->recorded == part_start) return;
+    uint64_t sp0 = plat_now_ns();
+    vk_exec_mt_join(ex);
+    uint64_t sp1 = plat_now_ns();
     ex->cb = vk_sync_split();
+    { static uint64_t j, q, n; j += sp1 - sp0, q += plat_now_ns() - sp1; if ((rt_trace & RT_TRACE_PERF) && ++n % 1000 == 0) { rt_log("perf: part split cost (us per split): join %.0f, split+submit %.0f (%llu splits)", j / 1e6, q / 1e6, (unsigned long long)n); j = q = 0; } }
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
     ex->dirty = VK_EXEC_DIRTY_ALL;
@@ -845,6 +1060,7 @@ int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
         .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     if (vmaCreateBuffer(c->vma, &bi, &ai, &buffer, &allocation, &mapped) != VK_SUCCESS) return 0;
     if (!mapped.pMappedData) { vmaDestroyBuffer(c->vma, buffer, allocation); return 0; }
+    vk_exec_mt_join(ex);
     vk_exec_barrier(ex);   // end rendering and order all earlier writes before the transfer
     VkBufferCopy copy = {.srcOffset = source.offset, .dstOffset = 0, .size = size};
     vkCmdCopyBuffer(ex->cb, source.buffer, buffer, 1, &copy);
@@ -874,18 +1090,85 @@ int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
     return result == VK_SUCCESS;
 }
 
+// The ops that only change replay state (the cases of walk below): TOTK_REPLAY_SPLIT applies them on the walk thread and again on
+// a worker's copy of the state. 1 when op was one.
+int vk_exec_state_op(VkExec *ex, uint32_t op, const void *a) {
+    switch (op) {
+    case OP_VIEWPORTS: {
+        const p_viewports *v = a;
+        for (int i = 0; i < v->n && v->first + i < 16; i++)
+            if (v->first + i >= 0) memcpy(ex->vp[v->first + i], v->v[i], sizeof ex->vp[0]);
+        ex->has_vp = 1;
+        ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
+        return 1;
+    }
+    case OP_SCISSOR:
+        ex->scissor = *(const p_scissor *)a;
+        ex->has_scissor = 1;
+        ex->dirty |= VK_EXEC_DIRTY_SCISSOR;
+        return 1;
+    case OP_DEPTH_RANGE: {
+        const p_depth_range *r = a;
+        ex->depth_range[0] = r->n, ex->depth_range[1] = r->f;
+        ex->dirty |= VK_EXEC_DIRTY_VIEWPORT;
+        return 1;
+    }
+    case OP_STENCIL: {
+        const p_stencil *s = a;
+        for (int f = 0; f < 2; f++) {
+            if (!(s->face & (1 << f))) continue;
+            if (s->which == 0) ex->st_vmask[f] = (uint32_t)s->value_mask;
+            else if (s->which == 1) ex->st_wmask[f] = (uint32_t)s->mask;
+            else ex->st_ref[f] = (uint32_t)s->ref;
+        }
+        ex->dirty |= VK_EXEC_DIRTY_STENCIL;
+        return 1;
+    }
+    case OP_POLY_OFFSET:
+        ex->poly_offset = *(const p_poly_offset *)a;
+        ex->dirty |= VK_EXEC_DIRTY_DEPTH_BIAS;
+        return 1;
+    case OP_BLEND_COLOR:
+        memcpy(ex->blend_color, ((const p_blend_color *)a)->rgba, sizeof ex->blend_color);
+        ex->dirty |= VK_EXEC_DIRTY_BLEND_CONST;
+        return 1;
+    case OP_DEPTH_CLAMP: ex->pipe.depth_clamp = ((const p_flag *)a)->value != 0; return 1;
+    case OP_RASTER_DISCARD: ex->pipe.raster_discard = ((const p_flag *)a)->value != 0; return 1;
+    case OP_PRIM_RESTART: ex->prim_restart = *(const p_prim_restart *)a; return 1;
+    case OP_COPY_STRIDE: ex->copy_stride = ((const p_copy_stride *)a)->stride; return 1;
+    case OP_SET_TEX_POOL: ex->tex_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; return 1;
+    case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; return 1;
+    default: return 0;
+    }
+}
+
 static void walk(VkExec *ex, const op_hdr *h, int depth) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         const void *a = nvn_op_payload(h);
+        uint64_t sp_t0 = vk_exec_split_active && (rt_trace & RT_TRACE_PERF) ? plat_now_ns() : 0;
+        if (vk_exec_split_active && vk_exec_split_op(ex, h, a)) {   // TOTK_REPLAY_SPLIT: the op went into a chunk
+            if (sp_t0) vk_exec_split_time(h->op, plat_now_ns() - sp_t0, 0);
+            if ((h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) && submit_early()) split_draws++;
+            h = nvn_op_next(h);
+            continue;
+        }
         switch (h->op) {
         case OP_END: return;
         case OP_BEGIN: break;
         case OP_JUMP: h = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target; continue;
         case OP_CALL:
             if (depth >= CALL_DEPTH) rt_fatal("vk: command buffer calls nested deeper than %d", CALL_DEPTH);
-            walk(ex, nvn_op_first(((const p_jump *)a)->target), depth + 1);
+            if (depth == 0 && (rt_trace & RT_TRACE_PERF)) {
+                uint64_t d0 = vk_exec_frame.draws_seen, t0 = plat_now_ns();
+                walk(ex, nvn_op_first(((const p_jump *)a)->target), depth + 1);
+                uint64_t d = vk_exec_frame.draws_seen - d0, ns = plat_now_ns() - t0;
+                int bk = mt_bucket(d);
+                MS.calls++, MS.call_draws += d, MS.call_ns += ns, MS.hist_calls[bk]++, MS.hist_draws[bk] += d, MS.hist_ns[bk] += ns;
+            } else {
+                walk(ex, nvn_op_first(((const p_jump *)a)->target), depth + 1);
+            }
             break;
         case OP_SET_RT: set_rt(ex, a); break;
         case OP_CLEAR_COLOR: clear_color(ex, a); break;
@@ -937,11 +1220,15 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_BARRIER: vk_exec_barrier(ex); break;
         case OP_WAIT_SYNC: break;   // submit preparation waited before any replay/snapshot; source may be gone
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
-            if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++;
+            if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) vk_exec_frame.draws_seen++, split_draws++, vr_check(ex);
             if (h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;
         case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
         case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_PUSH_CONST:
-            vk_exec_op_draw(ex, h->op, a);
+            {
+                const uint64_t ph = plat_now_ns();
+                vk_exec_op_draw(ex, h->op, a);
+                perf_phase(h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND || h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND ? PH_DRAW : PH_BIND, ph);
+            }
             break;
         case OP_COPY_B2B: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX:
             if (h->op != OP_CLEAR_TEX) vk_exec_frame.copies++;
@@ -954,6 +1241,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
         }
         if (split_draws >= split_n) maybe_split(ex);
+        if (sp_t0) vk_exec_split_time(h->op, plat_now_ns() - sp_t0, 1);
         h = nvn_op_next(h);
     }
 }
@@ -976,19 +1264,45 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     split_draws = part_start = 0;
     part_t0 = kern_now_ns();
     x_here = 1;
+    vk_exec_mt_begin(work != NULL);
     int memory = n || work;
-    if (memory) vk_mem_mirror_begin(), vk_usnap_begin(handles, n, fence);
+    uint64_t ph = plat_now_ns();
+    if (memory) {
+        vk_mem_mirror_begin();
+        perf_phase(PH_MIRROR_BEGIN, ph);
+        ph = plat_now_ns();
+        vk_usnap_begin(handles, n, fence);
+        perf_phase(PH_USNAP_BEGIN, ph);
+    }
+    ph = plat_now_ns();
+    const uint64_t sub_d0 = vk_exec_frame.draws_seen;
+    { static int init; if (!init) { const char *e = getenv("TOTK_REPLAY_VERIFY"); VR.on = e && !strcmp(e, "1"); init = 1; } }
+    if (work) VR.active = 0; else vr_prepass(ex, handles, n);
     if (work) work(ex, context);
     else {
         for (int i = 0; i < n; i++) {
             if (!handles[i]) rt_fatal("vk: command handle %d of a submission is null", i);
+            if (rt_trace & RT_TRACE_PERF) resub_note(handles[i]);
             walk(ex, nvn_op_first(handles[i]), 0);
         }
     }
+    if (rt_trace & RT_TRACE_PERF) {
+        int i = MS.nsub++ % 8;
+        MS.sub_draws[i] = vk_exec_frame.draws_seen - sub_d0, MS.sub_ns[i] = plat_now_ns() - ph;
+    }
+    vk_exec_mt_join(ex);
+    VR.active = 0;
+    perf_phase(PH_OPS, ph);
+    ph = plat_now_ns();
     vk_exec_pass_end(ex);
     x_here = 0;
+    uint64_t e0 = plat_now_ns(), e1, e2;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
-    if (memory) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    e1 = plat_now_ns();
+    if (memory) ex->recorded += vk_mem_mirror_end(ex->cb, fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    e2 = plat_now_ns();
+    if (memory) vk_usnap_end(fence);
+    { static uint64_t a[4], n; a[0] += e1 - e0, a[1] += e2 - e1, a[2] += plat_now_ns() - e2; if ((rt_trace & RT_TRACE_PERF) && ++n % 600 == 0) { rt_log("perf: end phase per submission (us): final barrier %.0f, mirror end %.0f, usnap end %.0f", a[0] / 600e3, a[1] / 600e3, a[2] / 600e3); a[0] = a[1] = a[2] = 0; } }
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);
         if (!l) rt_fatal("vk: out of memory");
@@ -998,6 +1312,7 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
         ex->nviews = 0;
     }
     ex->cb = VK_NULL_HANDLE;
+    perf_phase(PH_END, ph);
     if (memory) n_subs++;
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
         rt_log("perf: replay command buffer parts per submission %.2f", (double)(n_subs + n_parts) / (double)n_subs);

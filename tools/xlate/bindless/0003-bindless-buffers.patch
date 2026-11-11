@@ -1,0 +1,405 @@
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -209,6 +209,18 @@
+         }
+ 
+         /// <summary>
++        /// Bindless buffers: byte offset, in the push constant block of the pipeline, of the 8-byte address of this stage's record, or -1.
++        /// With a record (and the bindless texture table), constant and storage buffers are PhysicalStorageBuffer64 pointers loaded from
++        /// the record, and the texture slots are read from the record as well. Record: one 64-bit address per buffer, then one 32-bit slot
++        /// per bindless texture; buffers and textures are ranked by binding (the host derives the same ranks from the reflection).
++        /// </summary>
++        /// <returns>The offset in bytes, or -1</returns>
++        int QueryBindlessBufferRecord()
++        {
++            return -1;
++        }
++
++        /// <summary>
+         /// Queries host about the presence of the FrontFacing built-in variable bug.
+         /// </summary>
+         /// <returns>True if the bug is present on the host device used, false otherwise</returns>
+--- a/src/Ryujinx.Graphics.Shader/Translation/HostCapabilities.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/HostCapabilities.cs
+@@ -14,6 +14,7 @@
+         public readonly bool SupportsViewportMask;
+         public readonly int BindlessTextureSet;
+         public readonly int BindlessPushOffset;
++        public readonly int BindlessBufferRecord;
+ 
+         public HostCapabilities(
+             bool reducedPrecision,
+@@ -27,7 +28,8 @@
+             bool supportsTextureShadowLod,
+             bool supportsViewportMask,
+             int bindlessTextureSet = -1,
+-            int bindlessPushOffset = 0)
++            int bindlessPushOffset = 0,
++            int bindlessBufferRecord = -1)
+         {
+             ReducedPrecision = reducedPrecision;
+             SupportsFragmentShaderInterlock = supportsFragmentShaderInterlock;
+@@ -41,6 +43,7 @@
+             SupportsViewportMask = supportsViewportMask;
+             BindlessTextureSet = bindlessTextureSet;
+             BindlessPushOffset = bindlessPushOffset;
++            BindlessBufferRecord = bindlessBufferRecord;
+         }
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+@@ -410,7 +410,8 @@
+                 GpuAccessor.QueryHostSupportsTextureShadowLod(),
+                 GpuAccessor.QueryHostSupportsViewportMask(),
+                 GpuAccessor.QueryBindlessTextureSet(),
+-                GpuAccessor.QueryBindlessPushOffset());
++                GpuAccessor.QueryBindlessPushOffset(),
++                GpuAccessor.QueryBindlessBufferRecord());
+ 
+             CodeGenParameters parameters = new CodeGenParameters(attributeUsage, definitions, resourceManager.Properties, hostCapabilities, GpuAccessor, Options.TargetApi);
+ 
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -37,6 +37,23 @@
+         public Dictionary<int, Instruction> BindlessTables { get; } = new();
+         public Instruction BindlessPush { get; set; }
+         public Instruction BindlessPushPointerType { get; set; }
++
++        // Bindless buffers (QueryBindlessBufferRecord): rank of each buffer binding in the record, the struct type behind its pointer, the record.
++        public Dictionary<int, int> BindlessBufferRank { get; set; }
++        public Dictionary<int, Instruction> BindlessBufferTypes { get; } = new();
++        public Dictionary<int, Instruction> BindlessBufferPointerTypes { get; } = new();
++        public Instruction BindlessRecordU64Pointer { get; set; }
++        public Instruction BindlessRecordU32Pointer { get; set; }
++        public Instruction BindlessRecordPointerType { get; set; }
++        public Instruction BindlessPushU64Pointer { get; set; }
++        public int BindlessRecordTexMember { get; set; }
++        public int BindlessBufferCount { get; set; }
++
++        public bool IsBindlessBuffers =>
++            HostCapabilities.BindlessBufferRecord >= 0 &&
++            HostCapabilities.BindlessTextureSet >= 0 &&
++            TargetApi == TargetApi.Vulkan &&
++            (Definitions.Stage == ShaderStage.Vertex || Definitions.Stage == ShaderStage.Fragment);
+         public Dictionary<SetBindingPair, SamplerDeclaration> Samplers { get; } = new();
+         public Dictionary<SetBindingPair, ImageDeclaration> Images { get; } = new();
+ 
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -43,6 +43,32 @@
+ 
+         public static void DeclareAll(CodeGenContext context, StructuredProgramInfo info)
+         {
++            if (context.IsBindlessBuffers)
++            {
++                // Every constant and storage buffer is read through its 64-bit address in the record of the draw, ranked by binding.
++                SortedDictionary<int, int> rank = new();
++
++                foreach (BufferDefinition buffer in context.Properties.ConstantBuffers.Values)
++                {
++                    rank.Add(buffer.Binding, 0);
++                }
++
++                foreach (BufferDefinition buffer in context.Properties.StorageBuffers.Values)
++                {
++                    rank.Add(buffer.Binding, 0);
++                }
++
++                int next = 0;
++
++                foreach (int binding in new List<int>(rank.Keys))
++                {
++                    rank[binding] = next++;
++                }
++
++                context.BindlessBufferRank = new Dictionary<int, int>(rank);
++                context.BindlessBufferCount = next;
++            }
++
+             DeclareConstantBuffers(context, context.Properties.ConstantBuffers.Values);
+             DeclareStorageBuffers(context, context.Properties.StorageBuffers.Values);
+             DeclareMemories(context, context.Properties.LocalMemories, context.LocalMemories, StorageClass.Private);
+@@ -127,7 +153,7 @@
+ 
+                 if (decoratedTypes.Add(structType))
+                 {
+-                    context.Decorate(structType, isBuffer ? Decoration.BufferBlock : Decoration.Block);
++                    context.Decorate(structType, isBuffer && context.BindlessBufferRank == null ? Decoration.BufferBlock : Decoration.Block);
+ 
+                     for (int fieldIndex = 0; fieldIndex < structFieldOffsets.Length; fieldIndex++)
+                     {
+@@ -135,6 +161,13 @@
+                     }
+                 }
+ 
++                if (context.BindlessBufferRank != null && context.BindlessBufferRank.ContainsKey(buffer.Binding))
++                {
++                    // No variable: the buffer is a PhysicalStorageBuffer64 pointer loaded from the record where it is used.
++                    context.BindlessBufferTypes.Add(buffer.Binding, structType);
++                    continue;
++                }
++
+                 SpvInstruction pointerType = context.TypePointer(StorageClass.Uniform, structType);
+                 SpvInstruction variable = context.Variable(pointerType, StorageClass.Uniform);
+ 
+@@ -226,7 +259,11 @@
+                 }
+             }
+ 
+-            if (rank > 0)
++            if (context.BindlessBufferRank != null)
++            {
++                DeclareBindlessRecord(context, rank);
++            }
++            else if (rank > 0)
+             {
+                 DeclareBindlessPush(context, rank);
+             }
+@@ -327,6 +364,79 @@
+             context.BindlessPushPointerType = context.TypePointer(StorageClass.PushConstant, context.TypeU32());
+         }
+ 
++        // The push constant block { uint64 record; } at the stage offset, and the record struct { uint64 buffer[count]; uint slot[textures]; }
++        // read through PhysicalStorageBuffer64 (std430 strides 8 and 4).
++        private static void DeclareBindlessRecord(CodeGenContext context, int textures)
++        {
++            context.AddCapability(Capability.PhysicalStorageBufferAddresses);
++            context.AddCapability(Capability.Int64);
++            context.AddExtension("SPV_KHR_physical_storage_buffer");
++
++            if (textures > 0)
++            {
++                context.AddCapability(Capability.RuntimeDescriptorArray);
++                context.AddExtension("SPV_EXT_descriptor_indexing");
++            }
++
++            SpvInstruction u64 = context.TypeInt(64, 0);
++            int buffers = context.BindlessBufferCount;
++            List<SpvInstruction> members = new();
++            List<int> offsets = new();
++
++            // One scalar member per buffer address and per texture slot (no array types: their ArrayStride would clash with the buffer structs).
++            for (int i = 0; i < buffers; i++)
++            {
++                members.Add(u64);
++                offsets.Add(i * 8);
++            }
++
++            context.BindlessRecordTexMember = members.Count;
++
++            for (int i = 0; i < textures; i++)
++            {
++                members.Add(context.TypeU32());
++                offsets.Add(buffers * 8 + i * 4);
++            }
++
++            if (members.Count == 0)
++            {
++                return;
++            }
++
++            SpvInstruction record = context.TypeStruct(false, members.ToArray());
++            context.Decorate(record, Decoration.Block);
++
++            for (int i = 0; i < offsets.Count; i++)
++            {
++                context.MemberDecorate(record, i, Decoration.Offset, (LiteralInteger)offsets[i]);
++            }
++
++            context.BindlessRecordPointerType = context.TypePointer(StorageClass.PhysicalStorageBuffer, record);
++            context.BindlessRecordU64Pointer = context.TypePointer(StorageClass.PhysicalStorageBuffer, u64);
++            context.BindlessRecordU32Pointer = context.TypePointer(StorageClass.PhysicalStorageBuffer, context.TypeU32());
++
++            // The push constant block is two 32-bit words (low, high), not one 64-bit member: a struct of one uint64 would be the type of a record
++            // with a single buffer, which cannot be decorated twice.
++            SpvInstruction pushStruct = context.TypeStruct(false, context.TypeU32(), context.TypeU32());
++            context.Decorate(pushStruct, Decoration.Block);
++            context.MemberDecorate(pushStruct, 0, Decoration.Offset, (LiteralInteger)context.HostCapabilities.BindlessBufferRecord);
++            context.MemberDecorate(pushStruct, 1, Decoration.Offset, (LiteralInteger)(context.HostCapabilities.BindlessBufferRecord + 4));
++
++            SpvInstruction pushPointer = context.TypePointer(StorageClass.PushConstant, pushStruct);
++            SpvInstruction push = context.Variable(pushPointer, StorageClass.PushConstant);
++
++            context.Name(push, "bindless_record");
++            context.AddGlobalVariable(push);
++
++            context.BindlessPush = push;
++            context.BindlessPushU64Pointer = context.TypePointer(StorageClass.PushConstant, context.TypeU32());
++
++            foreach (KeyValuePair<int, SpvInstruction> pair in context.BindlessBufferTypes)
++            {
++                context.BindlessBufferPointerTypes[pair.Key] = context.TypePointer(StorageClass.PhysicalStorageBuffer, pair.Value);
++            }
++        }
++
+         // The runtime array of combined image samplers of the texture class in the global table (one variable per class).
+         private static void DeclareBindlessTexture(CodeGenContext context, TextureDefinition sampler, int slot)
+         {
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1698,22 +1698,55 @@
+ 
+         private static OperationResult GenerateLoadOrStore(CodeGenContext context, AstOperation operation, bool isStore)
+         {
+-            SpvInstruction pointer = GetStoragePointer(context, operation, out AggregateType varType);
++            SpvInstruction pointer = GetStoragePointer(context, operation, out AggregateType varType, out bool physical);
+ 
+             if (isStore)
+             {
+-                context.Store(pointer, context.Get(varType, operation.GetSource(operation.SourcesCount - 1)));
++                if (physical)
++                {
++                    context.StoreAligned(pointer, context.Get(varType, operation.GetSource(operation.SourcesCount - 1)), 4);
++                }
++                else
++                {
++                    context.Store(pointer, context.Get(varType, operation.GetSource(operation.SourcesCount - 1)));
++                }
++
+                 return OperationResult.Invalid;
+             }
+             else
+             {
+-                SpvInstruction result = context.Load(context.GetType(varType), pointer);
++                SpvInstruction result = physical
++                    ? context.LoadAligned(context.GetType(varType), pointer, 4)
++                    : context.Load(context.GetType(varType), pointer);
+                 return new OperationResult(varType, result);
+             }
+         }
+ 
++        // The record of the draw: the 64-bit address in the push constants, as a PhysicalStorageBuffer64 pointer.
++        private static SpvInstruction BindlessRecord(CodeGenContext context)
++        {
++            SpvInstruction lo = context.Load(
++                context.TypeU32(),
++                context.AccessChain(context.BindlessPushU64Pointer, context.BindlessPush, context.Constant(context.TypeU32(), 0)));
++            SpvInstruction hi = context.Load(
++                context.TypeU32(),
++                context.AccessChain(context.BindlessPushU64Pointer, context.BindlessPush, context.Constant(context.TypeU32(), 1)));
++            SpvInstruction address = context.Bitcast(
++                context.TypeInt(64, 0),
++                context.CompositeConstruct(context.TypeVector(context.TypeU32(), 2), lo, hi));
++
++            return context.ConvertUToPtr(context.BindlessRecordPointerType, address);
++        }
++
+         private static SpvInstruction GetStoragePointer(CodeGenContext context, AstOperation operation, out AggregateType varType)
+         {
++            return GetStoragePointer(context, operation, out varType, out _);
++        }
++
++        private static SpvInstruction GetStoragePointer(CodeGenContext context, AstOperation operation, out AggregateType varType, out bool physical)
++        {
++            physical = false;
++
+             StorageKind storageKind = operation.StorageKind;
+ 
+             StorageClass storageClass;
+@@ -1743,6 +1776,22 @@
+ 
+                     storageClass = StorageClass.Uniform;
+                     varType = field.Type & AggregateType.ElementTypeMask;
++
++                    if (context.BindlessBufferRank != null && context.BindlessBufferRank.TryGetValue(buffer.Binding, out int bufferRank))
++                    {
++                        // Bindless buffer: its address from the record, as a pointer to the buffer struct.
++                        SpvInstruction addressPointer = context.AccessChain(
++                            context.BindlessRecordU64Pointer,
++                            BindlessRecord(context),
++                            context.Constant(context.TypeU32(), bufferRank));
++                        SpvInstruction address = context.LoadAligned(context.TypeInt(64, 0), addressPointer, 8);
++
++                        storageClass = StorageClass.PhysicalStorageBuffer;
++                        physical = true;
++                        baseObj = context.ConvertUToPtr(context.BindlessBufferPointerTypes[buffer.Binding], address);
++                        break;
++                    }
++
+                     baseObj = storageKind == StorageKind.ConstantBuffer
+                         ? context.ConstantBuffers[bindingIndex.Value]
+                         : context.StorageBuffers[bindingIndex.Value];
+@@ -1965,13 +2014,26 @@
+ 
+             if (declaration.BindlessSlot >= 0)
+             {
+-                // The slot comes from the push constants of the draw, the same for every invocation: no NonUniform.
+-                SpvInstruction slotPointer = context.AccessChain(
+-                    context.BindlessPushPointerType,
+-                    context.BindlessPush,
+-                    context.Constant(context.TypeU32(), 0),
+-                    context.Constant(context.TypeU32(), declaration.BindlessSlot));
+-                SpvInstruction slot = context.Load(context.TypeU32(), slotPointer);
++                // The slot comes from the push constants (or the record) of the draw, the same for every invocation: no NonUniform.
++                SpvInstruction slot;
++
++                if (context.BindlessBufferRank != null)
++                {
++                    SpvInstruction slotAddress = context.AccessChain(
++                        context.BindlessRecordU32Pointer,
++                        BindlessRecord(context),
++                        context.Constant(context.TypeU32(), context.BindlessRecordTexMember + declaration.BindlessSlot));
++                    slot = context.LoadAligned(context.TypeU32(), slotAddress, 4);
++                }
++                else
++                {
++                    SpvInstruction slotPointer = context.AccessChain(
++                        context.BindlessPushPointerType,
++                        context.BindlessPush,
++                        context.Constant(context.TypeU32(), 0),
++                        context.Constant(context.TypeU32(), declaration.BindlessSlot));
++                    slot = context.Load(context.TypeU32(), slotPointer);
++                }
+ 
+                 image = context.AccessChain(declaration.SampledImagePointerType, image, slot);
+ 
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
+@@ -45,7 +45,7 @@
+ 
+             context.AddCapability(Capability.Shader);
+ 
+-            context.SetMemoryModel(AddressingModel.Logical, MemoryModel.GLSL450);
++            context.SetMemoryModel(context.IsBindlessBuffers ? AddressingModel.PhysicalStorageBuffer64 : AddressingModel.Logical, MemoryModel.GLSL450);
+ 
+             context.AddCapability(Capability.GroupNonUniformBallot);
+             context.AddCapability(Capability.GroupNonUniformShuffle);
+--- /dev/null
++++ b/src/Spv.Generator/AlignedAccess.cs
+@@ -0,0 +1,35 @@
++using static Spv.Specification;
++
++namespace Spv.Generator
++{
++    public partial class Module
++    {
++        // OpLoad and OpStore with the Aligned memory operand, which PhysicalStorageBuffer pointers require (bindless buffers).
++        public Instruction LoadAligned(Instruction resultType, Instruction pointer, int alignment)
++        {
++            Instruction result = NewInstruction(Op.OpLoad, GetNewId(), resultType);
++
++            result.AddOperand(pointer);
++            result.AddOperand(MemoryAccessMask.Aligned);
++            result.AddOperand((LiteralInteger)alignment);
++
++            AddToFunctionDefinitions(result);
++
++            return result;
++        }
++
++        public Instruction StoreAligned(Instruction pointer, Instruction obj, int alignment)
++        {
++            Instruction result = NewInstruction(Op.OpStore);
++
++            result.AddOperand(pointer);
++            result.AddOperand(obj);
++            result.AddOperand(MemoryAccessMask.Aligned);
++            result.AddOperand((LiteralInteger)alignment);
++
++            AddToFunctionDefinitions(result);
++
++            return result;
++        }
++    }
++}

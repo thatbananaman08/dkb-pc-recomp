@@ -19,6 +19,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
+#include "mtstat.h"
 #include "vk.h"
 #include "platform/platform.h"
 
@@ -99,7 +100,7 @@ static VkBufferUsageFlags pool_usage(const VkCtx *c) {
     if (c->has_transform_feedback)
         u |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
     if (c->has_conditional_rendering) u |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
-    return u;
+    return u | vkb_buf_usage();
 }
 
 static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want) {
@@ -150,8 +151,9 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     VkImportMemoryHostPointerInfoEXT im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
                                            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                            .pHostPointer = (void *)(uintptr_t)r->import_lo};
-    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
-                               .memoryTypeIndex = (uint32_t)type};
+    VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &im, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = vkb_buf_usage() ? (const void *)&af : (const void *)&im,
+                               .allocationSize = n, .memoryTypeIndex = (uint32_t)type};
     if ((res = vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
         (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
         rt_log("vk: pool %#llx+%#llx: host memory import failed (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
@@ -219,6 +221,7 @@ int vk_fix_zero(void) {
 }
 
 static void index_put(PoolRec *r) {
+    MTC(MT_POOL_INDEX);
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     pidx_ent e = {.lo = r->lo, .hi = r->lo + r->size, .base = r->lo, .buf = r, .gpu = r->lo, .key = r->key};
     pidx_remove(&pool_index, r->key, NULL);   // an object initialized again without Finalize
@@ -581,7 +584,10 @@ static volatile int64_t traffic[VK_MCLS_N][VK_MUSE_N];
 
 // Every caller is the replay (vk_exec*, under vk_sync_submit's lock), about ten adds per draw: one writer at a time, so
 // a plain add, not a locked one. An add racing the census's reset may be lost.
+uint64_t vk_lock_wait_ns[3];
+_Thread_local int vk_mem_worker;   // a TOTK_REPLAY_SPLIT worker: its traffic is not counted (one cache line every worker would write)
 void vk_mem_count(int cls, int use, uint64_t bytes) {
+    if (vk_mem_worker) return;
     if ((unsigned)cls < VK_MCLS_N && (unsigned)use < VK_MUSE_N)
         __atomic_store_n(&traffic[cls][use], __atomic_load_n(&traffic[cls][use], __ATOMIC_RELAXED) + (int64_t)bytes,
                          __ATOMIC_RELAXED);
@@ -702,6 +708,14 @@ static uint32_t reg_max[RT_ADDRESS_LIMIT >> REG_SHIFT];
 // Every write-watch query of the generation table (gen_lock held exclusively): calls, bytes and time since the last
 // mirror summary, all consumers together; the queries that found written pages (they also flush TLBs) apart.
 static uint64_t ww_calls, ww_bytes, ww_ticks, ww_dirty_calls, ww_dirty_ticks, ww_pages;
+// The same window's slowest call (gen_lock, like the sums above) and how many calls took more than WW_SLOW_NS: with TOTK_TRACE=perf each of
+// the first WW_SLOW_LOG is logged as it happens. A call is mem_written_pages, i.e. GetWriteWatch with a reset on Windows.
+#define WW_SLOW_NS 200000ull
+#define WW_SLOW_LOG 20
+static uint64_t ww_max_ticks, ww_max_size, ww_max_found, ww_slow, ww_slow_logged;
+
+// Time of every write-watch query so far (ns, read without gen_lock): perf.c puts the share of a slow frame in its line.
+uint64_t vk_mem_ww_ns(void) { return __atomic_load_n(&ww_ticks, __ATOMIC_RELAXED); }
 
 static uint64_t ww_query(uint64_t addr, uint64_t size) {
     uint64_t t0 = qpc();
@@ -709,6 +723,15 @@ static uint64_t ww_query(uint64_t addr, uint64_t size) {
     uint64_t dt = qpc() - t0;
     ww_ticks += dt, ww_calls++, ww_bytes += size;
     if (n && n != UINT64_MAX) ww_dirty_calls++, ww_dirty_ticks += dt, ww_pages += n;
+    if (dt > ww_max_ticks) ww_max_ticks = dt, ww_max_size = size, ww_max_found = n == UINT64_MAX ? 0 : n;
+    if (dt > WW_SLOW_NS) {
+        ww_slow++;
+        if ((rt_trace & RT_TRACE_PERF) && ww_slow_logged < WW_SLOW_LOG) {
+            ww_slow_logged++;
+            rt_log("mem: write-watch call %.3f ms: %.2f MiB queried, %llu pages found%s", dt / 1e6, size / 1048576.0,
+                   (unsigned long long)(n == UINT64_MAX ? 0 : n), n == UINT64_MAX ? " (refused)" : "");
+        }
+    }
     return n;
 }
 
@@ -1316,6 +1339,9 @@ static void range_add(MRange **a, int *n, int *cap, PoolRec *r, uint64_t off, ui
     (*a)[(*n)++] = (MRange){r, off, size};
 }
 
+static _Thread_local MRange *tl_wbl;   // TOTK_REPLAY_SPLIT: a worker's write-back ranges of the chunk it is replaying
+static _Thread_local int ntl_wbl, ctl_wbl;
+
 static int range_cmp(const void *x, const void *y) {
     const MRange *a = x, *b = y;
     if (a->r != b->r) return (uintptr_t)a->r < (uintptr_t)b->r ? -1 : 1;
@@ -1375,6 +1401,7 @@ static void refuse(PoolRec *r, int why, const char *what) {
 
 // Replay thread: the pool's mirror on its first buffer use.
 static void mirror_create(PoolRec *r) {
+    MTC(MT_MIRROR_CREATE);
     VkCtx *c = vk_ctx();
     uint64_t n = r->import_hi - r->import_lo;
     r->mstate = MS_REFUSED;
@@ -1433,6 +1460,7 @@ static void mirror_create(PoolRec *r) {
 }
 
 static void mirror_forget(PoolRec *r) {
+    MTC(MT_MIRROR_FORGET);
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     for (int i = 0; i < nm; i++)
         if (mlist[i] == r) {
@@ -1507,19 +1535,56 @@ static void mirror_sync(PoolRec *r) {
     mrep.sync_t += qpc() - t0;
 }
 
+// TOTK_REPLAY_SPLIT: the replay workers and the walk thread both change mirror state and the write-back list while a submission
+// is replayed; every such entry point takes this lock when vk_split_active is set (otherwise one thread replays: no lock).
+volatile int vk_split_active;
+static PlatMutex split_mx = PLAT_MUTEX_INIT;
+#define SPLIT_LOCK() int split_locked = __atomic_load_n(&vk_split_active, __ATOMIC_ACQUIRE); if (split_locked) vk_split_lock()
+#define SPLIT_UNLOCK() do { if (split_locked) plat_mutex_unlock(&split_mx); } while (0)
+void vk_split_lock(void) {
+    if (!vk_mem_worker) { plat_mutex_lock(&split_mx); return; }
+    uint64_t t = plat_now_ns();
+    plat_mutex_lock(&split_mx);
+    __atomic_fetch_add(&vk_lock_wait_ns[2], plat_now_ns() - t, __ATOMIC_RELAXED);
+}
+void vk_split_unlock(void) { plat_mutex_unlock(&split_mx); }
+
+int vk_mem_use_ready(VkMemSpan *sp);
 void vk_mem_use(VkMemSpan *sp) {
+    if (vk_mem_worker && vk_mem_use_ready(sp)) return;   // nothing to create or sync: no lock
+    SPLIT_LOCK();
     PoolRec *r = sp->pool;
     if (r->mstate == MS_NONE) mirror_create(r);
-    if (r->mstate != MS_ON) return;
-    if (r->acc_sub != msub) mirror_sync(r);
+    if (r->mstate == MS_ON) {
+        if (r->acc_sub != msub) mirror_sync(r);
+        sp->buffer = r->mbuf;
+    }
+    SPLIT_UNLOCK();
+}
+
+// vk_mem_use for a replay worker thread: only when it changes nothing (no mirror to create, none to sync for this
+// submission); 0 leaves the draw to the walk thread.
+int vk_mem_use_ready(VkMemSpan *sp) {
+    if (!vk_mirror_on || !sp->pool) return 1;
+    PoolRec *r = sp->pool;
+    uint8_t st = __atomic_load_n(&r->mstate, __ATOMIC_ACQUIRE);
+    if (st == MS_REFUSED) return 1;
+    if (st != MS_ON || __atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) != msub) return 0;
     sp->buffer = r->mbuf;
+    return 1;
 }
 
 void vk_mem_pick(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON) return;
+    if (vk_mem_worker && __atomic_load_n(&r->acc_sub, __ATOMIC_ACQUIRE) == msub) {
+        sp->buffer = r->mbuf;
+        return;
+    }
+    SPLIT_LOCK();
     if (r->acc_sub != msub) mirror_sync(r);
     sp->buffer = r->mbuf;
+    SPLIT_UNLOCK();
 }
 
 int vk_mem_mirror_probe(uint64_t addr) {
@@ -1531,9 +1596,24 @@ int vk_mem_mirror_probe(uint64_t addr) {
 }
 
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
+    MTC(MT_GPU_WROTE);
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON || sp->buffer != r->mbuf || !size) return;
+    if (vk_mem_worker) {   // a split replay worker keeps its own list and hands it over at the end of its chunk (vk_mem_split_flush)
+        range_add(&tl_wbl, &ntl_wbl, &ctl_wbl, r, sp->offset, size);
+        return;
+    }
+    SPLIT_LOCK();
     range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);
+    SPLIT_UNLOCK();
+}
+
+void vk_mem_split_flush(void) {
+    if (!ntl_wbl) return;
+    vk_split_lock();
+    for (int i = 0; i < ntl_wbl; i++) range_add(&wbl, &nwbl, &cwbl, tl_wbl[i].r, tl_wbl[i].off, tl_wbl[i].size);
+    vk_split_unlock();
+    ntl_wbl = 0;
 }
 
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
@@ -1661,9 +1741,9 @@ static void verify_cb(void *arg) {   // completion thread
                 while (e > k && m[e] == g[e]) e--;
                 char f[160];
                 flag_names(r->flags, f, sizeof f);
-                rt_log("mem: verify mismatch: pool %#llx+%#llx (%s) offset %#llx: bytes %#x..%#x of the page differ, "
-                       "mirror %02x guest %02x at the first (submission %u)", (unsigned long long)r->lo,
-                       (unsigned long long)r->size, f, (unsigned long long)(a - r->lo), k, e, m[k], g[k], j->sub);
+                rt_log("mem: verify mismatch: pool %#llx+%#llx (%s) offset %#llx: bytes %#x..%#x of the page differ "
+                       "(submission %u)", (unsigned long long)r->lo, (unsigned long long)r->size, f,
+                       (unsigned long long)(a - r->lo), k, e, j->sub);
             }
         }
     }
@@ -1741,7 +1821,9 @@ static void mirror_log(uint64_t frame) {
     uint64_t wc = ww_calls, wb = ww_bytes, wt = ww_ticks, dc = ww_dirty_calls, dt = ww_dirty_ticks, wp = ww_pages;
     ww_pages = 0;
     uint64_t nr = n_frz_refused;
+    uint64_t wmax = ww_max_ticks, wmsz = ww_max_size, wmf = ww_max_found, wslow = ww_slow;
     ww_calls = ww_bytes = ww_ticks = ww_dirty_calls = ww_dirty_ticks = n_frz_refused = 0;
+    ww_max_ticks = ww_max_size = ww_max_found = ww_slow = ww_slow_logged = 0;
     plat_mutex_unlock(&gen_lock);
     double wf = frame > ww_last ? (double)(frame - ww_last) : 1.0;
     ww_last = frame;
@@ -1753,6 +1835,11 @@ static void mirror_log(uint64_t frame) {
                "or mapping change %llu, refused %llu",
                (unsigned long long)frame, wc / wf, wb / wf / 1048576.0, qpc_ms(wt) / wf, dc / wf, wp / wf, qpc_ms(dt) / wf,
                fz * 2.0, (unsigned long long)ff, (unsigned long long)ft, (unsigned long long)fo, (unsigned long long)nr);
+    if (rt_trace & RT_TRACE_PERF)
+        rt_log("mem: write-watch timing frame %llu: %llu calls, %.3f ms total (%.4f ms per call), slowest %.3f ms (%.2f MiB queried, %llu pages found, reset), "
+               "%llu calls over %.1f ms",
+               (unsigned long long)frame, (unsigned long long)wc, qpc_ms(wt), wc ? qpc_ms(wt) / wc : 0.0, qpc_ms(wmax), wmsz / 1048576.0,
+               (unsigned long long)wmf, (unsigned long long)wslow, WW_SLOW_NS / 1e6);
     if (!vk_mirror_on) return;
     plat_mutex_lock(&mirror_stat_lock);
     MirrorAcc a = macc;
@@ -1963,7 +2050,10 @@ static void collect_locked(VkCtx *c) {
         switch (d->kind) {
         case DEAD_IMAGE: vkDestroyImage(c->device, (VkImage)(uintptr_t)d->handle, NULL); break;
         case DEAD_IMAGE_VMA: vmaDestroyImage(c->vma, (VkImage)(uintptr_t)d->handle, d->alloc); break;
-        case DEAD_VIEW: vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL); break;
+        case DEAD_VIEW:
+            vkb_view_gone((VkImageView)(uintptr_t)d->handle);   // TOTK_BINDLESS_TEX: its table slots hold the stand-in from now on
+            vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL);
+            break;
         case DEAD_BUFFER_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
         }
     }

@@ -84,6 +84,9 @@ static CmdSlot *slots;
 static int nslots, cur_slot;
 static uint64_t issued = 1, done = 1, cur_fence;
 static PlatMutex sub_lock, st_lock;
+static volatile int64_t sub_calls_w, sub_wait_w, sub_wait_max_w, sub_hold_w, sub_hold_max_w;   // vk_sync.c: the submit-lock window
+uint64_t plat_now_ns(void) { static uint64_t t; return t += 1000; }   // the submit-lock timing only reads it
+volatile int64_t perf_phase_ns[PH_N], perf_phase_n[PH_N];   // host.h perf_phase
 static PlatCond cv_work;
 static VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)0xC100;
 static nvn_hmap by_key = {.klen = sizeof(TexKey)}, by_addr = {.klen = 8};
@@ -163,6 +166,7 @@ static VkResult synthetic_device_idle(VkDevice d) {
     check(d == context.device && !driver_pending && !in_recording, "synthetic device idle without a future timeline signal"); return VK_SUCCESS;
 }
 void vk_texture_shutdown(void) { check(scenario == SHUTDOWN, "shutdown uses an empty synthetic texture cache"); }
+void vkb_view_gone(VkImageView view) { (void)view; }
 
 #define cmd_pool memory_cmd_pool
 @MEMORY_FUNCTIONS@

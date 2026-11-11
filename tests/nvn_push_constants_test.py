@@ -22,7 +22,7 @@ def main():
     exe = out / ('nvn_push_constants.exe' if os.name == 'nt' else 'nvn_push_constants')
     subprocess.run([args.cc, '-O2', '-Wall', '-fno-strict-aliasing', '-ffunction-sections', '-fdata-sections',
                     '-I', str(ROOT / 'runtime'), str(ROOT / 'tests' / 'nvn_push_constants.c'),
-                    str(ROOT / 'runtime' / 'nvn_api_cmd.c'), str(ROOT / 'runtime' / 'nvn_api_nvn2.c'),
+                    str(ROOT / 'runtime' / 'nvn_api_cmd.c'), str(ROOT / 'runtime' / 'nvn_api_nvn2.c'), str(ROOT / 'tests' / 'census_stub.c'),
                     '-Wl,--gc-sections', '-o', str(exe)], check=True)
     return subprocess.run([str(exe)]).returncode
 

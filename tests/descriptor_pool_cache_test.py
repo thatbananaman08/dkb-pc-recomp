@@ -24,6 +24,8 @@ def source():
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mtstat.h"
+_Thread_local uint64_t mt_cnt[MT_N];
 #include "vk_exec.h"
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
@@ -56,8 +58,8 @@ uint64_t vk_usnap_gen(void) { return 1; }
 uint32_t vk_texture_slots_gen(void) { return 7; }
 uint32_t vk_texture_epoch(void) { return 1; }
 uint32_t vk_sampler_gen(void) { return 9; }
-void vk_texture_lock(void) { if (locked++) abort(); }
-void vk_texture_unlock(void) { if (!locked--) abort(); }
+void vk_texture_lock(void) { locked++; }   // recursive, as the production lock is
+void vk_texture_unlock(void) { if (!locked) abort(); locked--; }
 uint64_t vk_texture_slot_token(const dpool_ref *pool,int id) {
     if (id!=257 || id>=(int)pool->count) return 0;
     return (pool->addr+32u*(unsigned)id)^memory_generation;
@@ -94,6 +96,7 @@ static int shader_memo_on(void) { return 1; }
 static int td_mode(void) { return 1; }
 // Full descriptor construction is a bounded provider: this test checks whether
 // the production TD lookup reuses or rebuilds it for the active tables.
+static void tex_info_core(VkExec *ex,const GfxShaderRes *r,uint64_t h,int storage,int separate,VkDescriptorImageInfo *out,uint64_t context);
 static void tex_info_full(VkExec *ex,const GfxShaderRes *r,uint64_t h,int storage,int separate,
                           VkDescriptorImageInfo *out,VkImage *image) {
     (void)r;
@@ -106,16 +109,16 @@ static void tex_info_full(VkExec *ex,const GfxShaderRes *r,uint64_t h,int storag
 static void support_in(const VkExec *ex,float in[3]) { (void)ex; (void)in; abort(); }
 static uint64_t ubo_ptr(const VkExec *ex,int st,const GfxShaderRes *r) { (void)ex; (void)st; (void)r; abort(); }
 '''
-    ac = function(draw, 'static struct { uint64_t context, tex[32],') + ' AC[6];\n'
-    serial = next(line for line in draw.splitlines() if line.startswith('static uint64_t descriptor_serial'))
+    ac = function(draw, 'static _Thread_local struct { uint64_t context, tex[32],') + ' AC[6];\n'
+    serial = next(line for line in draw.splitlines() if line.startswith('static _Thread_local uint64_t descriptor_serial'))
     sub = function(draw, 'typedef struct { VkImage image; uint32_t l0,') + ' SubRange;\n'
-    fm = function(draw, 'static struct { uint64_t context, h, tok; uint32_t gen; SubRange r;') + ' FM[FM_N];\n'
+    fm = function(draw, 'static _Thread_local struct { uint64_t context, h, tok; uint32_t gen; SubRange r;') + ' FM[FM_N];\n'
     td_start = draw.index('#define TD_N ')
-    td_begin = draw.index('static struct {', td_start)
+    td_begin = draw.index('static _Thread_local struct {', td_start)
     td = draw[td_begin:draw.index('} TD[TD_N];', td_begin) + len('} TD[TD_N];')]
     memo_end = draw.index('} MemoKey;')
     memo = draw[draw.rfind('typedef struct {', 0, memo_end):memo_end + len('} MemoKey;')]
-    sm = function(draw, 'static struct { int on, valid, has_fs') + ' SM = {.on=-1};\n'
+    sm = function(draw, 'static _Thread_local struct { int on, valid, has_fs') + ' SM = {.on=-1};\n'
     range_types = '\n'.join(function(draw, prefix) + suffix for prefix, suffix in (
         ('typedef struct { uint32_t off, len;', ' RsRange;'),
         ('typedef struct { int st; const GfxShaderRes *res;', ' RsPtr;'),
@@ -146,11 +149,11 @@ static const RsList *rs_list(const VkExec *ex,const VkPipeInfo *info) {
         'static int nvn_stage_of(', 'static int gfx_type_of(', 'static uint64_t token_of(', 'static int slot_still(',
         'static uint8_t type_of_handle(', 'static int in_fbl(', 'static SubRange sub_of(',
         'static uint32_t attached_as(', 'static void descriptor_state(VkExec *ex) {', 'static void answers_for(',
-        'static SubRange sampled_sub(', 'static uint32_t feedback_scan(', 'static void tex_info_lookup(',
+        'static SubRange sampled_sub(', 'static uint32_t feedback_scan(', 'static void tex_info_core(', 'static void tex_info_lookup(',
         'static void memo_key(', 'static int memo_match(', 'static int bind_sig(')]
     # These are the exact production replay cases, not a replacement pool setter.
     cases = '\n'.join(line for line in replay.splitlines()
-                      if line.strip().startswith(('case OP_SET_TEX_POOL:', 'case OP_SET_SAMP_POOL:')))
+                      if line.strip().startswith(('case OP_SET_TEX_POOL:', 'case OP_SET_SAMP_POOL:')) and line.rstrip().endswith('break;') and 'vr_shadow' not in line)
     selection = 'static void select_pool(VkExec *ex,int op,const p_set_pool *a) {\n switch(op) {\n' + cases + '\n default: abort();\n }\n}\n'
     tests = r'''
 static void select_table(VkExec *ex,int op,dpool_ref pool) {

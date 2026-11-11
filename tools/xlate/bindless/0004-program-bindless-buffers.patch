@@ -1,0 +1,30 @@
+--- a/Program.cs
++++ b/Program.cs
+@@ -237,6 +237,8 @@
+         // texture table and the byte offset of this stage's slot array in the push constants; absent: one binding per texture as before.
+         public int QueryBindlessTextureSet() => _job["bindless_tex"] is JsonObject b && b["set"] is JsonNode n ? (int)n : -1;
+         public int QueryBindlessPushOffset() => _job["bindless_tex"] is JsonObject b && b["push_offset"] is JsonNode n ? (int)n : 0;
++        // Bindless buffers (tools/xlate/bindless/0003-bindless-buffers.patch): byte offset of this stage's 8-byte record address in the push constants.
++        public int QueryBindlessBufferRecord() => _job["bindless_buf"] is JsonObject b && b["record_offset"] is JsonNode n ? (int)n : -1;
+         // Sub-texel precision bits of a host whose gathers round differently from Maxwell (AMD, Intel): Ryujinx then
+         // biases gather coordinates so the same texels are picked (TexturePass.InsertCoordGatherBias). 0: no bias.
+         public int QueryHostGatherBiasPrecision() => _job["gather_bias"] is JsonNode n ? (int)n : 0;
+@@ -300,6 +302,18 @@
+                 }
+                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
+                 foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
++                if (acc.QueryBindlessBufferRecord() >= 0 && acc.QueryBindlessTextureSet() >= 0 && ((string)job["stage"] == "vs" || (string)job["stage"] == "ps"))
++                {
++                    // Rank of every buffer binding in the record (the support buffer, binding 0, first), as Declarations.DeclareAll ranks them.
++                    var ranks = new SortedDictionary<int, int> { [0] = 0 };
++                    foreach (var b in p.Info.CBuffers) ranks[b.Binding] = 0;
++                    foreach (var b in p.Info.SBuffers) ranks[b.Binding] = 0;
++                    int at = 0;
++                    foreach (int k in ranks.Keys.ToList()) ranks[k] = at++;
++                    foreach (var name in new[] { "cbufs", "sbufs" })
++                        foreach (var e in res[name].AsArray()) e["bindless_slot"] = ranks[(int)e["binding"]];
++                    res["bindless_buffers"] = at;
++                }
+                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
+                 {
+                     // Same predicate and order as Declarations.IsBindlessTexture in the patched translator.

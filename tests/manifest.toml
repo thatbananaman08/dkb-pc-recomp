@@ -234,10 +234,37 @@ area = "nvn"
 cmd = ["{python}", "tests/nvn_push_constants_test.py", "--cc", "{cc}"]
 
 [[test]]
+name = "bindless-table"
+tier = 0
+area = "gfx"
+cmd = ["{python}", "tests/bindless_table_test.py", "--cc", "{cc}"]
+
+[[test]]
 name = "nvn-submit-ticks"
 tier = 1
 area = "nvn"
 cmd = ["{python}", "tests/nvn_submit_ticks_test.py", "--cc", "{cc}", "--vulkan-include", "{vulkan_include}"]
+
+[[test]]
+name = "zstd-oneshot"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/zstd_oneshot_test.py", "--cc", "{cc}"]
+paths = ["runtime/ov_zstd.c"]
+
+[[test]]
+name = "hostprof"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/hostprof_test.py", "--cc", "{cc}"]
+paths = ["runtime/hostprof.c", "runtime/hostprof.h"]
+
+[[test]]
+name = "pace-log"
+tier = 1
+area = "nvn"
+cmd = ["{python}", "tests/pace_log_test.py", "--cc", "{cc}"]
+paths = ["runtime/pace_log.c", "runtime/pace_log.h"]
 
 [[test]]
 name = "nvn-wait-sync"
@@ -366,7 +393,14 @@ name = "spirv-opt"
 tier = 1
 area = "shaders"
 cmd = ["{python}", "tests/spirv_opt_test.py", "--cxx", "{cxx}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
-paths = ["runtime/spirv_opt.cpp", "runtime/spirv_opt.h"]
+paths = ["runtime/spirv_opt.cpp", "runtime/spirv_opt.h", "runtime/lq_skip.h", "runtime/draw_filter.h", "runtime/draw_cache.h", "runtime/origin_cache.h"]
+
+[[test]]
+name = "lq-vseval"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/lq_vseval_test.py", "--spirv-val", "{spirv_val}", "--out", "{out}"]
+paths = ["tools/lq_vseval.py"]
 
 # ------------------------------------------------------------------ tier 1: shader translator and SPIR-V
 
@@ -407,6 +441,12 @@ tier = 1
 area = "geometry"
 cmd = ["{python}", "tests/xlate_geometry_test.py", "--xlate", "{xlate}", "--dotnet", "{dotnet}",
        "--spirv-val", "{spirv_val}", "--out", "{out}"]
+
+[[test]]
+name = "xlate-bindless"
+tier = 1
+area = "shaders"
+cmd = ["{python}", "tests/xlate_bindless_test.py", "--xlate", "{xlate}", "--spirv-val", "{spirv_val}", "--out", "{out}"]
 
 [[test]]
 name = "xlate-storage-candidates"
@@ -643,3 +683,10 @@ area = "scenario"
 cmd = ["{python}", "tools/scenario.py", "tutorial-cave"]
 needs = ["game_exe", "gpu"]
 timeout = 900
+
+[[test]]
+name = "vertex-fetch"
+tier = 1
+area = "geometry"
+cmd = ["{python}", "tests/vertex_fetch_test.py", "--cc", "{cc}", "--deps", "{deps}", "--out", "{out}"]
+paths = ["runtime/vk_vertex_fetch.h", "runtime/vk_exec_draw.c"]

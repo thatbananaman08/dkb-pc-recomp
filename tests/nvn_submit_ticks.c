@@ -10,6 +10,12 @@
 #endif
 #include "vk_exec.h"
 #include "platform/platform.h"
+static void resub_note(uint64_t handle) { (void)handle; }   // vk_exec.c TOTK_TRACE=perf resubmission census
+static struct { int on, active; } VR;   // vk_exec.c TOTK_REPLAY_VERIFY pre-pass (stubs: replay itself is not under test here)
+static void vr_prepass(const VkExec *ex, const uint64_t *handles, int n) { (void)ex, (void)handles, (void)n; }
+static struct { uint64_t sub_draws[8], sub_ns[8]; int nsub; } MS;   // vk_exec.c multithreading measurement
+void vk_exec_mt_begin(int work) { (void)work; }   // vk_exec_draw.c multithreaded replay (stubs: the draw path is not under test here)
+void vk_exec_mt_join(VkExec *ex) { (void)ex; }
 #define BY_VALUE_API @API@
 const int rt_game_version = TEST_GAME_VERSION;
 unsigned rt_trace;
@@ -135,6 +141,8 @@ static void check_reports(NVNcounterData *out,int n,uint64_t stamp,unsigned begi
         CHECK(out[i].counter==0 && out[i].timestamp==want);
     }
 }
+uint64_t plat_now_ns(void) { static uint64_t t; return t += 1000; }   // vk_exec.c phase timing only reads it
+volatile int64_t perf_phase_ns[PH_N], perf_phase_n[PH_N];   // host.h perf_phase
 int main(void) {
     for (int mode=0;mode<2;mode++) {
         async_mode=mode;reserved=issued;early=!mode;

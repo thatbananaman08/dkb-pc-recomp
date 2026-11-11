@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "census.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -123,6 +124,7 @@ static void *rec(cmd_t *o, uint32_t op, size_t payload) {
     uint8_t *p = cmd_alloc(o, sz);
     put_hdr(p, op, sz);
     memset(p + 8, 0, sz - 8);
+    if (census_on()) r0_op(op == OP_DRAW || op == OP_DRAW_IDX || op == OP_DRAW_IDX_IND || op == OP_DISPATCH || op == OP_DISPATCH_IND);   // DKB_CENSUS
     return p + 8;
 }
 #define REC(o, OP, T) ((T *)rec((o), (OP), sizeof(T)))
@@ -391,6 +393,7 @@ NVN_API(nvnCommandBufferBeginRecording) {
     cmd_t *o = cmd_of(c);
     if (o->recording) rt_log("nvn: BeginRecording on command buffer %p while it records", (void *)o);
     o->recording = 1;
+    if (census_on()) r0_begin(c->tpidr);   // DKB_CENSUS: R0
     o->cur = o->seg;   // the previous recording was copied at EndRecording
     o->rec_start = o->cmd_used;
     put_hdr(cmd_alloc(o, 8), OP_BEGIN, 8);
@@ -407,6 +410,7 @@ NVN_API(nvnCommandBufferEndRecording) {
     put_hdr(cmd_alloc(o, 8), OP_END, 8);
     o->hw_used -= 8;
     o->recording = 0;
+    if (census_on()) r0_end();
     uint8_t *copy = flatten_recording(o->seg, (size_t)(o->cur - o->seg));
     // Finalizing the recorder does not retire its handle; only reusing the control memory it was recorded in does.
     uintptr_t lo = (uintptr_t)o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
@@ -428,6 +432,7 @@ static void inline_recording(cmd_t *o, uint64_t handle, const char *what) {
     uint64_t bytes = copy_touch(handle, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED), what);
     if (bytes <= 16) return;
     size_t body = (size_t)bytes - 16;
+    if (census_on()) r0_inline(handle, (const uint8_t *)(uintptr_t)handle + 8, body);
     cmd_reserve(o, body);
     memcpy(o->cur, (const uint8_t *)(uintptr_t)handle + 8, body);
     o->cur += body;

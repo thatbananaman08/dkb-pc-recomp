@@ -66,6 +66,9 @@ void gfx_shader_counts(uint64_t *keys, uint64_t *translated);   // distinct keys
 void gfx_shader_set_host(int float64, uint32_t sbuf_align, const uint32_t subgroup[3], uint32_t gather_bits);
 // Both host setters precede shader requests. GS has no subgroup default; repeated identical setup is harmless.
 void gfx_shader_set_geometry_host(uint32_t subgroup);
+// The light-quad fold (gfx_shader.c lq_fold) may run: Bananza on NVIDIA (vk_caps.c, before any shader request).
+void gfx_shader_set_lq_fold_platform(int on);
+int gfx_shader_folded(const GfxShader *s);                  // 1 when the fold was applied to this module
 const uint8_t *gfx_shader_key(const GfxShader *s);          // the 32-byte cache key (stable while the translator is)
 const uint8_t *gfx_shader_input_id(const GfxShader *s);     // the 32-byte input id (stable across translators)
 // By input id from memory or disk; xlate 1 also translates it from its stored inputs. NULL if absent.
@@ -89,6 +92,21 @@ const GfxShader *gfx_shader_load_private(const uint8_t iid[32], int *owned);
 void gfx_shader_release_private(const GfxShader *s);
 const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words);
 uint64_t gfx_shader_failures(void);                         // failed translations; feeds GfxStats.shader_failures
+// TOTK_BINDLESS_TEX (vk.h VKB_SET, vk_bindless.c): the descriptor set of the global texture table and the push constant ranges of a
+// bindless pipeline layout: the vertex stage reads up to GFX_BINDLESS_SLOTS_VS table slots at byte GFX_BINDLESS_PUSH_VS, the fragment
+// stage GFX_BINDLESS_SLOTS_FS at GFX_BINDLESS_PUSH_FS. The bindless translator (tools/build_xlate_bindless.py) is used only when the
+// device allows it (gfx_shader_set_bindless, from vk_caps_init, before any translation) and TOTK_BINDLESS_TEX=1.
+#define GFX_BINDLESS_SET 2
+#define GFX_BINDLESS_PUSH_VS 0
+#define GFX_BINDLESS_SLOTS_VS 8
+#define GFX_BINDLESS_PUSH_FS 64
+#define GFX_BINDLESS_SLOTS_FS 32
+#define GFX_BINDLESS_REC_VS 0
+#define GFX_BINDLESS_REC_FS 8
+void gfx_shader_set_bindless(int device_ok);
+int gfx_shader_bindless_buf(void);   // 1: the shaders also read constant and storage buffers through the record (TOTK_BINDLESS_BUF=1)
+int gfx_shader_bindless_buffers(const GfxShader *s);   // buffers in the record of a record shader (the texture slots follow them), 0 for others
+int gfx_shader_bindless(void);   // 1: shaders are translated with the bindless option (their cache keys are the bindless translator's)
 // Reflection: parsed once per shader from the translator's .res.json and the SPIR-V before it enters the cache.
 enum { GFX_RES_UBO, GFX_RES_SSBO, GFX_RES_TEX, GFX_RES_IMG, GFX_RES_KINDS };
 // Version 1 requires guarded SSBOs to expose zero array elements when their address cannot be bound.
@@ -105,6 +123,8 @@ typedef struct {
     uint16_t handle;            // TEX/IMG: raw handle (word offset; separate: texture | sampler << 14); SSBO: address offset
     uint16_t count;             // descriptors (array length)
     uint8_t separate;           // TEX: texture and sampler handles are separate
+    int8_t bindless;            // TEX: slot of the texture in the stage's push constants when the module reads it from the global table
+                                // (TOTK_BINDLESS_TEX, translator option bindless_tex); -1: an ordinary binding
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed, scalar_bits; } GfxShaderIo;   // scalar_bits: actual numeric SPIR-V width, 0 unknown
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_GS, GFX_STAGE_FS or GFX_STAGE_CS
@@ -113,6 +133,11 @@ typedef struct {
 } GfxShaderGeometry;
 // Ordinary GS contract; NULL for another stage. Translation support does not imply replay/pipeline support.
 const GfxShaderGeometry *gfx_shader_geometry(const GfxShader *s);
+int gfx_shader_fold_origin(uint64_t origin);   // 1: the NVN 2 stage has a light-quad fold rule that is active (Bananza + NVIDIA, DKB_LQ_FOLD)
+const GfxShader *gfx_shader_fold_fix(const GfxShader *s, uint64_t origin);   // folds s now if its stage needs it and it was loaded without it
+int gfx_shader_lq_suspect(const GfxShader *s);   // 1: a vertex module the fold's pattern matches; the prewarm leaves its pipelines to the draw
+uint64_t vk_mem_ww_ns(void);   // total time of the write-watch queries so far (vk_memory.c)
+void gfx_shader_prewarm_background(void);   // the boot prewarm runs beside the guest: its workers take below-normal priority
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
 // NVN 2 compute parameter-block layout, including the declared root-table word counts, or NULL.
 const Nvn2C0Layout *gfx_shader_c0_layout(const GfxShader *s);

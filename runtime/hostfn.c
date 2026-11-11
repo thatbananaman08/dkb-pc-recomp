@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "host.h"
+#include "hostprof.h"
 
 #define MAX_HOSTFN 4096   // dispatch.c holds HOST_CAP / 2 host functions
 #define MAX_ADDED 64
@@ -142,6 +143,15 @@ __attribute__((noinline)) static void hostfn_blocking(Cpu *c, GuestFn fn) {
     kern_core_back(&away);
 }
 
+// TOTK_HOSTPROF: the call timed, with the wait time (locks, core retake) its thread added meanwhile.
+__attribute__((noinline)) static void hostfn_profiled(Cpu *c, Slot *s, uint64_t i) {
+    HpT t = hp_begin();
+    if (s->blocking) hostfn_blocking(c, s->fn);
+    else if (kern_host_track && c->thread) hostfn_tracked(c, s->fn);
+    else s->fn(c);
+    hp_host_call((int)i, kern_now_ns() - t.t0, hp_wait_ns - t.w0);
+}
+
 static void hostfn_entry(Cpu *c) {
     uint64_t i = (c->pc - RT_HOSTFN_BASE) >> 4;
     if (__builtin_expect((c->pc & 15) || i >= (uint64_t)nslots, 0)) bad_entry(c);
@@ -150,6 +160,10 @@ static void hostfn_entry(Cpu *c) {
     if (__builtin_expect(!n && (rt_trace & RT_TRACE_HOSTCALL), 0)) {
         char lr[96];
         rt_log("host call %s from %s", s->name, ldr_describe(c->x[30] - 4, lr, sizeof lr));
+    }
+    if (__builtin_expect(g_hostprof, 0)) {
+        hostfn_profiled(c, s, i);
+        return;
     }
     if (s->blocking) {
         hostfn_blocking(c, s->fn);

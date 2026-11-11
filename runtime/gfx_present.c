@@ -23,6 +23,8 @@
 #include "gfx.h"
 #include "gfx_wsys.h"
 #include "nvn_api.h"
+#include "pace_log.h"
+#include "host.h"
 #include "ui/menu.h"
 #include "vk.h"
 #include "platform/platform.h"
@@ -116,6 +118,17 @@ static VmaAllocation g_cap_alloc;
 static uint8_t *g_cap_ptr;
 static VkDeviceSize g_cap_size;
 static int g_cap_w, g_cap_h, g_cap_valid;
+static uint64_t g_present_id, g_present_seen;   // TOTK_PACE_LOG: VkPresentIdKHR of the last present; the last one the waiter saw
+static PlatThread *g_pace_thread;
+// TOTK_PACE_FLIP=1: the host present of a blit waits for the pacer's display time on a flip thread of its own, so presents
+// leave at an even cadence while the present thread goes on with the next blit (it used to hold them itself, TOTK_PRESENT_HOLD,
+// which stalled vk_present_drain). The queue holds the blits waiting to be flipped (g_pl).
+#define FQ_MAX 4
+static struct { uint32_t idx; uint64_t at; int ready; } g_fq[FQ_MAX];
+static int g_fq_n;
+static PlatEvent g_fq_ev;
+static PlatThread *g_fq_thread;
+static int g_fq_mode = -1;
 static int g_flip_on;            // vk_present_blit submitted the blit of swapchain image g_flip_idx; vk_present_flip presents it
 static uint32_t g_flip_idx;
 
@@ -256,19 +269,114 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
 
 const char *gfx_window_present_mode(void) { return __atomic_load_n(&g_present_got, __ATOMIC_ACQUIRE); }
 
+// TOTK_PACE_LOG: waits for each present id in turn and logs when the image reached the display (pace_log.c). A diagnostic:
+// it reads g_sc without g_pl, so a swapchain rebuilt meanwhile ends a wait with an error and the thread goes on with the
+// newest id.
+static void pace_wait_main(void *arg) {
+    (void)arg;
+    PFN_vkWaitForPresentKHR wait = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(vk_ctx()->device, "vkWaitForPresentKHR");
+    if (!wait) return;
+    uint64_t id = 1;
+    for (;;) {
+        if (id > __atomic_load_n(&g_present_id, __ATOMIC_ACQUIRE)) {
+            plat_sleep_ms(1);
+            continue;
+        }
+        VkSwapchainKHR sc = __atomic_load_n(&g_sc, __ATOMIC_ACQUIRE);
+        VkResult r = sc ? wait(vk_ctx()->device, sc, id, 200000000ull) : VK_NOT_READY;
+        if (r == VK_SUCCESS) {
+            pace_log_display(kern_now_ns());
+            id++;
+        } else if (r == VK_TIMEOUT) {
+            if (id < __atomic_load_n(&g_present_id, __ATOMIC_ACQUIRE)) id++;   // a skipped present never completes: move on
+        } else {
+            id = __atomic_load_n(&g_present_id, __ATOMIC_ACQUIRE) + 1;   // the swapchain went away
+            plat_sleep_ms(5);
+        }
+    }
+}
+
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
 // first; the device release drops it.
+static void present_idx_locked(uint32_t flip_idx);
+
+static int fq_mode(void) {
+    if (g_fq_mode < 0) {
+        const char *e = cfg_get("TOTK_PACE_FLIP");
+        g_fq_mode = e && !strcmp(e, "1");
+        if (g_fq_mode) {
+            plat_event_init(&g_fq_ev, 0, 0);
+            rt_log("gfx: presents wait for their display time on a flip thread (TOTK_PACE_FLIP=1)");
+        }
+    }
+    return g_fq_mode;
+}
+
+// Presents the oldest queued blit now (g_pl held).
+static void fq_present_head_locked(void) {
+    if (!g_fq_n) return;
+    uint32_t idx = g_fq[0].idx;
+    memmove(&g_fq[0], &g_fq[1], (size_t)(g_fq_n - 1) * sizeof g_fq[0]);
+    g_fq_n--;
+    present_idx_locked(idx);
+}
+
+static void wait_until_ns(uint64_t at) {
+    uint64_t now = kern_now_ns();
+    if (at > now + 1500000) plat_wait_ns(at - now - 1000000);
+    while (kern_now_ns() < at) plat_yield();
+}
+
+static void flip_thread_main(void *arg) {
+    (void)arg;
+    plat_thread_priority(PLAT_PRIO_ABOVE_NORMAL);
+    for (;;) {
+        plat_event_wait_ns(&g_fq_ev, 5000000);
+        for (;;) {
+            plat_rmutex_lock(&g_pl);
+            int have = g_fq_n && g_fq[0].ready;
+            uint64_t at = have ? g_fq[0].at : 0;
+            plat_rmutex_unlock(&g_pl);
+            if (!have) break;
+            uint64_t t0 = kern_now_ns();
+            if (at > t0) {
+                wait_until_ns(at);
+                pace_log_hold(at - t0);
+            }
+            plat_rmutex_lock(&g_pl);
+            if (g_fq_n && g_fq[0].ready && g_fq[0].at == at) fq_present_head_locked();   // not flushed meanwhile
+            plat_rmutex_unlock(&g_pl);
+        }
+    }
+}
+
 static void flip_locked(void) {
+    if (fq_mode()) {   // every queued blit goes out now, in order
+        while (g_fq_n) fq_present_head_locked();
+        return;
+    }
     if (!g_flip_on) return;
     g_flip_on = 0;
+    present_idx_locked(g_flip_idx);
+}
+
+static void present_idx_locked(uint32_t flip_idx) {
     if (!g_sc) return;
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
-                           .pWaitSemaphores = &g_render_done[g_flip_idx], .swapchainCount = 1, .pSwapchains = &g_sc,
-                           .pImageIndices = &g_flip_idx};
+                           .pWaitSemaphores = &g_render_done[flip_idx], .swapchainCount = 1, .pSwapchains = &g_sc,
+                           .pImageIndices = &flip_idx};
+    uint64_t pid = 0;
+    VkPresentIdKHR pidi = {.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .swapchainCount = 1, .pPresentIds = &pid};
+    if (pace_log_on() && vk_ctx()->has_present_wait) {   // the display time of this frame comes from vkWaitForPresentKHR
+        pid = __atomic_add_fetch(&g_present_id, 1, __ATOMIC_RELEASE);
+        pi.pNext = &pidi;
+        if (!g_pace_thread) g_pace_thread = plat_thread_new(pace_wait_main, NULL, "pace wait");
+    }
     vk_queue_lock();
     VkResult r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
     vk_queue_unlock();
     vk_device_fault_report(r);
+    pace_log_host_present(kern_now_ns());   // TOTK_PACE_LOG: the host present has returned
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
 }
 
@@ -538,7 +646,11 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     gfx_window_start();
     VkCtx *c = vk_ctx();
     plat_rmutex_lock(&g_pl);
-    flip_locked();
+    if (fq_mode()) {   // blits still waiting for their slot stay queued, as many as the swapchain can spare
+        while (g_fq_n > (g_sc_n >= 4 ? 2 : 1)) fq_present_head_locked();
+    } else {
+        flip_locked();
+    }
     if (!g_sc || plat_cas32(&g_dirty, 0, 0)) {
         if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
     }
@@ -693,9 +805,14 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     vk_queue_unlock();
     if (r == VK_SUCCESS) {
         g_ts_on[slot] = (uint8_t)timed;
-        g_flip_on = 1;
-        g_flip_idx = idx;
-        if (!defer) flip_locked();
+        if (defer && fq_mode()) {
+            if (g_fq_n == FQ_MAX) fq_present_head_locked();
+            g_fq[g_fq_n].idx = idx, g_fq[g_fq_n].at = 0, g_fq[g_fq_n].ready = 0, g_fq_n++;
+        } else {
+            g_flip_on = 1;
+            g_flip_idx = idx;
+            if (!defer) flip_locked();
+        }
     } else {
         vk_device_fault_report(r);
         rt_log("gfx: present submit failed (%d)", (int)r);
@@ -727,6 +844,21 @@ void vk_present_flip(void) {
     plat_rmutex_unlock(&g_pl);
 }
 
+int vk_present_flip_queued(void) { return fq_mode(); }
+
+void vk_present_flip_at(uint64_t at_ns) {
+    plat_rmutex_lock(&g_pl);
+    if (fq_mode() && g_fq_n) {
+        g_fq[g_fq_n - 1].at = at_ns;
+        g_fq[g_fq_n - 1].ready = 1;
+        if (!g_fq_thread) g_fq_thread = plat_thread_new(flip_thread_main, NULL, "flip");
+        plat_event_set(&g_fq_ev);
+    } else {
+        flip_locked();
+    }
+    plat_rmutex_unlock(&g_pl);
+}
+
 void gfx_window_resize(int cw, int chh) {
     gfx_window_start();
     wsys_resize(cw, chh);
@@ -744,6 +876,7 @@ void gfx_window_release_vk(void) {
         vkDeviceWaitIdle(c->device);
         vk_queue_unlock();
         g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
+        g_fq_n = 0;
         menu_vk_release();
         vk_fsr_release();
         vk_color_release();

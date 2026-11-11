@@ -15,6 +15,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "hostprof.h"
 #include "kernel.h"
 #include "platform/platform.h"
 
@@ -116,7 +117,7 @@ static RtThread *g_all, *g_wait, *g_main;
 static uint64_t g_next_id = 0x51, g_wseq, g_created;
 static uint64_t g_main_stack;
 
-static void lock(void) { plat_mutex_lock(&G); }
+static void lock(void) { hp_lock(&G, HPW_SCHED); }
 static void unlock(void) { plat_mutex_unlock(&G); }
 
 uint64_t kern_now_ns(void) { return plat_now_ns(); }
@@ -1022,10 +1023,13 @@ int kern_core_away(void) {
 void kern_core_back(int *away) {
     RtThread *t = tcur;
     if (!*away || !t) return;
+    uint64_t t0 = g_hostprof ? kern_now_ns() : 0;
+    hp_in_core = t0 != 0;
     lock();
     core_take(t);
     unlock();
     *away = 0;
+    if (t0) hp_in_core = 0, hp_wait_add(HPW_CORE, kern_now_ns() - t0);
 }
 
 // ---- spin waits (recomp/patches.py `spin` lines, found by tools/spin_waits.py)

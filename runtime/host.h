@@ -54,11 +54,23 @@ int vk_backend_selftest(void);                  // replay write-back deduplicati
 void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended (any thread; the render thread's also counts as PERF_FENCE)
 // GPU side of the 60-frame perf line, filled by the graphics back end when it set perf_gpu_stats. gpu_ns: GPU busy time
 // since the previous call (timestamp queries, overlaps counted once), have_gpu 0 when the device has no timestamps.
+// Phases of one submission (vk_sync_submit_record, vk_exec.c record_impl), summed over the 60-frame window for the perf line: the time under
+// the submit lock before recording (pre), waiting for a free command slot (slot: the GPU's fence), the whole recording (record) and inside it
+// the mirror and uniform snapshots at its start, the replayed ops (ops, with the draws and the binds counted separately), and its end; then what
+// follows the recording (post: end of the buffer, uploads, prologue) and vkQueueSubmit2 (queue submit, with the queue lock).
+enum { PH_PRE, PH_SLOT, PH_RECORD, PH_MIRROR_BEGIN, PH_USNAP_BEGIN, PH_OPS, PH_DRAW, PH_BIND, PH_END, PH_POST, PH_QSUBMIT, PH_N };
+extern volatile int64_t perf_phase_ns[PH_N], perf_phase_n[PH_N];
+uint64_t plat_now_ns(void);   // platform/platform.h
+static inline void perf_phase(int ph, uint64_t t0) {
+    __atomic_add_fetch(&perf_phase_ns[ph], (int64_t)(plat_now_ns() - t0), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&perf_phase_n[ph], 1, __ATOMIC_RELAXED);
+}
 typedef struct {
     int have_gpu, have_vram, vram_exact;
     uint64_t gpu_ns, gpu_parts, gpu_missed;     // busy time, submission parts timed, parts left untimed
     uint64_t vram_used, vram_budget;
     uint64_t up_gpu_ns, up_timed, up_batches, up_wait_ns, up_bytes;   // upload batches (vk_memory.c, vk_upload_perf)
+    uint64_t sub_calls, sub_wait_ns, sub_wait_max_ns, sub_hold_ns, sub_hold_max_ns;   // vk_sync_submit_record: waits for the submit lock, and the time it is held (the recording and the submit)
 } PerfGpu;
 extern void (*perf_gpu_stats)(PerfGpu *out);
 // The performance overlay (perfmon.c): mode 0 off, 1 fps, 2 full. While it is on, perf_present hands every frame to

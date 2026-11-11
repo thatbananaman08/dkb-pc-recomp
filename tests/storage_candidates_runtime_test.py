@@ -28,6 +28,7 @@ static const Nvn2C0Layout *c0_lay;
 static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
 static uint32_t c0_dim[3], c0_binst;
 static struct { VkBuffer zbuf; } Z;
+static _Thread_local int rsp_worker;   // vk_exec_draw.c TOTK_REPLAY_SPLIT
 static struct { int volatile_; } RS;
 static int c0_enabled = 1;
 static int c0_on(void) { return c0_enabled; }

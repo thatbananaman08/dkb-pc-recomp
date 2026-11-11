@@ -21,8 +21,11 @@
 
 #include "host.h"
 #include "nvn_api.h"
+#include "mtstat.h"
 #include "vk.h"
 #include "platform/platform.h"
+extern int vk_exec_split_active;
+int vk_exec_split_ext(uint32_t bit);
 
 #define ALIGN 256u
 #define MAX_RANGE (64u << 10)
@@ -38,13 +41,16 @@ typedef struct Arena {
 } Arena;
 
 typedef struct { uint64_t lo, hi; } Rng;
-typedef struct { uint64_t lo, hi, off; int dropped; } Reg;
+typedef struct { uint64_t lo, hi, off; uint32_t dropped_at; } Reg;   // dropped_at: 0 not dropped, else the replay draw sequence from which on it reads as dropped (TOTK_REPLAY_MT)
 typedef struct { uint64_t lo, hi, fence; } Wrote;
 
 static struct {
     int mode;                   // rt_knob: 0 off, 1 on, 2 ab
     int on;                     // this submission has a snapshot
     uint64_t fence, gen;
+    uint32_t dstamp[64];        // TOTK_REPLAY_SPLIT: the stamps of this submission's drops, in the order they were made
+    int ndstamp;
+    uint32_t seq;               // sequence number of the newest deferred draw (vk_usnap_seq); 0 when none
     Arena *arena;
     Rng *col;                   // collected ranges
     int ncol, ccol;
@@ -81,7 +87,7 @@ static Arena *arena_get(uint64_t need) {
     if (!a) rt_fatal("vk_usnap: out of memory");
     a->size = need < ARENA_MIN ? ARENA_MIN : (need + (1u << 20) - 1) & ~(uint64_t)((1u << 20) - 1);
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = a->size,
-                             .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+                             .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | vkb_buf_usage()};
     // Device-local through the BAR when the device has it (the GPU reads constants on every draw), else host memory.
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
@@ -216,14 +222,53 @@ static void summary(void) {
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
 }
 
-void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
-    if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
-    U.on = 0, U.fence = fence, U.gen++;
-    summary();
-    if (!RT_KNOB_ON(U.mode - 1)) {
-        U.off_subs++;
-        return;
+// TOTK_REPLAY_SPLIT_EXT bit 1: the collection walk, sort and copy of a submission run on a helper thread while the walk thread walks the
+// same ops; everything that reads or changes the table or the arena waits for it first (usnap_wait).
+static struct {
+    PlatMutex m;
+    PlatCond cv_work, cv_done;
+    int started, pending, go;
+    const uint64_t *handles;
+    int n;
+} A = {.m = PLAT_MUTEX_INIT};
+
+static void usnap_build(const uint64_t *handles, int n);
+
+static void usnap_helper(void *arg) {
+    (void)arg;
+    plat_mutex_lock(&A.m);
+    for (;;) {
+        while (!A.go) plat_cond_wait(&A.cv_work, &A.m);
+        A.go = 0;
+        plat_mutex_unlock(&A.m);
+        usnap_build(A.handles, A.n);
+        plat_mutex_lock(&A.m);
+        __atomic_store_n(&A.pending, 0, __ATOMIC_RELEASE);
+        plat_cond_broadcast(&A.cv_done);
     }
+}
+
+static inline void usnap_wait(void) {
+    if (!__atomic_load_n(&A.pending, __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&A.m);
+    while (__atomic_load_n(&A.pending, __ATOMIC_ACQUIRE)) plat_cond_wait(&A.cv_done, &A.m);
+    plat_mutex_unlock(&A.m);
+}
+
+static void usnap_async(const uint64_t *handles, int n) {
+    plat_mutex_lock(&A.m);
+    if (!A.started) {
+        A.started = 1;
+        plat_cond_init(&A.cv_work), plat_cond_init(&A.cv_done);
+        plat_thread_spawn(usnap_helper, NULL, "usnap", 0);
+    }
+    A.handles = handles, A.n = n, A.go = 1;
+    __atomic_store_n(&A.pending, 1, __ATOMIC_RELEASE);
+    plat_cond_signal(&A.cv_work);
+    plat_mutex_unlock(&A.m);
+}
+
+static void usnap_build(const uint64_t *handles, int n) {
     uint64_t t0 = kern_now_ns();
     U.ncol = 0;
     for (int i = 0; i < n; i++)
@@ -260,7 +305,24 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
 }
 
+
+void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
+    if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
+    U.on = 0, U.fence = fence, U.gen++, U.seq = 0, U.ndstamp = 0;
+    summary();
+    if (!RT_KNOB_ON(U.mode - 1)) {
+        U.off_subs++;
+        return;
+    }
+    if (vk_exec_split_active && vk_exec_split_ext(2)) {   // TOTK_REPLAY_SPLIT_EXT bit 1: the collection walk and the copy overlap the replay walk
+        usnap_async(handles, n);
+        return;
+    }
+    usnap_build(handles, n);
+}
+
 void vk_usnap_end(uint64_t fence) {
+    usnap_wait();
     if (U.arena) vk_completion_add(fence, arena_done, U.arena), U.arena = NULL;
     U.on = 0, U.gen++;
 }
@@ -276,29 +338,118 @@ static int first_above(uint64_t a) {
     return lo;
 }
 
-int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
+// asof: the replay sequence number the lookup is made for (a deferred draw's); a copy dropped at a later sequence still
+// reads as intact. UINT32_MAX: as of now. Safe from several threads during the replay: the region table is fixed after
+// vk_usnap_begin and dropped_at is read atomically.
+int vk_usnap_find_asof(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, uint32_t asof) {
+    usnap_wait();
     if (!U.on || !n) return 0;
     int i = first_above(addr);
     if (i >= U.nreg) return 0;
     const Reg *r = &U.reg[i];
-    if (r->dropped || addr < r->lo || addr + n > r->hi) return 0;
+    uint32_t d = __atomic_load_n(&r->dropped_at, __ATOMIC_ACQUIRE);
+    if ((d && d <= asof) || addr < r->lo || addr + n > r->hi) return 0;
     uint64_t off = r->off + (addr - r->lo);
     if (off % align) return 0;
     *out = (VkDescriptorBufferInfo){U.arena->buf, off, n};
-    U.hits++;
     return 1;
+}
+
+// TOTK_REPLAY_SPLIT: every replay thread numbers the draws it replays (their order in the submission); lookups are made as of
+// that number and a drop after number s reads as dropped from s + 1 on.
+static _Thread_local uint32_t tl_seq;
+static _Thread_local int tl_split;
+void vk_usnap_split_seq(uint32_t s) { tl_seq = s, tl_split = s != 0; }
+
+int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out) {
+    int ok = vk_usnap_find_asof(addr, n, align, out, tl_split ? tl_seq : UINT32_MAX);
+    if (ok && !tl_split) U.hits++;   // (a split replay's threads would all write this)
+    return ok;
+}
+
+// The replay (walk thread) numbers its deferred draws; a drop after number s reads as dropped from s + 1 on.
+void vk_usnap_seq(uint32_t s) { U.seq = s; }
+
+// The bytes of [addr, addr+n) as the submission's snapshot holds them (what the GPU reads); 0 when there is no such copy.
+int vk_usnap_read(uint64_t addr, uint64_t n, void *out) {
+    usnap_wait();
+    if (!U.on || !n) return 0;
+    int i = first_above(addr);
+    if (i >= U.nreg) return 0;
+    const Reg *r = &U.reg[i];
+    if (r->dropped_at || addr < r->lo || addr + n > r->hi || !U.arena->map) return 0;
+    memcpy(out, U.arena->map + r->off + (addr - r->lo), n);
+    return 1;
+}
+
+// TOTK_REPLAY_SPLIT: a worker marks the copies at once (a compare-and-swap) and keeps its writes in a list of its own, handed over at the
+// end of its chunk (vk_usnap_split_flush); only a copy dropped for the first time takes the lock.
+static _Thread_local Wrote *tl_wr;
+static _Thread_local int ntl_wr, ctl_wr;
+static _Thread_local struct { uint64_t addr, n; } tl_seen[256];
+
+void vk_usnap_split_flush(void) {
+    usnap_wait();
+    if (ntl_wr) {
+        vk_split_lock();
+        for (int i = 0; i < ntl_wr; i++) {
+            if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
+            U.wr[U.nwr++] = tl_wr[i];
+        }
+        vk_split_unlock();
+        ntl_wr = 0;
+    }
+    memset(tl_seen, 0, sizeof tl_seen);
+}
+
+static void drop_worker(uint64_t addr, uint64_t n) {
+    usnap_wait();
+    typeof(tl_seen[0]) *e = &tl_seen[(addr * 0x9E3779B97F4A7C15ull ^ n) >> 56];
+    if (e->addr == addr && e->n == n) return;
+    e->addr = addr, e->n = n;
+    if (ntl_wr == ctl_wr) tl_wr = grow(tl_wr, &ctl_wr, sizeof *tl_wr);
+    tl_wr[ntl_wr++] = (Wrote){addr, addr + n, U.fence};
+    if (!U.on) return;
+    uint32_t stamp = tl_seq + 1;
+    for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++) {
+        uint32_t zero = 0;
+        if (__atomic_load_n(&U.reg[i].dropped_at, __ATOMIC_ACQUIRE)) continue;
+        if (__atomic_compare_exchange_n(&U.reg[i].dropped_at, &zero, stamp, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+            vk_split_lock();
+            U.drops++, U.gen++;
+            if (U.ndstamp < 64) U.dstamp[U.ndstamp++] = stamp;
+            vk_split_unlock();
+        }
+    }
 }
 
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
+    usnap_wait();
+    if (vk_mem_worker) return drop_worker(addr, n);
+    int locked = __atomic_load_n(&vk_split_active, __ATOMIC_ACQUIRE);
+    if (locked) vk_split_lock();
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);
     U.wr[U.nwr++] = (Wrote){addr, addr + n, U.fence};
-    if (!U.on) return;
-    for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
-        if (!U.reg[i].dropped) U.reg[i].dropped = 1, U.drops++, U.gen++;
+    if (U.on) {
+        uint32_t stamp = (tl_split ? tl_seq : U.seq) + 1;
+        for (int i = first_above(addr); i < U.nreg && U.reg[i].lo < addr + n; i++)
+            if (!U.reg[i].dropped_at) {
+                __atomic_store_n(&U.reg[i].dropped_at, stamp, __ATOMIC_RELEASE), U.drops++, U.gen++, MTC(MT_USNAP_DROP);
+                if (U.ndstamp < 64) U.dstamp[U.ndstamp++] = stamp;
+            }
+    }
+    if (locked) vk_split_unlock();
 }
 
-uint64_t vk_usnap_gen(void) { return U.gen; }
+// Split replay: a lookup is made as of the thread's draw number, so the generation also tells how many drops that draw sees.
+uint64_t vk_usnap_gen(void) {
+    if (!tl_split) return U.gen;
+    uint64_t c = 0;
+    int n = __atomic_load_n(&U.ndstamp, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) c += U.dstamp[i] <= tl_seq;
+    return U.gen * 128 + c;
+}
 
 // The arenas back on the free list (vk_exec_draw_shutdown: the device is idle, every completion ran).
 void vk_usnap_shutdown(void) {
@@ -306,4 +457,12 @@ void vk_usnap_shutdown(void) {
     for (Arena *a = free_arenas, *next; a; a = next) next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a);
     free_arenas = NULL;
     plat_mutex_unlock(&free_lock);
+}
+
+// The device address range of the snapshot arena of the submission being recorded (0 when it has none).
+void vk_usnap_span(uint64_t *base, uint64_t *size) {
+    *base = *size = 0;
+    usnap_wait();
+    if (!U.arena) return;
+    *base = vkb_buffer_address(U.arena->buf), *size = U.arena->size;
 }

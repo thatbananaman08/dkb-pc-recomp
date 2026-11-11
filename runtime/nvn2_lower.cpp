@@ -1,6 +1,7 @@
 // NVN 2 program stage -> the NVN 1 shape the rest of the host takes (gfx_shader.c, vk_exec_draw.c): Eglantine's
 // lowering (runtime/third_party/eglantine, GPL-3.0-or-later) rewrites the Ampere code as Maxwell, laid out as TotK's
 // translator reads it, and a synthetic control block carries the fields the host reads.
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -9,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "origin_cache.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
 
 extern "C" void rt_log(const char *fmt, ...);
@@ -166,8 +168,19 @@ extern "C" int nvn2_lower(const uint8_t *control, const uint8_t *code, const uin
 
 // The dump name (gfx_shader_nvn2_hash) of the NVN 2 stage a lowered code buffer came from, or 0. Lowered buffers live
 // for the process, so their addresses never name another stage.
+static OriginCache origin_cache;
+static std::atomic<int> origin_cache_on{1};
+
+// TOTK_DRAW_FASTPATH=0 turns the lock-free cache off (every call takes the lock, as before).
+extern "C" void nvn2_origin_cache(int on) { origin_cache_on.store(on, std::memory_order_relaxed); }
+
 extern "C" uint64_t nvn2_origin(const uint8_t *code) {
+    uint64_t o;
+    bool cache = origin_cache_on.load(std::memory_order_relaxed) != 0;
+    if (cache && origin_cache.get(code, &o)) return o;
     std::lock_guard<std::mutex> g(lock);
     auto it = origins.find(code);
-    return it == origins.end() ? 0 : it->second;
+    o = it == origins.end() ? 0 : it->second;
+    if (cache && o) origin_cache.put(code, o);
+    return o;
 }

@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def source(draw):
     recorder = (ROOT / 'runtime/vk_rec.c').read_text()
-    context_start = draw.index('static struct {', draw.index('// State of the command buffer being recorded'))
+    context_start = draw.index('static _Thread_local struct {', draw.index('// State of the command buffer being recorded'))
     context_end = draw.index('// The bound-slot bytes of VkExec', context_start)
     context = draw[context_start:context_end]
     declarations = '\n'.join(function(recorder, prefix) + suffix for prefix, suffix in (

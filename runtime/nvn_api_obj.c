@@ -14,6 +14,9 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
+#include "pace_log.h"
+
+void delta_scan_note_window(const Cpu *c, uint64_t nvn_window);   // delta_scan.c
 #include "nvn_hmap.h"
 #include "nvn_geometry_control.h"
 #include "nvn_tex.h"
@@ -711,6 +714,7 @@ NVN_API(nvnWindowSetPresentInterval) {
     int v = (int)arg_x(c, 1);
     if (o->interval != v) NVN_LOG("present interval %d -> %d", o->interval, v);
     o->interval = v;
+    delta_scan_note_window(c, (uint64_t)(uintptr_t)o);   // DKB_DELTA_SCAN
 }
 // void nvnWindowSetCrop(NVNwindow *w, int x, int y, int w, int h)
 NVN_API(nvnWindowSetCrop) {
@@ -792,6 +796,7 @@ NVN_API(nvnQueuePresentTexture) {
     const tex_t *t = (const tex_t *)o->tex[idx];
     uint64_t period = present_period(o), now = kern_now_ns();
     uint64_t slot = now + pace(&o->pace, now, period);
+    pace_log_request(o->interval, period, slot - now);   // TOTK_PACE_LOG
     gfx_backend()->present(t, o->crop, slot);
     o->ticket[idx] = o->presents;
     o->avail[idx] = slot + period;

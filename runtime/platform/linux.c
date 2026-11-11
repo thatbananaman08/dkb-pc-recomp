@@ -1561,6 +1561,24 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
     if (f) fclose(f);
 }
 
+void plat_process_vm_stats(PlatVmStats *s) {
+    memset(s, 0, sizeof *s);
+    struct rusage ru;
+    if (!getrusage(RUSAGE_SELF, &ru)) s->faults = (uint64_t)ru.ru_minflt + (uint64_t)ru.ru_majflt, s->peak_resident = (uint64_t)ru.ru_maxrss << 10;
+    char line[128];
+    unsigned long long k;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (sscanf(line, "MemAvailable: %llu kB", &k) == 1) s->avail_phys = (uint64_t)k << 10;
+            else if (sscanf(line, "MemTotal: %llu kB", &k) == 1) s->total_phys = (uint64_t)k << 10;
+            else if (sscanf(line, "CommitLimit: %llu kB", &k) == 1) s->commit_limit = (uint64_t)k << 10;
+            else if (sscanf(line, "Committed_AS: %llu kB", &k) == 1) s->commit_used = (uint64_t)k << 10;
+        }
+        fclose(f);
+    }
+}
+
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     *resident = *private_bytes = 0;
     FILE *f = fopen("/proc/self/status", "r");

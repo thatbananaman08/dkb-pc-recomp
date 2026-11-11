@@ -136,6 +136,19 @@ void vk_exec_inline_end(int reopen);
 // vk_exec_draw.c: forget what the command buffer being recorded has bound (pipeline, sets, dynamic state, vertex
 // buffers): the replay continues in a new one (vk_sync_split).
 void vk_exec_draw_new_cb(void);
+// TOTK_REPLAY_MT (vk_exec_draw.c): begin a submission's walk (work: synchronous work recording, no deferral); join the deferred draw
+// records before a part is submitted or GPU results are read.
+void vk_exec_mt_begin(int work);
+// TOTK_REPLAY_SPLIT (vk_exec_draw.c, MT_DESIGN.md version (ii)): the walk thread cuts the op stream into chunks of draws and binds that
+// worker threads replay beside it, each into a packet buffer of its own (vk_rec.c) that the recorder thread plays in order.
+extern int vk_exec_split_active;                          // this submission is split
+int vk_exec_split_op(VkExec *ex, const op_hdr *h, const void *payload);   // 1: the op went into a chunk (the walk skips it)
+int vk_exec_state_op(VkExec *ex, uint32_t op, const void *payload);       // the pure state ops of the walk
+void vk_exec_split_bind(VkExec *ex, uint32_t op, const void *payload);    // a bind op's effect on the state alone
+void vk_exec_set_worker(int on);
+void vk_exec_split_refused(void);                         // a worker was asked for something only the walk thread can do
+int vk_exec_oq_counting(void);                            // vk_exec_xfer.c: samples-passed counting is on
+void vk_exec_mt_join(VkExec *ex);
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
 // vk_exec.c: the stand-in a 3D BC render target is drawn through goes with its image (vk_exec_image_gone).
 void vk_exec_bc_gone(VkImage image);
@@ -182,6 +195,7 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
 // vk_exec_draw.c: OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BIND_* (program, state, vattr, vstream, vbuf, ubo, ssbo, tex,
 // samp, img), OP_UPDATE_UB, OP_DRAW_IDX_IND, OP_DISPATCH_IND. payload: nvn_op_payload of the record.
 void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload);
+void vk_exec_apply_binding(VkExec *ex, uint32_t op, const void *payload, int live);
 // The aspect a sampled view of img reads (vk_exec_draw.c get_view): stencil for a view in STENCIL depth-stencil mode.
 VkImageAspectFlags vk_exec_view_aspect(const VkTexImage *img, const view_t *v, int hv);
 VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageViewType type, uint32_t aspect,

@@ -4,9 +4,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "draw_cache.h"
+int cfg_bool(const char *key);
 #include "vk_exec.h"
+#include "census.h"
+
+// The binder counts for DKB_CENSUS and DRAWSPLIT (runtime/census.c); the counters stay off here.
+int census_flag = 0, split_flag = 0, split_sampling = 0;
+int census_read(void) { return 0; }
+int split_read(void) { return 0; }
+void census_draw(unsigned nbind, unsigned ndesc) { (void)nbind, (void)ndesc; }
+void census_tex(int st, int slot, int img, uint64_t h) { (void)st, (void)slot, (void)img, (void)h; }
+void census_buf(int ssbo, int st, int slot, uint64_t key, uint64_t range) { (void)ssbo, (void)st, (void)slot, (void)key, (void)range; }
+void census_desc(int what) { (void)what; }
+void split_acc(int k, uint64_t cycles) { (void)k, (void)cycles; }
 #define MAX_BINDINGS 128
 #define MAX_DESC 1024
+#define RTC_MAX 32
 #define SUPPORT_BYTES 1408u
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
@@ -31,6 +45,9 @@ static struct { VkBufferView zview; } Z;
 void rt_fatal(const char *fmt,...) { (void)fmt; abort(); }
 VkCtx *vk_ctx(void) { return &context; }
 static void bind_stats(const VkPipeInfo *info) { (void)info; }
+int vkb_mode(void) { return 0; }
+static void bindless_draw(VkExec *ex, const VkPipeInfo *info) { (void)ex; (void)info; }
+static void bindless_check(VkExec *ex, const GfxShaderRes *r, uint64_t h, const VkDescriptorImageInfo *got) { (void)ex; (void)r; (void)h; (void)got; }
 static int bind_skip_on(void) { return 0; } // exercise every descriptor build
 static int push_skip_on(void) { return 0; } // exercise every push
 static int bind_sig(const VkExec *ex,const VkPipeInfo *info) { (void)ex; (void)info; abort(); }
@@ -47,6 +64,8 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex,int stage,int slot) {
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex,int stage,const GfxShaderRes *r,int written_) {
     (void)ex; (void)stage; (void)r; (void)written_; abort();
 }
+int cfg_bool(const char *key) { (void)key; return 1; }
+void nvn2_origin_cache(int on) { (void)on; }
 void vk_texture_lock(void) { abort(); }
 void vk_texture_unlock(void) { abort(); }
 static void tex_info(VkExec *ex,const GfxShaderRes *r,uint64_t h,int image,int separate,VkDescriptorImageInfo *out) {
@@ -202,6 +221,7 @@ static void run(const char *name,uint32_t vs,uint32_t fs,int compute,int default
         CHECK(allocated[s]==alloc && bound[s]==alloc,"empty fragment set binds only for the validation workaround");
     }
 }
+int fastpath_use(void) { return fastpath_on(); }
 int main(void) {
     _Static_assert(sizeof(VkDescSlot)==sizeof(VkDescriptorBufferInfo),"packed buffer array stride");
     for (unsigned st=0;st<6;st++) for (unsigned slot=0;slot<32;slot++)

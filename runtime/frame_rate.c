@@ -248,6 +248,10 @@ static void world_clock(double dt, double step) {
     atomic_store_explicit(&world_us, w + (int64_t)(step * 1e6 + 0.5), memory_order_relaxed);
 }
 
+void delta_scan_present(uint64_t display_ns);
+void delta_probe_present(void);
+void delta_probe_present(void);   // delta_scan.c
+
 void frame_step_present(uint64_t display_ns, int interval) {
     frame_limit_live();
     double step = 0, dt = last_ns ? (double)(display_ns - last_ns) * 1e-9 : 0;
@@ -271,5 +275,6 @@ void frame_step_present(uint64_t display_ns, int interval) {
     atomic_store_explicit(&game_us, atomic_load_explicit(&game_us, memory_order_relaxed) + (uint64_t)(game * 1e6 + 0.5),
                           memory_order_relaxed);
     world_clock(dt, step);
+    delta_scan_present(display_ns); delta_probe_present();   // DKB_DELTA_SCAN
     if (rt_trace & RT_TRACE_PERF) speed_report(display_ns, step, interval);
 }

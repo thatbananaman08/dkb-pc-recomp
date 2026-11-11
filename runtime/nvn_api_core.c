@@ -458,6 +458,49 @@ NVN_API(nvnBufferFlushMappedRange) {
 }
 
 // ---------- Sync and events
+uint64_t vk_sync_issued(void);
+int vk_texture_small_dirty_class(uint64_t fence, uint64_t tiny);
+int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);
+void vk_texture_write_back_small(uint64_t fence);
+// TOTK_SYNC_LATE_SMALL=1 (default off): when the only small targets a wait for fence would write back are tiny (the
+// 1x1 exposure value), the wait returns at replay-done and this thread writes them back once the GPU reached fence.
+// The guest sees that value one frame late.
+static int sync_late_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_SYNC_LATE_SMALL"); on = e && *e && strcmp(e, "0") != 0; }
+    return on;
+}
+static PlatMutex late_m = PLAT_MUTEX_INIT;
+static PlatCond late_cv = PLAT_COND_INIT;
+static uint64_t late_want, late_started;
+static void late_main(void *arg) {
+    (void)arg;
+    uint64_t done = 0;
+    for (;;) {
+        plat_mutex_lock(&late_m);
+        while (late_want <= done) plat_cond_wait(&late_cv, &late_m);
+        uint64_t f = late_want;
+        plat_mutex_unlock(&late_m);
+        vk_sync_fence_wait(f, UINT64_MAX);
+        vk_texture_write_back_small(f);
+        done = f;
+    }
+}
+static void late_queue(uint64_t fence) {
+    plat_mutex_lock(&late_m);
+    if (!late_started) {
+        late_started = 1;
+        if (!plat_thread_spawn(late_main, NULL, "sync late", 0)) rt_fatal("nvn: cannot start the late write-back thread");
+    }
+    if (fence > late_want) late_want = fence;
+    plat_cond_broadcast(&late_cv);
+    plat_mutex_unlock(&late_m);
+}
+static int sync_early_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_SYNC_EARLY"); on = e && *e && strcmp(e, "0") != 0; }
+    return on;
+}
 // A sync is a fence value: fenced = 1 after QueueFenceSync (the newest submit), 3 after WindowAcquireTexture (fence 0).
 // NVNboolean nvnSyncInitialize(NVNsync *s, NVNdevice *d)
 NVN_API(nvnSyncInitialize) {
@@ -481,6 +524,16 @@ NVN_API(nvnSyncWait) {
     if (!s->fenced) { ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
     const GfxBackend *b = gfx_backend();
     if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+    if ((sync_early_on() || sync_late_on()) && b == &gfx_vulkan_backend && vk_sync_issued() >= s->fence) {
+        // TOTK_SYNC_EARLY / TOTK_SYNC_LATE_SMALL: the submission's replay is done and everything the GPU reads was copied
+        // by it. With no small target to write back for it, the wait for the GPU's last part would only delay the guest.
+        int cls = vk_texture_small_dirty_class(s->fence, 256);
+        if (cls == 0 || (cls == 1 && sync_late_on())) {
+            if (cls) late_queue(s->fence);
+            ret_x(c, NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED);
+            return;
+        }
+    }
     int ok;
     {
         NVN_BLOCKING();

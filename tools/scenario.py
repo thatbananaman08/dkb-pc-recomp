@@ -465,7 +465,12 @@ def main(argv=None):
                     help='run under GPU-assisted validation in safe mode (tools/vk_gpuav_safe.txt): an access that '
                     'would fault the GPU is skipped and reported in game.log, so the driver is never reset. About '
                     'ten times slower; speed is not judged')
+    ap.add_argument('--async', dest='async_pipes', action='store_true',
+                    help='TOTK_PIPE_ASYNC=1: build shaders and pipelines in the background and write the census, as normal play '
+                    'does (a --shot run builds them on the replay thread). For perf runs; images can depend on build timing')
     a = ap.parse_args(argv)
+    if a.async_pipes:
+        a.env = ['TOTK_PIPE_ASYNC=1'] + a.env
 
     if a.list:
         for p in sorted(SCENARIOS.glob('*.toml')):

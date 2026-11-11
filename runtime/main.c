@@ -259,6 +259,13 @@ static void crash_handler(const PlatCrash *x) {
     } else {
         rt_logf("  not on a guest thread\n");
     }
+    {
+        extern volatile uint32_t rec_last_op[2];
+        extern volatile uint64_t rec_last_bind[4];
+        rt_logf("  recorder: last packets %u, %u\n", (unsigned)rec_last_op[0], (unsigned)rec_last_op[1]);
+        rt_logf("  recorder: last bind layout %#llx first %llu n %llu set %#llx\n", (unsigned long long)rec_last_bind[0], (unsigned long long)rec_last_bind[1],
+                (unsigned long long)rec_last_bind[2], (unsigned long long)rec_last_bind[3]);
+    }
     fflush(stderr);
     plat_exit(71);
 }

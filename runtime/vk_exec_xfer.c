@@ -189,6 +189,8 @@ static void oq_close(VkExec *ex) {
     oq_open = -1;
 }
 
+int vk_exec_oq_counting(void) { return oq_counting != 0; }
+
 void vk_exec_oq_draw(VkExec *ex) {
     if (!oq_counting || oq_open >= 0) return;
     uint32_t q = oq_next % OQ_N;

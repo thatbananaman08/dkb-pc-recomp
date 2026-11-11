@@ -1493,6 +1493,17 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
         *proc_mb = (double)(pmc.PrivateUsage >> 20);
 }
 
+void plat_process_vm_stats(PlatVmStats *s) {
+    memset(s, 0, sizeof *s);
+    PROCESS_MEMORY_COUNTERS pm = {.cb = sizeof pm};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pm, sizeof pm)) s->faults = pm.PageFaultCount, s->peak_resident = pm.PeakWorkingSetSize;
+    MEMORYSTATUSEX ms = {.dwLength = sizeof ms};
+    if (GlobalMemoryStatusEx(&ms)) {
+        s->avail_phys = ms.ullAvailPhys, s->total_phys = ms.ullTotalPhys;
+        s->commit_limit = ms.ullTotalPageFile, s->commit_used = ms.ullTotalPageFile - ms.ullAvailPageFile;
+    }
+}
+
 void plat_process_memory(uint64_t *resident, uint64_t *private_bytes) {
     PROCESS_MEMORY_COUNTERS_EX pm = {.cb = sizeof pm};
     *resident = *private_bytes = 0;

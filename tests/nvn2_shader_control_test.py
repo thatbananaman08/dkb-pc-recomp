@@ -57,6 +57,7 @@ def source():
 #include <stdlib.h>
 #include <string.h>
 #include "gfx.h"
+#include "draw_filter.h"
 #include "nvn_geometry_control.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -68,7 +69,7 @@ def source():
 #define CONTROL_SIZE 0x880
 #define CODE_SKIP 0x30
 #define COUNT(a) (sizeof(a)/sizeof(*(a)))
-static int host_f64=1;
+static int host_f64=1, bindless_xlate, bindless_buf;
 static uint32_t host_sbuf=256, host_sg[3]={32,32,32}, host_gather, host_gs_sg;
 static const char *tex_names[]={"unused"}, *fmt_names[]={"unused"};
 static char cache_dir[]=".";
@@ -101,6 +102,13 @@ uint32_t *spirv_opt_local_single_block(const uint32_t *w, uint64_t n, uint64_t *
     if (o) memcpy(o, w, n * 4), *out_n = n;
     return o;
 }
+int spirv_lq_patch_ex(const uint32_t *w, uint64_t n, unsigned kinds, uint32_t **out, uint64_t *out_n, unsigned *applied, char *err, size_t cap, int force) {
+    (void)w; (void)n; (void)kinds; (void)out; (void)out_n; (void)err; (void)cap; (void)force; *applied = 0; return 0;
+}
+int spirv_lq_patch(const uint32_t *w, uint64_t n, unsigned kinds, uint32_t **out, uint64_t *out_n, unsigned *applied, char *err, size_t cap) {
+    (void)w; (void)n; (void)kinds; (void)out; (void)out_n; (void)err; (void)cap; *applied = 0; return 0;
+}
+uint64_t nvn2_origin(const uint8_t *code) { (void)code; return 0; }   // the light-quad fold looks the stage up by its origin
 static uint8_t *pack_read(int kind, const uint8_t key[32], uint64_t *size) {
     (void)kind; (void)key; (void)size; abort(); // This fixture owns loose files only.
 }
@@ -281,6 +289,12 @@ int main(void) {
         'static int spirv_complete(')]
     if 'static void spirv_optimize(' in production:
         pieces.append(function(production, 'static void spirv_optimize('))
+    if 'static int lq_patch(' in production:   # the fold (gfx_shader.c lq_fold) and what it uses precede lq_patch
+        fold = production.index('typedef struct { uint64_t origin; unsigned site, construct; } LqFoldRule;')
+        pieces.append(production[fold:production.index('static int lq_patch(', fold)])
+        pieces.append(function(production, 'static int lq_patch('))
+    elif 'static void lq_patch(' in production:
+        pieces.append(function(production, 'static void lq_patch('))
     pieces += [function(production,name) for name in (
         'static GfxShader *disk_load_from(', 'static GfxShader *disk_load(')]
     if 'static GfxShader *input_disk_load(' in production:

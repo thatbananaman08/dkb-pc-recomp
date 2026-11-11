@@ -61,6 +61,13 @@ uint32_t *spirv_opt_local_single_block(const uint32_t *w, uint64_t n, uint64_t *
     if (o) memcpy(o, w, n * 4), *out_n = n;
     return o;
 }
+int spirv_lq_patch_ex(const uint32_t *w, uint64_t n, unsigned kinds, uint32_t **out, uint64_t *out_n, unsigned *applied, char *err, size_t cap, int force) {
+    (void)w; (void)n; (void)kinds; (void)out; (void)out_n; (void)err; (void)cap; (void)force; *applied = 0; return 0;
+}
+int spirv_lq_patch(const uint32_t *w, uint64_t n, unsigned kinds, uint32_t **out, uint64_t *out_n, unsigned *applied, char *err, size_t cap) {
+    (void)w; (void)n; (void)kinds; (void)out; (void)out_n; (void)err; (void)cap; *applied = 0; return 0;
+}
+uint64_t nvn2_origin(const uint8_t *code) { (void)code; return 0; }   // the light-quad fold looks the stage up by its origin
 void rt_event_shader_failure(const char *reason, const char *shader) { (void)reason; (void)shader; }
 _Noreturn void rt_fatal(const char *format, ...) { (void)format; forbidden("runtime fatal"); abort(); }
 void rt_sha256(const void *data, size_t size, uint8_t out[32]) { sha256(data, size, out); }

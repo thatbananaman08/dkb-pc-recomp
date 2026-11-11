@@ -14,6 +14,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "hostprof.h"
 #include "layout.h"
 #include "platform/platform.h"
 
@@ -111,9 +112,11 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
 }
 
 void mem_thaw(uint64_t a, uint64_t n) {
-    plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
+    HpT hp = hp_begin();
+    hp_lock(&frz_lock, HPW_FRZ);   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
     plat_mutex_unlock(&frz_lock);
+    hp_end(HPS_MEM_THAW, hp);
 }
 
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
@@ -140,7 +143,7 @@ int mem_freeze(uint64_t a) {
     if ((a & (FRZ_SIZE - 1)) || !watched(a, FRZ_SIZE)) return 0;
     uint64_t r = a >> FRZ_SHIFT;
     int ok = 0;
-    plat_mutex_lock(&frz_lock);
+    hp_lock(&frz_lock, HPW_FRZ);
     if (frz[r]) ok = 1;
     else if (thaw_ms[r] && (int32_t)((uint32_t)plat_now_ms() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
     else if (freeze_locked(r)) {
@@ -167,7 +170,7 @@ void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws
 // The platform's write-fault hook (plat_mem_fault_hook): 1 retries the write.
 static int thaw_fault(uint64_t a) {
     if (a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return 0;
-    plat_mutex_lock(&frz_lock);
+    hp_lock(&frz_lock, HPW_FRZ);
     int was = frz[a >> FRZ_SHIFT];
     thaw_locked(a >> FRZ_SHIFT, 1);
     plat_mutex_unlock(&frz_lock);
@@ -178,7 +181,7 @@ static int thaw_fault(uint64_t a) {
 
 // Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
 static void commit(uint64_t a, uint64_t n, const char *what) {
-    plat_mutex_lock(&frz_lock);
+    hp_lock(&frz_lock, HPW_FRZ);
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_commit(a, n);
     plat_mutex_unlock(&frz_lock);
@@ -186,7 +189,7 @@ static void commit(uint64_t a, uint64_t n, const char *what) {
 }
 
 static void decommit(uint64_t a, uint64_t n, const char *what) {
-    plat_mutex_lock(&frz_lock);
+    hp_lock(&frz_lock, HPW_FRZ);
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_decommit(a, n);
     plat_mutex_unlock(&frz_lock);
@@ -194,7 +197,7 @@ static void decommit(uint64_t a, uint64_t n, const char *what) {
 }
 
 static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
-    plat_mutex_lock(&frz_lock);
+    hp_lock(&frz_lock, HPW_FRZ);
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_protect(a, n, prot);
     plat_mutex_unlock(&frz_lock);
@@ -280,7 +283,7 @@ static int inside(uint64_t a, uint64_t n, RtRange r) { return a >= r.base && n <
 
 // ---- 0x01 SetHeapSize
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_MEM);
     if (size > HEAP_CAP || size % 0x200000 || size + image_bytes() > L.pool) {
         plat_mutex_unlock(&lock);
         return R_INVALID_STATE;
@@ -335,7 +338,7 @@ uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm) {
     int i = module_data(a, n);
     if (i < 0) return R_INVALID_STATE;
     const RtLoaded *m = ldr_module(i);
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_MEM);
     uint8_t *t = perm_table(i) + (a - m->base - m->data_off) / PAGE;
     for (uint64_t p = 0; p < n / PAGE; p++)
         if (t[p] & ATTR_PERMISSION_LOCKED) {
@@ -358,7 +361,7 @@ uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at) {
     int i = module_data(a, n);
     if (i < 0) return R_INVALID_STATE;
     const RtLoaded *m = ldr_module(i);
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_MEM);
     uint8_t *t = perm_table(i) + (a - m->base - m->data_off) / PAGE;
     for (uint64_t p = 0; p < n / PAGE; p++) t[p] |= ATTR_PERMISSION_LOCKED;
     plat_mutex_unlock(&lock);
@@ -380,7 +383,7 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
     int in_heap = inside(src, n, (RtRange){L.heap.base, heap_size});
     int in_alias = inside(src, n, L.alias);
     if (!in_heap && !in_alias) return R_INVALID_REGION;
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_MEM);
     uint32_t r = R_OK;
     if (in_alias && !alias_all_mapped(src, n)) {
         r = R_INVALID_REGION;
@@ -442,7 +445,7 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
     if (!n || ((a | n) & (PAGE - 1))) return R_INVALID_ADDRESS;
     if (!inside(a, n, L.alias)) return R_INVALID_REGION;
     uint64_t first = (a - L.alias.base) / PAGE, count = n / PAGE;
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_MEM);
     uint32_t r = R_OK;
     if (unmap) {
         for (unsigned i = 0; i < nstack_maps; i++)
@@ -515,7 +518,7 @@ static uint64_t run_start(const uint8_t *p, uint64_t i, uint8_t v) {   // first 
 uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
     RtMemoryInfo r = {.base = a & ~(PAGE - 1), .size = PAGE};
     uint64_t low = L.aslr.base;
-    plat_mutex_lock_shared(&lock);
+    hp_lock_shared(&lock, HPW_MEM);
     int mi;
     if (a >= RT_ADDRESS_LIMIT) {
         r.base = RT_ADDRESS_LIMIT;
@@ -596,7 +599,7 @@ int mem_info(uint32_t id, uint64_t *out) {
     case 5: v = L.heap.size; break;
     case 6: case 21: v = L.pool; break;
     case 7: case 22:
-        plat_mutex_lock_shared(&lock);
+        hp_lock_shared(&lock, HPW_MEM);
         v = image_bytes() + heap_size + alias_bytes;
         plat_mutex_unlock_shared(&lock);
         break;
@@ -635,7 +638,7 @@ void *mem_kernel_alloc(uint64_t size, uint64_t align) {
     int k = kclass(want ? want : 1);
     if (k >= KCLASSES) rt_fatal("mem_kernel_alloc: %#llx bytes", (unsigned long long)size);
     uint64_t bytes = 1ull << (k + KMIN_SHIFT), al = bytes < KCOMMIT ? bytes : KCOMMIT;
-    plat_mutex_lock(&klock);
+    hp_lock(&klock, HPW_MEM);
     KFree *f = kfree_list[k];
     void *p;
     if (f) {
@@ -666,7 +669,7 @@ void mem_kernel_free(void *p, uint64_t size) {
     int k = kclass(size ? size : 1);
     // A block allocated with a larger alignment sits in a larger class; freeing it into the smaller class only
     // wastes the rest.
-    plat_mutex_lock(&klock);
+    hp_lock(&klock, HPW_MEM);
     KFree *f = p;
     f->next = kfree_list[k];
     kfree_list[k] = f;

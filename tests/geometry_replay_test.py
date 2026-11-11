@@ -26,7 +26,7 @@ def source():
     replay = (ROOT / 'runtime/vk_exec.c').read_text()
     pipeline = (ROOT / 'runtime/vk_pipeline.c').read_text()
     base = descriptor.source().replace('int main(void)', 'static int descriptor_checks(void)', 1)
-    base = base.replace('#include "vk_exec.h"', '#include "vk_exec.h"\n#include "nvn_hmap.h"\n#include "nvn_geometry_control.h"')
+    base = base.replace('#include "vk_exec.h"', '#include "vk_exec.h"\n#include "nvn_hmap.h"\n#include "nvn_geometry_control.h"\n#include "mtstat.h"\n_Thread_local uint64_t mt_cnt[MT_N];')
     base = base.replace('uint8_t body[16];', 'uint8_t body[8192]; int volatile_;')
     old_stage = function(base, 'int gfx_shader_stage(')
     old_res = function(base, 'int gfx_shader_resources(')
@@ -105,6 +105,7 @@ static uint64_t expected_count_bytes=sizeof output_words;
 static uint64_t pending_addr,pending_size;
 static int last_use;
 static struct {VkBuffer zbuf;} Z;
+static _Thread_local int rsp_worker;   // vk_exec_draw.c TOTK_REPLAY_SPLIT
 static const Nvn2C0Layout *c0_lay;
 static uint32_t c0_dim[3];
 int vk_mirror_on=1;

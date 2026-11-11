@@ -1,0 +1,306 @@
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -189,6 +189,26 @@
+         }
+ 
+         /// <summary>
++        /// Bindless sampled textures: the descriptor set of the host global texture table, or -1 to keep one binding per texture.
++        /// With a table, combined image samplers that are not arrays, not separate and not buffers are declared as runtime arrays
++        /// in this set (binding = texture class, see BindlessTextureClass) and indexed by a slot the host pushes per draw.
++        /// </summary>
++        /// <returns>The set index, or -1</returns>
++        int QueryBindlessTextureSet()
++        {
++            return -1;
++        }
++
++        /// <summary>
++        /// Byte offset, in the push constant block shared by the stages of a pipeline, of the array of table slots of this stage.
++        /// </summary>
++        /// <returns>The offset in bytes</returns>
++        int QueryBindlessPushOffset()
++        {
++            return 0;
++        }
++
++        /// <summary>
+         /// Queries host about the presence of the FrontFacing built-in variable bug.
+         /// </summary>
+         /// <returns>True if the bug is present on the host device used, false otherwise</returns>
+--- a/src/Ryujinx.Graphics.Shader/Translation/HostCapabilities.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/HostCapabilities.cs
+@@ -12,6 +12,8 @@
+         public readonly bool SupportsShaderNonUniformIndexing;
+         public readonly bool SupportsTextureShadowLod;
+         public readonly bool SupportsViewportMask;
++        public readonly int BindlessTextureSet;
++        public readonly int BindlessPushOffset;
+ 
+         public HostCapabilities(
+             bool reducedPrecision,
+@@ -23,7 +25,9 @@
+             bool supportsShaderFloat64,
+             bool supportsShaderNonUniformIndexing,
+             bool supportsTextureShadowLod,
+-            bool supportsViewportMask)
++            bool supportsViewportMask,
++            int bindlessTextureSet = -1,
++            int bindlessPushOffset = 0)
+         {
+             ReducedPrecision = reducedPrecision;
+             SupportsFragmentShaderInterlock = supportsFragmentShaderInterlock;
+@@ -35,6 +39,8 @@
+             SupportsShaderNonUniformIndexing = supportsShaderNonUniformIndexing;
+             SupportsTextureShadowLod = supportsTextureShadowLod;
+             SupportsViewportMask = supportsViewportMask;
++            BindlessTextureSet = bindlessTextureSet;
++            BindlessPushOffset = bindlessPushOffset;
+         }
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+@@ -408,7 +408,9 @@
+                 GpuAccessor.QueryHostSupportsShaderFloat64(),
+                 GpuAccessor.QueryHostSupportsShaderNonUniformIndexing(),
+                 GpuAccessor.QueryHostSupportsTextureShadowLod(),
+-                GpuAccessor.QueryHostSupportsViewportMask());
++                GpuAccessor.QueryHostSupportsViewportMask(),
++                GpuAccessor.QueryBindlessTextureSet(),
++                GpuAccessor.QueryBindlessPushOffset());
+ 
+             CodeGenParameters parameters = new CodeGenParameters(attributeUsage, definitions, resourceManager.Properties, hostCapabilities, GpuAccessor, Options.TargetApi);
+ 
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SamplerDeclaration.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SamplerDeclaration.cs
+@@ -9,14 +9,17 @@
+         public readonly Instruction SampledImagePointerType;
+         public readonly Instruction Image;
+         public readonly bool IsIndexed;
++        public readonly int BindlessSlot;   // index in the push constant slot array when the texture is read from the global table, else -1
+ 
+         public SamplerDeclaration(
+             Instruction imageType,
+             Instruction sampledImageType,
+             Instruction sampledImagePointerType,
+             Instruction image,
+-            bool isIndexed)
++            bool isIndexed,
++            int bindlessSlot = -1)
+         {
++            BindlessSlot = bindlessSlot;
+             ImageType = imageType;
+             SampledImageType = sampledImageType;
+             SampledImagePointerType = sampledImagePointerType;
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -154,12 +154,93 @@
+             }
+         }
+ 
++        // The class of a bindless texture, and the binding of its array in the global table: dimension (1D 0, 2D 1, 3D 2,
++        // cube 3) | array 4 | multisample 8 | shadow 16. Mirrored by bt_class_of_type in runtime/bindless_table.h.
++        private static int BindlessTextureClass(SamplerType type)
++        {
++            int dim = (type & SamplerType.Mask) switch
++            {
++                SamplerType.Texture1D => 0,
++                SamplerType.Texture2D => 1,
++                SamplerType.Texture3D => 2,
++                SamplerType.TextureCube => 3,
++                _ => -1,
++            };
++
++            if (dim < 0)
++            {
++                return -1;
++            }
++
++            return dim |
++                (type.HasFlag(SamplerType.Array) ? 4 : 0) |
++                (type.HasFlag(SamplerType.Multisample) ? 8 : 0) |
++                (type.HasFlag(SamplerType.Shadow) ? 16 : 0);
++        }
++
++        // A combined texture that is not an array and not a buffer reads its image and sampler from the global table.
++        private static bool IsBindlessTexture(CodeGenContext context, TextureDefinition sampler)
++        {
++            return context.HostCapabilities.BindlessTextureSet >= 0 &&
++                context.TargetApi == TargetApi.Vulkan &&
++                sampler.Type != SamplerType.None &&
++                !sampler.Separate &&
++                sampler.ArrayLength == 1 &&
++                BindlessTextureClass(sampler.Type) >= 0;
++        }
++
+         private static void DeclareSamplers(CodeGenContext context, IEnumerable<TextureDefinition> samplers)
+         {
++            // The slot of a bindless texture in the push constant array is its rank by binding among the bindless textures
++            // of the module; the host derives the same rank from the reflection (tools/xlate/Program.cs writes it as bindless_slot).
++            SortedDictionary<int, int> bindlessRank = new();
++
++            // Only vertex (8 slots) and fragment (32 slots) stages read the table: their slots are 4 bytes each in a push constant
++            // range of the pipeline layout. Textures past the limit keep their own bindings.
++            int slotLimit = context.Definitions.Stage switch
++            {
++                ShaderStage.Vertex => 8,
++                ShaderStage.Fragment => 32,
++                _ => 0,
++            };
++
++            foreach (TextureDefinition sampler in samplers)
++            {
++                if (IsBindlessTexture(context, sampler))
++                {
++                    bindlessRank.Add(sampler.Binding, 0);
++                }
++            }
++
++            int rank = 0;
++
++            foreach (int binding in new List<int>(bindlessRank.Keys))
++            {
++                if (rank < slotLimit)
++                {
++                    bindlessRank[binding] = rank++;
++                }
++                else
++                {
++                    bindlessRank.Remove(binding);
++                }
++            }
++
++            if (rank > 0)
++            {
++                DeclareBindlessPush(context, rank);
++            }
++
+             foreach (TextureDefinition sampler in samplers)
+             {
+                 int setIndex = context.TargetApi == TargetApi.Vulkan ? sampler.Set : 0;
+ 
++                if (IsBindlessTexture(context, sampler) && bindlessRank.TryGetValue(sampler.Binding, out int bindlessSlot))
++                {
++                    DeclareBindlessTexture(context, sampler, bindlessSlot);
++                    continue;
++                }
++
+                 SpvInstruction imageType;
+                 SpvInstruction sampledImageType;
+ 
+@@ -223,6 +304,78 @@
+             }
+         }
+ 
++        // uniform BindlessPush { uint slot[count]; } as a push constant block at the stage offset (std430 stride 4).
++        private static void DeclareBindlessPush(CodeGenContext context, int count)
++        {
++            context.AddCapability(Capability.RuntimeDescriptorArray);
++            context.AddExtension("SPV_EXT_descriptor_indexing");
++
++            SpvInstruction arrayType = context.TypeArray(context.TypeU32(), context.Constant(context.TypeU32(), count));
++            context.Decorate(arrayType, Decoration.ArrayStride, (LiteralInteger)4);
++
++            SpvInstruction structType = context.TypeStruct(false, arrayType);
++            context.Decorate(structType, Decoration.Block);
++            context.MemberDecorate(structType, 0, Decoration.Offset, (LiteralInteger)context.HostCapabilities.BindlessPushOffset);
++
++            SpvInstruction pointerType = context.TypePointer(StorageClass.PushConstant, structType);
++            SpvInstruction variable = context.Variable(pointerType, StorageClass.PushConstant);
++
++            context.Name(variable, "bindless_slots");
++            context.AddGlobalVariable(variable);
++
++            context.BindlessPush = variable;
++            context.BindlessPushPointerType = context.TypePointer(StorageClass.PushConstant, context.TypeU32());
++        }
++
++        // The runtime array of combined image samplers of the texture class in the global table (one variable per class).
++        private static void DeclareBindlessTexture(CodeGenContext context, TextureDefinition sampler, int slot)
++        {
++            int cls = BindlessTextureClass(sampler.Type);
++            Dim dim = (sampler.Type & SamplerType.Mask) switch
++            {
++                SamplerType.Texture1D => Dim.Dim1D,
++                SamplerType.Texture2D => Dim.Dim2D,
++                SamplerType.Texture3D => Dim.Dim3D,
++                _ => Dim.Cube,
++            };
++
++            SpvInstruction imageType = context.TypeImage(
++                context.TypeFP32(),
++                dim,
++                sampler.Type.HasFlag(SamplerType.Shadow),
++                sampler.Type.HasFlag(SamplerType.Array),
++                sampler.Type.HasFlag(SamplerType.Multisample),
++                1,
++                ImageFormat.Unknown);
++
++            SpvInstruction sampledImageType = context.TypeSampledImage(imageType);
++            SpvInstruction elementPointerType = context.TypePointer(StorageClass.UniformConstant, sampledImageType);
++
++            if (!context.BindlessTables.TryGetValue(cls, out SpvInstruction table))
++            {
++                SpvInstruction arrayType = context.TypeRuntimeArray(sampledImageType);
++                SpvInstruction arrayPointerType = context.TypePointer(StorageClass.UniformConstant, arrayType);
++
++                table = context.Variable(arrayPointerType, StorageClass.UniformConstant);
++
++                context.Name(table, "bindless_class" + cls);
++                context.Decorate(table, Decoration.DescriptorSet, (LiteralInteger)context.HostCapabilities.BindlessTextureSet);
++                context.Decorate(table, Decoration.Binding, (LiteralInteger)cls);
++                context.AddGlobalVariable(table);
++
++                context.BindlessTables.Add(cls, table);
++            }
++
++            context.Samplers.Add(new(sampler.Set, sampler.Binding), new SamplerDeclaration(
++                imageType,
++                sampledImageType,
++                elementPointerType,
++                table,
++                false,
++                slot));
++            context.SamplersTypes.Add(new(sampler.Set, sampler.Binding), sampler.Type);
++        }
++
+         private static void DeclareImages(CodeGenContext context, IEnumerable<TextureDefinition> images)
+         {
+             bool writeWithoutFormat = false;
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -33,6 +33,10 @@
+         public Dictionary<int, Instruction> SharedMemories { get; } = new();
+ 
+         public Dictionary<SetBindingPair, SamplerType> SamplersTypes { get; } = new();
++
++        public Dictionary<int, Instruction> BindlessTables { get; } = new();
++        public Instruction BindlessPush { get; set; }
++        public Instruction BindlessPushPointerType { get; set; }
+         public Dictionary<SetBindingPair, SamplerDeclaration> Samplers { get; } = new();
+         public Dictionary<SetBindingPair, ImageDeclaration> Images { get; } = new();
+ 
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1963,6 +1963,21 @@
+             SpvInstruction image = declaration.Image;
+             bool imageIndexed = declaration.IsIndexed;
+ 
++            if (declaration.BindlessSlot >= 0)
++            {
++                // The slot comes from the push constants of the draw, the same for every invocation: no NonUniform.
++                SpvInstruction slotPointer = context.AccessChain(
++                    context.BindlessPushPointerType,
++                    context.BindlessPush,
++                    context.Constant(context.TypeU32(), 0),
++                    context.Constant(context.TypeU32(), declaration.BindlessSlot));
++                SpvInstruction slot = context.Load(context.TypeU32(), slotPointer);
++
++                image = context.AccessChain(declaration.SampledImagePointerType, image, slot);
++
++                return context.Load(declaration.SampledImageType, image);
++            }
++
+             if (imageIndexed)
+             {
+                 SpvInstruction textureIndex = context.Get(AggregateType.S32, texOp.GetSource(srcIndex++));

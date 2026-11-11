@@ -1,0 +1,37 @@
+--- a/Program.cs
++++ b/Program.cs
+@@ -233,6 +233,10 @@
+         // "softfloat64": true lowers FP64 operations to FP32 (Ryujinx's DoubleToFloat pass), for a host without shaderFloat64.
+         public bool QueryHostSupportsShaderFloat64() => _job["softfloat64"] is not JsonValue v || !(v.TryGetValue<bool>(out bool b) && b);
+         public bool QueryHostSupportsTextureShadowLod() => true;
++        // Bindless sampled textures (tools/xlate/bindless/0001-bindless-sampled-textures.patch): the descriptor set of the host global
++        // texture table and the byte offset of this stage's slot array in the push constants; absent: one binding per texture as before.
++        public int QueryBindlessTextureSet() => _job["bindless_tex"] is JsonObject b && b["set"] is JsonNode n ? (int)n : -1;
++        public int QueryBindlessPushOffset() => _job["bindless_tex"] is JsonObject b && b["push_offset"] is JsonNode n ? (int)n : 0;
+         // Sub-texel precision bits of a host whose gathers round differently from Maxwell (AMD, Intel): Ryujinx then
+         // biases gather coordinates so the same texels are picked (TexturePass.InsertCoordGatherBias). 0: no bias.
+         public int QueryHostGatherBiasPrecision() => _job["gather_bias"] is JsonNode n ? (int)n : 0;
+@@ -297,7 +301,22 @@
+                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
+                 foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
+                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
+-                    foreach (var t in list) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
++                {
++                    // Same predicate and order as Declarations.IsBindlessTexture in the patched translator.
++                    bool bindless = name == "textures" && acc.QueryBindlessTextureSet() >= 0;
++                    var rank = new SortedDictionary<int, int>();
++                    foreach (var t in list)
++                        if (bindless && t.Type != SamplerType.None && !t.Separate && t.ArrayLength == 1 && (t.Type & SamplerType.Mask) is not (SamplerType.None or SamplerType.TextureBuffer))
++                            rank[t.Binding] = 0;
++                    int next = 0, limit = (string)job["stage"] == "vs" ? 8 : (string)job["stage"] == "ps" ? 32 : 0;   // Declarations.cs slotLimit
++                    foreach (int k in rank.Keys.ToList()) { if (next < limit) rank[k] = next++; else rank.Remove(k); }
++                    foreach (var t in list)
++                    {
++                        var o = new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags };
++                        if (bindless) o["bindless_slot"] = rank.TryGetValue(t.Binding, out int slot) ? slot : -1;
++                        res[name].AsArray().Add((JsonNode)o);
++                    }
++                }
+                 if (job["c0"] is JsonNode c0) {
+                     res["c0"] = c0.DeepClone();
+                     res["c0_version"] = 2;

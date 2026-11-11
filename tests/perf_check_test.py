@@ -58,6 +58,20 @@ class PerfCheck(unittest.TestCase):
         self.assertEqual((r['verdict'], r['slow_windows'], r['episodes']), ('OK', 0, []))
         self.assertAlmostEqual(r['fps'], 1000 / 16.7, places=3)
 
+    def test_the_instrumentation_lines_do_not_change_the_verdict(self):
+        # lines added by TOTK_TRACE=perf for slow-window diagnosis (runtime/perf.c, vk_memory.c): the submit lock, the process, GetWriteWatch timing
+        extra = ('[host] perf: frame 60: submit lock: 3.00 submits per frame, wait 4.100 ms per frame (max 30.00 ms), held 11.000 ms per frame (max 50.00 ms)\n'
+                 '[host] perf: frame 60: process: page faults +123456 (2057 per frame), working set 4054 MiB (peak 4100), private 11516 MiB; system: '
+                 'available 11000 of 32000 MiB, commit 20000 of 60000 MiB\n'
+                 '[host] mem: write-watch timing frame 60: 800 calls, 9.400 ms total (0.0118 ms per call), slowest 3.100 ms (2.00 MiB queried, '
+                 '5 pages found, reset), 12 calls over 0.2 ms\n'
+                 '[host] mem: write-watch call 3.100 ms: 2.00 MiB queried, 5 pages found\n')
+        plain = log(*[STEADY] * 3)
+        with_extra = ''.join(line + (extra if i % 2 else '') for i, line in enumerate(plain.splitlines(True)))   # after each window's second line
+        a, b = self.analyse(plain), self.analyse(with_extra)
+        self.assertEqual((a['verdict'], a['slow_windows'], a['episodes']), (b['verdict'], b['slow_windows'], b['episodes']))
+        self.assertAlmostEqual(a['fps'], b['fps'], places=6)
+
     def test_short_dip_is_minor(self):
         r = self.analyse(log(STEADY, STEADY, dict(avg=24.0), STEADY, STEADY))
         self.assertEqual(r['verdict'], 'HITCHY')

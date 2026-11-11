@@ -24,6 +24,7 @@
 #include "cfg.h"
 #include "fs.h"
 #include "host.h"
+#include "hostprof.h"
 #include "romfs_config.h"
 #include "romfs_path.h"
 #include "platform/platform.h"
@@ -74,7 +75,9 @@ static double now_s(void) { return (double)plat_now_ns() / 1e9; }
 // Bytes read at off (0 at or past the end of the file), -1 on an I/O error.
 static int64_t read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
     mem_thaw((uintptr_t)buf, n);   // the kernel's write would fail on a frozen page instead of faulting
+    HpT hp = hp_begin();
     int64_t got = plat_file_pread(f, buf, n, off);
+    hp_end(HPS_ROMFS_PREAD, hp);
     if (got == -2)   // a read-only page in the buffer: a frozen region missed its thaw
         rt_log("RomFS: read of %u bytes into %p refused: the buffer is not writable", n, buf);
     return got < 0 ? -1 : got;
@@ -598,7 +601,7 @@ uint32_t romfs_mount(const char *name) {
     if (!name || !romfs_path_valid_relative(name) || strlen(name) >= sizeof mount_name || strchr(name, '/') ||
         strchr(name, ':'))
         return FS_R_INVALID;
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_ROMFS);
     if (*mount_name && strcmp(name, mount_name)) rt_fatal("second RomFS mount %s (%s is mounted)", name, mount_name);
     strcpy(mount_name, name);
     plat_mutex_unlock(&lock);
@@ -606,7 +609,16 @@ uint32_t romfs_mount(const char *name) {
     return 0;
 }
 
+static uint32_t romfs_open_impl(uint64_t *out, const char *path, int mode);
+
 uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
+    HpT hp = hp_begin();
+    uint32_t r = romfs_open_impl(out, path, mode);
+    hp_end(HPS_ROMFS_OPEN, hp);
+    return r;
+}
+
+static uint32_t romfs_open_impl(uint64_t *out, const char *path, int mode) {
     fs_trace("rom", path);
     if (!out || mode != FS_OPEN_READ) return FS_R_UNSUPPORTED_OPEN;
     const char *p = romfs_path_relative(mount_name, path);
@@ -623,7 +635,7 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
         if (!f || memcmp(&id, &o->id, sizeof id))
             rt_fatal("RomFS overlay %s is missing or changed since the start check (restart the game)", o->path);
     }
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_ROMFS);
     for (unsigned j = 1; j < NH; j++)
         if (!handles[j]) {
             handles[j] = i + 1;
@@ -642,7 +654,7 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
 static int handle_source(uint64_t h, PlatFile **f, uint64_t *base, uint64_t *size) {
     if (!romfs_handle(h)) return 0;
     uint64_t j = h - ROMFS_HANDLE_BASE;
-    plat_mutex_lock_shared(&lock);
+    hp_lock_shared(&lock, HPW_ROMFS);
     uint64_t i = handles[j];
     uint32_t ov = handle_ovl[j];
     PlatFile *of = handle_file[j];
@@ -661,7 +673,16 @@ static int handle_source(uint64_t h, PlatFile **f, uint64_t *base, uint64_t *siz
     return 1;
 }
 
+static uint32_t romfs_read_impl(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size);
+
 uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
+    HpT hp = hp_begin();
+    uint32_t r = romfs_read_impl(out, h, offset, buffer, size);
+    hp_end(HPS_ROMFS_READ, hp);
+    return r;
+}
+
+static uint32_t romfs_read_impl(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
     PlatFile *f;
     uint64_t base, fsize;
     if (!out || offset < 0 || !handle_source(h, &f, &base, &fsize)) return FS_R_INVALID;
@@ -695,7 +716,7 @@ void romfs_close(uint64_t h) {
     if (!handle_source(h, &f, &base, &size))
         rt_fatal("RomFS: close of invalid file handle %#llx", (unsigned long long)h);
     uint64_t j = h - ROMFS_HANDLE_BASE;
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_ROMFS);
     PlatFile *of = handle_ovl[j] ? handle_file[j] : NULL;
     handles[j] = 0;
     handle_ovl[j] = 0;

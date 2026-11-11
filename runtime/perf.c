@@ -5,14 +5,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "census.h"
 #include "cfg.h"
 #include "flight.h"
 #include "gfx.h"
 #include "host.h"
+#include "hostprof.h"
 #include "nvn_mode_trace.h"
 #include "perfmon.h"
 #include "prof.h"
 #include "platform/platform.h"
+
+void ov_zstd_probe_log(uint64_t frame);
+void vkb_log(uint64_t frame);
 
 volatile uint32_t prof_render_tid, prof_main_tid, prof_replay_tid;
 
@@ -85,6 +90,7 @@ void perf_end(int kind, uint64_t t0) {
 static volatile int64_t other_wait_ns;     // perf_gpu_wait on threads other than the render thread, over the window
 static volatile int64_t render_wait_ns;    // the same on the render thread
 void (*perf_gpu_stats)(PerfGpu *out);
+volatile int64_t perf_phase_ns[PH_N], perf_phase_n[PH_N];   // host.h perf_phase
 
 void perf_gpu_wait(uint64_t t0) {
     if (!t0 || !__atomic_load_n(&perf_on, __ATOMIC_RELAXED)) return;
@@ -217,6 +223,32 @@ static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share,
     rt_log("perf: frame %llu: %s; %s; fence wait per frame: render thread %.2f ms, other threads %.2f ms; %s; ram working "
            "set %.0f MiB, private %.0f MiB; bound: %s",
            (unsigned long long)frame, gs, us, rw, ow, vs, ws, priv, bound);
+    // Where a slow window went, beyond the line above: the submit lock (waiting for it, and holding it while recording and submitting) and
+    // the process's page faults and the machine's memory (a rise in faults with the working set points at first touches of new memory).
+    if (g.sub_calls)
+        rt_log("perf: frame %llu: submit lock: %.2f submits per frame, wait %.3f ms per frame (max %.2f ms), held %.3f ms per frame (max %.2f ms)",
+               (unsigned long long)frame, (double)g.sub_calls / n, g.sub_wait_ns / 1e6 / n, g.sub_wait_max_ns / 1e6, g.sub_hold_ns / 1e6 / n,
+               g.sub_hold_max_ns / 1e6);
+    int64_t ph[PH_N], pn[PH_N];
+    for (int i = 0; i < PH_N; i++) ph[i] = plat_xchg64(&perf_phase_ns[i], 0), pn[i] = plat_xchg64(&perf_phase_n[i], 0);
+    if (pn[PH_RECORD]) {
+        const double d = (double)n * 1e6;   // ns over n frames -> ms per frame
+        rt_log("perf: frame %llu: submit phases per frame (ms): pre %.2f, slot (fence) %.2f, record %.2f [mirror begin %.2f, usnap begin %.2f, ops %.2f "
+               "(draws %.2f for %.0f, binds %.2f for %.0f), end %.2f], post %.2f, queue submit %.2f; %.1f submissions per frame",
+               (unsigned long long)frame, ph[PH_PRE] / d, ph[PH_SLOT] / d, ph[PH_RECORD] / d, ph[PH_MIRROR_BEGIN] / d, ph[PH_USNAP_BEGIN] / d,
+               ph[PH_OPS] / d, ph[PH_DRAW] / d, (double)pn[PH_DRAW] / (double)n, ph[PH_BIND] / d, (double)pn[PH_BIND] / (double)n, ph[PH_END] / d,
+               ph[PH_POST] / d, ph[PH_QSUBMIT] / d, (double)pn[PH_RECORD] / (double)n);
+    }
+    static uint64_t last_faults;
+    PlatVmStats vm;
+    plat_process_vm_stats(&vm);
+    const double M = 1048576.0;
+    rt_log("perf: frame %llu: process: page faults +%llu (%.0f per frame), working set %.0f MiB (peak %.0f), private %.0f MiB; system: available %.0f of "
+           "%.0f MiB, commit %.0f of %.0f MiB",
+           (unsigned long long)frame, (unsigned long long)(last_faults ? vm.faults - last_faults : 0),
+           last_faults ? (double)(vm.faults - last_faults) / n : 0.0, ws, vm.peak_resident / M, priv, vm.avail_phys / M, vm.total_phys / M,
+           vm.commit_used / M, vm.commit_limit / M);
+    last_faults = vm.faults;
 }
 
 int rt_ab(void) {
@@ -274,6 +306,7 @@ void perf_present(uint64_t frame) {
     if (__atomic_load_n(&overlay, __ATOMIC_RELAXED))   // the overlay's only cost while it is off: this branch
         perfmon_frame(now, d, frame_ns, rep, __atomic_load_n(&counts[PERF_CNT_TEX_UP], __ATOMIC_RELAXED));
     kern_core_diag_frame(frame, d);
+    census_frame(frame);   // DKB_CENSUS / DKB_DRAWSPLIT
     if (flight_on) flight_frame(frame, now, d, frame_ns, counts);
     if (!(rt_trace & RT_TRACE_PERF)) {
         memset(frame_ns, 0, sizeof frame_ns);
@@ -289,16 +322,34 @@ void perf_present(uint64_t frame) {
         sum += d;
         n++;
         if (d > max) max = d, memcpy(worst_ns, frame_ns, sizeof worst_ns);
-        if (d >= slow_ns)
-            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f xlate %.1f texture %.1f astc %.1f fence %.1f pacing %.1f",
+        // What else the frame did: the process's page faults and working set since the previous frame (a load that touches
+        // new memory shows as thousands of faults with the working set growing, in the thread that touches it, not in the
+        // replay) and the write-watch queries' time (they stall under load too).
+        static uint64_t pf_last, ww_last, rs_last;
+        PlatVmStats vm;
+        plat_process_vm_stats(&vm);
+        uint64_t rs, pv, ww = vk_mem_ww_ns();
+        plat_process_memory(&rs, &pv);
+        if (d >= slow_ns) {
+            char hps[400];
+            hostprof_slow_summary(hps, sizeof hps);   // TOTK_HOSTPROF: the frame's top host time and lock waits
+            rt_log("perf: slow frame %llu: %.1f ms; blocked pipeline %.1f xlate %.1f texture %.1f astc %.1f fence %.1f pacing %.1f; "
+                   "process: page faults +%llu, working set %+.0f MiB, write-watch %.1f ms%s",
                    (unsigned long long)frame, d / 1e6, frame_ns[PERF_PIPE] / 1e6, frame_ns[PERF_XLATE] / 1e6,
                    frame_ns[PERF_TEX] / 1e6, frame_ns[PERF_ASTC] / 1e6, frame_ns[PERF_FENCE] / 1e6,
-                   frame_ns[PERF_PACE] / 1e6);
+                   frame_ns[PERF_PACE] / 1e6, (unsigned long long)(pf_last ? vm.faults - pf_last : 0),
+                   rs_last ? ((double)rs - (double)rs_last) / 1048576.0 : 0.0, ww_last ? (double)(ww - ww_last) / 1e6 : 0.0, hps);
+        }
+        hostprof_frame_reset();
+        pf_last = vm.faults, ww_last = ww, rs_last = rs;
     }
     memset(frame_ns, 0, sizeof frame_ns);
     last = now;
     if (!win_start) win_start = now;
     if (frame % 60) return;
+    ov_zstd_probe_log(frame);
+    vkb_log(frame);   // TOTK_BINDLESS_TEX
+    hostprof_log(frame);   // DKB_ZSTD_PROBE (ov_zstd_probe.c): one line per probed call site
     uint64_t span = now - win_start;
     int64_t win[PERF_CNT_N];
     for (int i = 0; i < PERF_CNT_N; i++) {

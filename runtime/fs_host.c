@@ -22,6 +22,7 @@
 
 #include "fs.h"
 #include "host.h"
+#include "hostprof.h"
 #include "platform/platform.h"
 #include "romfs_path.h"
 
@@ -517,7 +518,7 @@ static volatile int32_t commit_pending;
 
 static void save_wait_commit(void) {
     if (!plat_cas32(&commit_pending, 0, 0)) return;
-    plat_mutex_lock(&pend_lock);
+    hp_lock(&pend_lock, HPW_FS);
     while (commit_pending) plat_cond_wait(&pend_cv, &pend_lock);
     plat_mutex_unlock(&pend_lock);
 }
@@ -525,11 +526,11 @@ static void save_wait_commit(void) {
 void fs_save_flush(void) { save_wait_commit(); }
 
 static uint32_t commit_run(void) {
-    plat_mutex_lock(&tx_lock);
+    hp_lock(&tx_lock, HPW_FS);
     uint32_t r = save_commit_locked();
     plat_dec32(&save_writers);
     plat_mutex_unlock(&tx_lock);
-    plat_mutex_lock(&pend_lock);
+    hp_lock(&pend_lock, HPW_FS);
     commit_pending = 0;
     plat_mutex_unlock(&pend_lock);
     plat_cond_broadcast(&pend_cv);
@@ -606,7 +607,7 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     char as_path[40];
     snprintf(as_path, sizeof as_path, "%s:", name);
     if (romfs_owns(as_path)) return FS_R_ALREADY_EXISTS;   // the RomFS mount's name
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_FS);
     int slot = -1;
     for (int i = 0; i < NMOUNTS; i++) {
         if (mounts[i].kind && !strcmp(mounts[i].name, name)) {
@@ -642,7 +643,7 @@ static uint32_t host_path_kind(const char *path, char *out, size_t cap, int *kin
     size_t n = (size_t)(colon - path);
     char root[1024];
     int k = M_FREE;
-    plat_mutex_lock_shared(&lock);
+    hp_lock_shared(&lock, HPW_FS);
     for (int i = 0; i < NMOUNTS; i++)
         if (mounts[i].kind && strlen(mounts[i].name) == n && !strncmp(mounts[i].name, path, n)) {
             strcpy(root, mounts[i].root);
@@ -696,7 +697,7 @@ static int my_uid(const uint64_t *uid) {
 static uint32_t mount_save(const char *name, const uint64_t *uid) {
     ready();
     if (!my_uid(uid)) return FS_R_TARGET_NOT_FOUND;
-    plat_mutex_lock(&tx_lock);
+    hp_lock(&tx_lock, HPW_FS);
     if (!save_mounts) work_create();
     uint32_t r = mount_add(name, M_SAVE, work_root);
     if (!r) save_mounts++;
@@ -787,8 +788,8 @@ static void close_cache_list(uint64_t h) { free((void *)(uintptr_t)h); }
 
 static void unmount(const char *name) {
     save_wait_commit();   // else the working copy could go before a Commit queued just now has copied it
-    plat_mutex_lock(&tx_lock);
-    plat_mutex_lock(&lock);
+    hp_lock(&tx_lock, HPW_FS);
+    hp_lock(&lock, HPW_FS);
     for (int i = 0; i < NMOUNTS; i++)
         if (name && mounts[i].kind && !strcmp(mounts[i].name, name)) {
             int save = mounts[i].kind == M_SAVE;
@@ -809,13 +810,13 @@ static void unmount(const char *name) {
 
 static uint32_t commit(const char *name) {
     int found = 0, save = 0;
-    plat_mutex_lock_shared(&lock);
+    hp_lock_shared(&lock, HPW_FS);
     for (int i = 0; i < NMOUNTS; i++)
         if (name && mounts[i].kind && !strcmp(mounts[i].name, name)) found = 1, save = mounts[i].kind == M_SAVE;
     plat_mutex_unlock_shared(&lock);
     if (!found) return FS_R_PATH_NOT_FOUND;
     if (save) return save_commit();   // durability comes from the staging copy, not the working copy's handles
-    plat_mutex_lock_shared(&lock);
+    hp_lock_shared(&lock, HPW_FS);
     for (int i = 0; i < NFILES; i++)
         if (files[i].h && (files[i].mode & FS_OPEN_WRITE)) plat_file_fsync(files[i].h);
     plat_mutex_unlock_shared(&lock);
@@ -825,7 +826,7 @@ static uint32_t commit(const char *name) {
 // ---- files
 static File *file_of(uint64_t h, PlatFile **fh, int *mode) {
     if (h < FILE_BASE || h >= FILE_BASE + NFILES) return NULL;
-    plat_mutex_lock_shared(&lock);
+    hp_lock_shared(&lock, HPW_FS);
     File *f = &files[h - FILE_BASE];
     PlatFile *v = f->h;
     if (fh) *fh = f->h;
@@ -857,7 +858,7 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     int err = 0;
     PlatFile *f = plat_fs_open(p, (mode & FS_OPEN_WRITE) != 0, &err);
     if (!f) return fs_result(err);
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_FS);
     for (int i = 0; i < NFILES; i++)
         if (!files[i].h) {
             files[i] = (File){f, mode, save_writer};
@@ -950,7 +951,7 @@ static void close_file(uint64_t h) {
         return;
     }
     if (!file_of(h, NULL, NULL)) rt_fatal("fs: close of invalid file handle %#llx", (unsigned long long)h);
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_FS);
     PlatFile *f = files[h - FILE_BASE].h;
     int save = files[h - FILE_BASE].save;
     files[h - FILE_BASE] = (File){0};
@@ -1035,7 +1036,7 @@ static uint32_t open_directory(uint64_t *out, const char *path, int mode) {
     Listing l;
     int e = list_dir(p, &l);
     if (e) return fs_result(e);
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_FS);
     for (int i = 0; i < NDIRS; i++)
         if (!dirs[i].used) {
             dirs[i] = (Dir){l.e, l.n, 0, mode, 1};
@@ -1071,7 +1072,7 @@ static uint32_t read_directory(int64_t *count, DirectoryEntry *out, uint64_t h, 
 static void close_directory(uint64_t h) {
     if (h < DIR_BASE || h >= DIR_BASE + NDIRS || !dirs[h - DIR_BASE].used)
         rt_fatal("fs: close of invalid directory handle %#llx", (unsigned long long)h);
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_FS);
     Dir d = dirs[h - DIR_BASE];
     dirs[h - DIR_BASE] = (Dir){0};
     plat_mutex_unlock(&lock);
@@ -1400,7 +1401,7 @@ static uint64_t probe_romfs(void) {
 // ---- save transactions: restarts, uncommitted and committed changes, a crash at every step of a Commit
 // The process dies here: the save mount goes without Unmount, and the next start runs save_recover and mounts again.
 static void probe_restart(const uint64_t *uid) {
-    plat_mutex_lock(&lock);
+    hp_lock(&lock, HPW_FS);
     for (int i = 0; i < NMOUNTS; i++)
         if (mounts[i].kind == M_SAVE) mounts[i].kind = M_FREE;
     plat_mutex_unlock(&lock);

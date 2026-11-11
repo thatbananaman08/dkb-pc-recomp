@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "hostprof.h"
 #include "fs.h"
 #include "gfx.h"
 #include "nvn_api.h"
@@ -340,6 +341,7 @@ static void guest_main(Cpu *c) {
 
 static void prewarm_main(void *arg) {
     (void)arg;
+    if (!cfg_bool("TOTK_PREWARM_BLOCK")) plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
     vk_pipeline_prewarm();
     const char *prep = cfg_get("TOTK_TEST_PREPARE_SHADERS");   // Task 2.3 test hook; Task 2.6 builds the preparation
     if (prep && !strcmp(prep, "1")) {
@@ -351,8 +353,19 @@ static void prewarm_main(void *arg) {
 
 void rt_boot(void) {
     check_npdm();
-    if (!rt_config()->shot) vk_pipeline_async_enable();   // a --shot image must not depend on build timing
-    // Shaders and pipelines recorded in earlier runs are made ready while the modules load; the guest waits for them.
+    // A --shot image must not depend on build timing, so a --shot run (tools/scenario.py) builds shaders and pipelines on the
+    // replay thread, which also leaves its draws never skipped and writes no pipeline-keys.bin or shader-answers.bin census.
+    // TOTK_PIPE_ASYNC=1 gives a --shot run the same background builds, skips and census as normal play.
+    const char *pa = cfg_get("TOTK_PIPE_ASYNC");
+    if (!rt_config()->shot || (pa && !strcmp(pa, "1"))) vk_pipeline_async_enable();
+    // Shaders and pipelines recorded in earlier runs are made ready while the modules load. By default the guest does not wait
+    // for them: the prewarm goes on beside it at below-normal priority (the title screen and the save load take ~35 s before
+    // a stage needs most of them), a draw whose pipeline is not ready yet takes the ordinary background path (a fast link or a
+    // skipped frame), and a draw that must have it (one-shot draws wait for that pipeline, which moves its job to the front;
+    // compute builds its own) never waits for the whole prewarm. TOTK_PREWARM_BLOCK=1 waits for it before the guest starts.
+    hostprof_init();   // TOTK_HOSTPROF
+    const int block = cfg_bool("TOTK_PREWARM_BLOCK");
+    if (!block) vk_pipeline_prewarm_background();
     PlatThread *warm = plat_thread_new(prewarm_main, NULL, "prewarm");
     ldr_load(rt_config()->exefs);
     rt_patches_init();
@@ -363,11 +376,13 @@ void rt_boot(void) {
     cb_addr[2] = hostfn_register("<rtld module_finis>", cb_module_finis);
     hostfn_seal();
     uint64_t held = plat_now_ms();
-    if (warm) plat_thread_join(warm);
+    if (warm && block) plat_thread_join(warm);
+    else if (warm) plat_thread_detach(warm);
     else vk_pipeline_prewarm();
     held = plat_now_ms() - held;
-    rt_log("boot: guest starts %llu ms after process start (%llu ms of it waiting for the prewarm)",
-           (unsigned long long)(plat_process_uptime_ns() / 1000000), (unsigned long long)held);
+    rt_log("boot: guest starts %llu ms after process start (%llu ms of it waiting for the prewarm%s)",
+           (unsigned long long)(plat_process_uptime_ns() / 1000000), (unsigned long long)held,
+           warm && !block ? "; it goes on in the background, TOTK_PREWARM_BLOCK=1 waits" : "");
     rt_guest_start_ns = kern_now_ns();
     kern_run_on_guest_main(guest_main);
     rt_fatal("boot: the guest main thread ended");

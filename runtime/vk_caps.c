@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "census.h"
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
@@ -77,6 +78,7 @@ static void driver_version(char *o, size_t n, uint32_t vendor, uint32_t v) {
 }
 
 void vk_caps_init(VkCtx *c) {
+    gfx_shader_set_bindless(vkb_supported(c));   // TOTK_BINDLESS_TEX: decides the translator, so before any translation
     VkPhysicalDeviceLimits *l = &c->props.limits;
     VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, .pNext = &drv};
@@ -115,6 +117,7 @@ void vk_caps_init(VkCtx *c) {
     gfx_shader_set_host(vk_caps.float64, vk_caps.sbuf_align, told, gather);
     uint32_t geometry_told = vk_caps.sg_pin_stages & VK_SHADER_STAGE_GEOMETRY_BIT ? want : sg.subgroupSize;
     gfx_shader_set_geometry_host(geometry_told);
+    gfx_shader_set_lq_fold_platform(!rt_game_version && c->props.vendorID == 0x10de);   // Bananza on NVIDIA
     if (gather) rt_log("vk caps: gather coordinates biased for %u sub-texel bits (TOTK_GATHER_BIAS)", gather);
 
     char dv[32];
@@ -132,6 +135,42 @@ void vk_caps_init(VkCtx *c) {
            f64_supported, vk_caps.float64, (unsigned)l->minStorageBufferOffsetAlignment, real_align,
            (unsigned long long)l->minUniformBufferOffsetAlignment, pd.maxPushDescriptors, c->has_provoking_vertex,
            (int)pvf.provokingVertexLast);
+
+    if (census_on()) {   // DKB_CENSUS: what descriptor indexing and buffer device address would have to work with (BINDLESS_DESIGN.md phase 0)
+        VkPhysicalDeviceVulkan12Properties q12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceProperties2 qp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &q12};
+        vkGetPhysicalDeviceProperties2(c->phys, &qp);
+        VkPhysicalDeviceVulkan12Features q12f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceFeatures2 qf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &q12f};
+        vkGetPhysicalDeviceFeatures2(c->phys, &qf);
+        rt_log("census limits: descriptor indexing %d, runtimeDescriptorArray %d, sampled-image array nonuniform %d (native %d), "
+               "update-after-bind: sampled image %d sampler %d uniform buffer %d storage buffer %d storage image %d, partially bound %d, "
+               "variable descriptor count %d, update-unused-while-pending %d, bufferDeviceAddress %d",
+               q12f.descriptorIndexing, q12f.runtimeDescriptorArray, q12f.shaderSampledImageArrayNonUniformIndexing,
+               q12.shaderSampledImageArrayNonUniformIndexingNative, q12f.descriptorBindingSampledImageUpdateAfterBind,
+               q12f.descriptorBindingSampledImageUpdateAfterBind, q12f.descriptorBindingUniformBufferUpdateAfterBind,
+               q12f.descriptorBindingStorageBufferUpdateAfterBind, q12f.descriptorBindingStorageImageUpdateAfterBind,
+               q12f.descriptorBindingPartiallyBound, q12f.descriptorBindingVariableDescriptorCount,
+               q12f.descriptorBindingUpdateUnusedWhilePending, q12f.bufferDeviceAddress);
+        rt_log("census limits: set update-after-bind: sampled images %u samplers %u uniform buffers %u storage buffers %u storage images %u; "
+               "per stage: sampled images %u samplers %u uniform buffers %u storage buffers %u storage images %u, resources %u; "
+               "in all pools %u; descriptor set samplers %u sampled images %u (non-update-after-bind)",
+               q12.maxDescriptorSetUpdateAfterBindSampledImages, q12.maxDescriptorSetUpdateAfterBindSamplers,
+               q12.maxDescriptorSetUpdateAfterBindUniformBuffers, q12.maxDescriptorSetUpdateAfterBindStorageBuffers,
+               q12.maxDescriptorSetUpdateAfterBindStorageImages, q12.maxPerStageDescriptorUpdateAfterBindSampledImages,
+               q12.maxPerStageDescriptorUpdateAfterBindSamplers, q12.maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               q12.maxPerStageDescriptorUpdateAfterBindStorageBuffers, q12.maxPerStageDescriptorUpdateAfterBindStorageImages,
+               q12.maxPerStageUpdateAfterBindResources, q12.maxUpdateAfterBindDescriptorsInAllPools, l->maxDescriptorSetSamplers,
+               l->maxDescriptorSetSampledImages);
+        rt_log("census limits: maxSamplerAllocationCount %u, maxBoundDescriptorSets %u, maxPerStageResources %u, maxPerStageDescriptor: "
+               "samplers %u sampled images %u uniform buffers %u storage buffers; maxUniformBufferRange %u, maxStorageBufferRange %u, "
+               "maxPushConstantsSize %u, maxPushDescriptors %u; descriptor_buffer ext %d, descriptor_indexing ext %d, buffer_device_address ext %d",
+               l->maxSamplerAllocationCount, l->maxBoundDescriptorSets, l->maxPerStageResources, l->maxPerStageDescriptorSamplers,
+               l->maxPerStageDescriptorSampledImages, l->maxPerStageDescriptorUniformBuffers, l->maxPerStageDescriptorStorageBuffers,
+               l->maxUniformBufferRange, l->maxStorageBufferRange, l->maxPushConstantsSize, pd.maxPushDescriptors,
+               has_ext(ep, ne, "VK_EXT_descriptor_buffer"), has_ext(ep, ne, "VK_EXT_descriptor_indexing"),
+               has_ext(ep, ne, "VK_KHR_buffer_device_address"));
+    }
     rt_log("vk caps: ext index_type_uint8 khr %d ext %d, attachment_feedback_loop_layout %d dynamic_state %d, "
            "graphics_pipeline_library %d; depth attachment D16 %c D24S8 %c X8D24 %c D32 %c D32S8 %c",
            has_ext(ep, ne, "VK_KHR_index_type_uint8"), has_ext(ep, ne, "VK_EXT_index_type_uint8"),

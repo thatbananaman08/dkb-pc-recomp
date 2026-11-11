@@ -33,7 +33,8 @@ typedef struct VkCtx {
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker,
-        has_astc_ldr;                       // textureCompressionASTC_LDR (enabled when reported)
+        has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
+        has_present_wait;                   // VK_KHR_present_id and present_wait, only with TOTK_PACE_LOG=1 (pace_log.h)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
     // old behaviour); VK_FEEDBACK_LAYOUT with VK_EXT_attachment_feedback_loop_layout and dynamicRenderingLocalRead
@@ -108,6 +109,8 @@ void vk_fsr_release(void);   // before the device goes away
 VkImage vk_color_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]);
 void vk_color_release(void);   // before the device goes away
 void vk_present_flip(void);
+int vk_present_flip_queued(void);          // TOTK_PACE_FLIP=1: presents wait for their slot on a flip thread (vk_present_flip_at)
+void vk_present_flip_at(uint64_t at_ns);   // queues the flip of the last blit for the pacer's display time
 // Every submission to ctx->gfx_queue (and xfer_queue when shared) takes this lock; vk_present_image and the swapchain
 // rebuild do. Recursive.
 void vk_queue_lock(void);
@@ -206,16 +209,31 @@ void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its l
 extern int vk_mirror_on;
 void vk_mem_use(VkMemSpan *sp);
 void vk_mem_pick(VkMemSpan *sp);
+int vk_mem_use_ready(VkMemSpan *sp);   // VK_MEM_USE without a change of state: 1 and sp->buffer set when it would create or sync nothing, else 0 (replay worker threads)
 #define VK_MEM_USE(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_use(&(sp)); } while (0)
 #define VK_MEM_PICK(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_pick(&(sp)); } while (0)
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
+// TOTK_REPLAY_SPLIT: set while replay workers run beside the walk thread; the mirror, write-back and uniform-snapshot
+// bookkeeping then take vk_split_lock. vk_usnap_split_seq: this thread's draw number for drops and lookups (0: off).
+extern volatile int vk_split_active;
+extern _Thread_local int vk_mem_worker;
+extern uint64_t vk_lock_wait_ns[3];   // texture lock, pipeline lock, split lock: time replay workers waited for them
+void vk_split_lock(void);
+void vk_split_unlock(void);
+void vk_usnap_split_seq(uint32_t s);
+void vk_usnap_split_flush(void);   // a worker hands over the writes it made in its chunk
+void vk_mem_split_flush(void);
 // Uniform blocks as of the submit call (vk_usnap.c): vk_exec_record copies the uniform ranges a submission binds before
 // it records, ubo bindings take the copy (0: not copied, bind memory), GPU writes of the replay drop the copies they touch.
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence);
 void vk_usnap_end(uint64_t fence);
 int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out);
+int vk_usnap_find_asof(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferInfo *out, uint32_t asof);   // TOTK_REPLAY_MT: as of a deferred draw's sequence number
+void vk_usnap_seq(uint32_t s);
+int vk_usnap_read(uint64_t addr, uint64_t n, void *out);   // the snapshot's bytes of [addr, addr+n), 0 when it has none (diagnostics)
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
 uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
+void vk_usnap_span(uint64_t *base, uint64_t *size);   // device address range of the current snapshot arena (probe)
 void vk_usnap_shutdown(void);                     // vk_exec_draw_shutdown: frees the arenas
 void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
@@ -355,6 +373,7 @@ void vk_texture_storage_bound_locked(const VkTexImage *img);   // bound as a sto
 uint64_t vk_texture_last_write(const tex_t *t);    // timeline value of the newest submission recorded to write it; 0: none
 size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img);   // bytes ReadTexels spans; 0 for a bad region
 int vk_texture_small_dirty(void);                   // a small mirrored target holds GPU texels its storage lacks
+int vk_texture_small_dirty_class(uint64_t fence, uint64_t tiny);   // 0: none rendered by work up to fence would be written back, 1: only targets <= tiny bytes, 2: larger ones
 void vk_texture_write_back_small(uint64_t fence);   // writes those rendered by work up to fence back to storage
 void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change, int *pages_written);   // vk_dump
 int vk_texture_slot_swz(const dpool_ref *pool, int id, uint8_t swz[4]);
@@ -496,6 +515,18 @@ typedef struct {
     // Descriptor update template per set (vk_pipeline.c make_tpl): reads one VkDescSlot per descriptor, in binding order,
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
+    // TOTK_BINDLESS_TEX (vk_bindless.c): the textures the modules read from the global table. bl[i].binding is the texture slot index in
+    // its stage's push constant block (GfxShaderRes.bindless), bl[i].stage and .res say which texture it is; bl_vs / bl_fs: words of the
+    // vertex / fragment block (0: the stage has none). A layout with any block also has the table at set VKB_SET.
+    uint32_t n_bl;
+    const VkPipeBinding *bl;
+    uint8_t bl_vs, bl_fs;
+    // TOTK_BINDLESS_BUF: the constant and storage buffers (and the support buffer) the record shaders read through 64-bit addresses in the record
+    // of the draw. bb[i].binding is the buffer index in its stage's record, .kind GFX_RES_UBO, GFX_RES_SSBO or VK_PIPE_SUPPORT. rec_nb[0] / [1]:
+    // buffers in the vertex / fragment record (0: that stage has no record); the texture slots follow them (bl_vs / bl_fs words).
+    uint32_t n_bb;
+    const VkPipeBinding *bb;
+    uint8_t rec_nb[2];
 } VkPipeInfo;
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.
@@ -510,6 +541,7 @@ VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
 VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms);
 // rt_boot calls it unless --shot is given; TOTK_PIPE_SYNC=1 makes it a no-op. Probes never call it.
 void vk_pipeline_async_enable(void);
+void vk_pipeline_prewarm_background(void);   // before the prewarm starts: it runs beside the guest (rt_boot, TOTK_PREWARM_BLOCK=0)
 int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics shaders are translated in the background too
 // Boot prewarm, before the guest runs (rt_boot): loads the shaders pipeline-keys.bin names, translating the ones not
 // cached under the current translator from their stored inputs, and builds every recorded pipeline, on all cores.
@@ -554,5 +586,29 @@ void vk_clear_stencil_masked(VkCommandBuffer cb, VkFormat format, uint32_t sampl
                              VkImageView view, uint32_t width, uint32_t height, VkRect2D scissor,
                              uint32_t mask, uint32_t value);
 void vk_clear_shutdown(VkDevice device);   // after device idle, before destroying the device
+
+// ---- global sampled-texture table (TOTK_BINDLESS_TEX, vk_bindless.c; slot logic in bindless_table.h)
+// One update-after-bind descriptor set of combined image samplers per SPIR-V image class (BT_CLASSES bindings, the class
+// number is the binding), bound at set VKB_SET. A shader of a bindless pipeline indexes it with a slot the replay pushes
+// per draw (push constants, 4 bytes per texture). TOTK_BINDLESS_TEX=0 (default) off, 1 on, check: the draw path stays
+// the old one and every texture use is also entered into the table and compared (the table is never sampled).
+#define VKB_SET 2
+int vkb_supported(VkCtx *c);           // the device can hold the table and run bindless pipelines (features, limits, independent layouts)
+int vkb_mode(void);                    // 0 off, 1 on, 2 check; 0 as well when the device cannot (logged)
+VkDescriptorSetLayout vkb_layout(void);
+VkDescriptorSet vkb_set(void);
+// The slot of the descriptor the replay would bind for a texture of class `cls` (bt_class_of_type), written into the table
+// when new. dummy_*: the stand-in view and sampler of the class (slot 0 and freed slots hold it).
+uint32_t vkb_slot(uint32_t cls, VkSampler samp, VkImageView view, VkImageLayout layout, VkSampler dummy_samp, VkImageView dummy_view);
+// check mode: 1 when the slot holds (samp, view, layout), else counts and logs a mismatch.
+int vkb_verify(uint32_t cls, uint32_t slot, VkSampler samp, VkImageView view, VkImageLayout layout);
+// TOTK_BINDLESS_BUF=1 (needs TOTK_BINDLESS_TEX=1): constant and storage buffers are read through 64-bit device addresses in a per-draw record.
+VkBufferUsageFlags vkb_buf_usage(void);        // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT for every buffer a shader can read when the mode is requested, else 0
+int vkb_buf_mode(void);                        // 1 when bindless buffers are on (the shaders are record shaders and the device has bufferDeviceAddress)
+VkDeviceAddress vkb_buffer_address(VkBuffer buffer);   // cached vkGetBufferDeviceAddress
+uint64_t vkb_gen(void);                        // changes whenever a table slot is released (a cached slot number may be stale)
+void vkb_view_gone(VkImageView view);          // before the view is destroyed: its slots are freed and hold the stand-in
+void vkb_sampler_gone(VkSampler samp);
+void vkb_log(uint64_t frame);                  // every 60 presents (perf.c)
 
 #include "vk_rec.h"   // last: its macros route the vkCmd* calls of every file that includes vk.h

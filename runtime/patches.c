@@ -52,6 +52,12 @@ void rt_patches_init(void) {
                               rt_patch_on[i] ? "on" : "off");
         if (n >= sizeof list) n = sizeof list - 1;
     }
+    // TOTK_ZSTD=1 (ov_zstd.c, Bananza) is carried by the sites of the zstdprobe set: they route the call to the host function,
+    // which answers it or passes it through.
+    const char *zs = cfg_get("TOTK_ZSTD");
+    if (zs && !strcmp(zs, "1"))
+        for (int i = 0; i < RT_PATCH_COUNT; i++)
+            if (!strcmp(sets[i].name, "zstdprobe")) rt_patch_on[i] = 1, n += (size_t)snprintf(list + n, sizeof list - n, ", zstdprobe on by TOTK_ZSTD");
     rt_log("patches: %s (page %#llx)", list, RT_PATCH_PAGE);
 #endif
 }

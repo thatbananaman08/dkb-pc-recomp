@@ -43,7 +43,9 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "event_log.h"
+#include "draw_filter.h"
 #include "host.h"
+#include "lq_skip.h"
 #include "nvn_geometry_control.h"
 #include "spirv_opt.h"
 #include "platform/platform.h"
@@ -110,6 +112,10 @@ struct GfxShader {
     unsigned geometry_position;                         // v2: Position input/output, malformed interface bit 4
     Nvn2C0Layout c0;                                       // NVN 2 compute parameter-block layout, when has_c0
     int has_c0;
+    int lq_folded;                                         // lq_fold applied to this module (gfx_shader_folded)
+    int lq_refold_tried;                                   // gfx_shader_fold_fix tried the fold on this module (under refold_lock)
+    int lq_suspect;                                        // gfx_shader_lq_suspect's answer: 0 not asked, 1 no, 2 yes (under refold_lock)
+    int bl_buffers;                                        // record shaders (TOTK_BINDLESS_BUF): buffers in the record; the texture slots follow them
 };
 
 static PlatMutex cache_lock = PLAT_MUTEX_INIT;                  // memory cache
@@ -304,6 +310,10 @@ static void xlate_identity(void) {
 // next to totk.exe, so every build dir has its own (as the pipeline cache, vk_pipeline.c cache_path_init).
 static void use_preload_start(void);
 
+static int bindless_dev_ok = -1;   // gfx_shader_set_bindless: the device can serve bindless pipelines (-1: not told yet)
+static int bindless_xlate;         // the bindless translator serves
+static int bindless_buf;           // ... and its shaders read constant and storage buffers through the record (TOTK_BINDLESS_BUF=1)
+
 static void init_paths(void *param) {
     (void)param;
     char exe[PATH_CAP], root[PATH_CAP] = "", exe_dir[PATH_CAP] = "";
@@ -326,15 +336,45 @@ static void init_paths(void *param) {
     if (xlate_cfg && *xlate_cfg && strlen(xlate_cfg) < sizeof xlate_exe) strcpy(xlate_exe, xlate_cfg);
     else if (exe_dir[0] && file_exists(beside)) strcpy(xlate_exe, beside);
     else if (root[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s/build/xlate/totk_xlate" PLAT_EXE_SUFFIX, root);
+    {   // TOTK_BINDLESS_TEX=1: the translator with the bindless option, next to totk.exe or under build/xlate-bindless; its own identity
+        const char *bl = cfg_get("TOTK_BINDLESS_TEX");
+        if (bl && !strcmp(bl, "1")) {
+            char cand[PATH_CAP + 48];
+            cand[0] = 0;
+            if (exe_dir[0]) snprintf(cand, sizeof cand, "%s/totk_xlate_bindless" PLAT_EXE_SUFFIX, exe_dir);
+            if (!(cand[0] && file_exists(cand)) && root[0]) snprintf(cand, sizeof cand, "%s/build/xlate-bindless/totk_xlate" PLAT_EXE_SUFFIX, root);
+            if (bindless_dev_ok != 1) rt_log("gfx_shader: TOTK_BINDLESS_TEX=1: %s; the default translator serves", bindless_dev_ok == 0 ? "the device cannot serve it" : "the device was not asked first");
+            else if (!cand[0] || !file_exists(cand)) rt_log("gfx_shader: TOTK_BINDLESS_TEX=1: no bindless translator (python tools/build_xlate_bindless.py); the default translator serves");
+            else strcpy(xlate_exe, cand), bindless_xlate = 1;
+            const char *bb = cfg_get("TOTK_BINDLESS_BUF");
+            if (bindless_xlate && bb && !strcmp(bb, "1")) bindless_buf = 1;
+        }
+    }
     if (cache_cfg && *cache_cfg && strlen(cache_cfg) < sizeof cache_dir) strcpy(cache_dir, cache_cfg);
+    else if (cfg_get("TOTK_CACHE_DIR") && *cfg_get("TOTK_CACHE_DIR") && strlen(cfg_get("TOTK_CACHE_DIR")) < sizeof cache_dir - 16)
+        snprintf(cache_dir, sizeof cache_dir, "%s/shader-cache", cfg_get("TOTK_CACHE_DIR"));   // TOTK_CACHE_DIR: see vk_pipeline.c
     else if (exe_dir[0]) snprintf(cache_dir, sizeof cache_dir, "%s/shader-cache", exe_dir);
     xlate_identity();
+    if (bindless_buf) {   // the same translator makes other modules with the record: its own cache keys
+        uint8_t buf[32 + 4];
+        memcpy(buf, xlate_id, 32), memcpy(buf + 32, "TKBB", 4);
+        rt_sha256(buf, sizeof buf, xlate_id);
+    }
     if (cache_dir[0]) pack_open();
     use_preload_start();
     return;
 }
 
 static void paths(void) { plat_once(&paths_once, init_paths, NULL); }
+
+// vk_caps_init: whether the device can serve bindless pipelines; the first call into this file, as it decides the translator.
+void gfx_shader_set_bindless(int device_ok) {
+    bindless_dev_ok = device_ok != 0;
+    paths();
+}
+int gfx_shader_bindless(void) { return bindless_xlate; }
+int gfx_shader_bindless_buf(void) { return bindless_buf; }
+int gfx_shader_bindless_buffers(const GfxShader *s) { return s ? s->bl_buffers : 0; }
 
 // Host answers (vk_caps.c, at device creation, before any translation). Answers other than the defaults (Float64,
 // exact storage offsets, 32 lanes, no gather bias) are mixed into the translator identity, so they get their own cache
@@ -627,8 +667,341 @@ static void spirv_optimize(uint8_t **spv, uint64_t *size) {
     *size = n * 4;
 }
 
+// DKB_LQ_PATCH_KEYS=<cache key prefixes> (a comma list of hex prefixes of the shader-cache file name, i.e. the key disk_load_from
+// loads) limits every patch below, DKB_LQ_VSMASK and the rest to the modules whose key starts with one of them; each patched
+// module is logged with its key.
+// DKB_LQ_PATCH=caps,demote,lod,nullfs,cullvs,nullvs,passvs,flatten,notrig,noflags,ubocomp,ldcfix,and3exact,rotexact,loadexact (diagnostic, off by default): applies spirv_lq_patch (spirv_opt.cpp) to the
+// deferred-light fragment family that faults the NVIDIA driver (nullfs also breaks that family on purpose: its entry
+// function writes null outputs) and, for cullvs, to vertex modules with an Input at Location 9 (their Position output
+// is forced outside the clip volume; nullvs and passvs replace the vertex entry function by one that writes only that
+// Position and null or passed-through outputs). Called for every module; the patcher decides by stage. Runs after spirv_optimize. A patch that fails validation keeps the
+// module as it was and logs one warning; each kind logs when it first applies and then at powers of two.
+// caps also applies to those vertex modules, and so do flatten (locals to SSA, if-conversion, remaining selections marked
+// Flatten: no data-dependent branches where the maths allows), notrig (Sin / Cos results become 0.0) and noflags
+// (OpBitwiseAnd results become 0); all three keep the rest of the original code and need no mask. ubocomp applies to
+// every module of any stage: a load through an access chain into a Uniform / StorageBuffer variable whose last index picks
+// a vector component dynamically becomes a load of the whole vector, four extracts and a select chain on the index.
+// DKB_LQ_VSMASK=<hex> (independent of DKB_LQ_PATCH) masks the matched vertex
+// modules' outputs: bit k (0..15) keeps the Output at Location k, bit 16 keeps Position; the others are overwritten
+// with null (Position with vec4(0,0,2,1)) at every return and the code that only fed them is removed. It logs the
+// mask and the entry function's instruction counts for the first 64 modules. DKB_LQ_VSCUT=tdepth|scale|rot|flags|pos|offset|center
+// (after the mask, usable without it) replaces the results of a fixed set of instructions of the captured Ground
+// light-quad vertex shader (spirv_opt.cpp vscut_table) by nulls and removes what only fed them; every other matched
+// vertex module gets mask 0 instead (all Location outputs null, Position culled) and is counted as vscut-fallback-mask0.
+// The fold (DKB_LQ_FOLD, default 1; 0 turns it off): the default workaround for NVIDIA issue #9, a driver fault ("instruction pointer
+// (invalid)", the device is lost after 40 to 60 s, or the driver's compiler crashes) in seven light-shaped vertex stages of Bananza
+// (lq_fold_rules). THE FOLD IS NOT EXACT.
+// The stages compute a selector r = (a computed index) & 3 that picks one of four constant-buffer words, and the fault goes away when the
+// test-class `&3` ANDs that feed branch conditions are replaced by 0 (spirv_lq_patch kind 4096). What changes depends on the rule:
+//  - Ground's 67a23e6f132386f9 and e2bf75f927acd249, Tower's 3a10ce1a4f3cdf0b, 8475bd9dadb18f45 and 4645f0dd7b4502a2, and Ice's
+//    7a76ae8de5016fd9 (site 0, the whole fold; the folded Ice module compiled without the compiler crash and drew without device loss):
+//    both ANDs become 0, so the per-instance value exported to the fragment stage, which uses it as a texture array layer, becomes layer 0 for
+//    every instance (r was 0 to 3 in the captured draws; the other outputs were identical).
+//  - Fort's 1ee77eac998beea5 (site 4, construct 31): only the AND(s) that decide selection construct 31 (the `r != 3` one) become 0. That shifts
+//    a texture coordinate (Location 3) by up to 0.5 in about 46% of the captured invocations; Position and the exported layer are unchanged.
+// Every value-preserving rewrite of the same code was tried and still lost the device: and3exact, rotexact, loadexact, selfix, mul2 and a
+// branch-free select form. A rule applies only on Bananza + NVIDIA (the vk_caps.c setter), only to the stage named by the origin the request
+// carries, and only if the patcher finds exactly the expected pattern (whole fold: two test-class ANDs and a Location 9 input; construct rule:
+// an AND that reaches that construct); otherwise the module stays as translated and, for light-quad stages, its draws stay skipped
+// (vk_exec_draw.c light_quad_fault_skip; Fort's stage is not a light quad and is never skipped). The cache key does not depend on the origin, so
+// two origins can share a module (4645f0dd and e2bf75f9 do); both are in the table, so it is folded whichever loads first. DKB_LQ_PATCH set:
+// the diagnostic kinds run instead. DKB_LQ_FOLD_ORIGINS adds stages and DKB_LQ_FOLD_SITE / DKB_LQ_FOLD_CONSTRUCT override the rule for them.
+typedef struct { uint64_t origin; unsigned site, construct; } LqFoldRule;   // site 0: the whole fold; 4: the ANDs that reach `construct`
+static const LqFoldRule lq_fold_rules[] = {
+    {0x67a23e6f132386f9ull, 0, 0}, {0xe2bf75f927acd249ull, 0, 0}, {0x3a10ce1a4f3cdf0bull, 0, 0}, {0x8475bd9dadb18f45ull, 0, 0},
+    {0x4645f0dd7b4502a2ull, 0, 0}, {0x7a76ae8de5016fd9ull, 0, 0}, {0x1ee77eac998beea5ull, 4, 31},
+};
+static const LqFoldRule *lq_fold_rule(uint64_t origin) {
+    for (size_t i = 0; i < sizeof lq_fold_rules / sizeof *lq_fold_rules; i++)
+        if (lq_fold_rules[i].origin == origin) return &lq_fold_rules[i];
+    return NULL;
+}
+static int fold_platform;
+void gfx_shader_set_lq_fold_platform(int on) { fold_platform = on; }
+int gfx_shader_folded(const GfxShader *s) { return s && s->lq_folded; }
+static _Thread_local uint64_t lq_origin;   // the NVN 2 stage name of the request disk_load_from is serving (0: unknown)
+static _Thread_local int lq_quiet;         // gfx_shader_lq_suspect's trial runs: no log lines, no counts
+static int fold_enabled(void) {            // DKB_LQ_FOLD=0 turns the fold (and the fail-safe that goes with it) off
+    static int e = -1;
+    if (e < 0) {
+        const char *v = getenv("DKB_LQ_FOLD");
+        e = !(v && !strcmp(v, "0"));
+    }
+    return e;
+}
+
+static int lq_fold(uint8_t **spv, uint64_t *size, uint64_t origin) {
+    static int enabled = -1;
+    static DfOrigins extra;   // DKB_LQ_FOLD_ORIGINS: more stages to try the fold on (off by default)
+    static volatile int32_t lines, failures;
+    if (enabled < 0) {
+        const char *v = getenv("DKB_LQ_FOLD"), *x = getenv("DKB_LQ_FOLD_ORIGINS");
+        enabled = !(v && !strcmp(v, "0"));
+        if (x && *x) {
+            if (df_parse_whole_origins(&extra, x) < 0)
+                rt_log("gfx_shader: DKB_LQ_FOLD_ORIGINS=%s is not a comma-separated list of 16-digit origins (at most %d); ignored", x, DF_MAX_ORIGINS);
+            else rt_log("gfx_shader: DKB_LQ_FOLD_ORIGINS: the fold is also tried on %u stage(s)", extra.n);
+        }
+    }
+    const LqFoldRule *rule = lq_fold_rule(origin);
+    if (!enabled || !fold_platform || (!rule && df_match_origin(&extra, origin) < 0)) return 0;
+    char err[256] = "";
+    uint32_t *o = NULL;
+    uint64_t n = 0;
+    unsigned applied = 0;
+    // DKB_LQ_FOLD_SITE=export|branch|exact (diagnostic, only for the stages named in DKB_LQ_FOLD_ORIGINS): null just one of the two test-class &3 ANDs.
+    unsigned site = rule ? rule->site : 0, construct = rule ? rule->construct : 0;
+    if (df_match_origin(&extra, origin) >= 0) {   // only for stages named in DKB_LQ_FOLD_ORIGINS, default stages included
+        const char *sv = getenv("DKB_LQ_FOLD_SITE");
+        const unsigned env_site = sv && !strcmp(sv, "export") ? 1 : sv && !strcmp(sv, "branch") ? 2 : sv && !strcmp(sv, "exact") ? 3 :
+                                  sv && !strcmp(sv, "construct") ? 4 : 0;
+        if (sv && *sv && !env_site) rt_log("gfx_shader: DKB_LQ_FOLD_SITE=%s is not export, branch, exact or construct; ignored", sv);
+        if (env_site) site = env_site, construct = 0;   // the environment overrides the rule; the construct then comes from DKB_LQ_FOLD_CONSTRUCT
+    }
+    // construct (DKB_LQ_FOLD_CONSTRUCT=<n>): bit 18 and the vertex force, so a stage without a Location 9 input (Fort's) can be tried
+    // the rule's construct travels in bits 19..24 of the kinds; DKB_LQ_FOLD_CONSTRUCT, when set, takes precedence in the patcher
+    int r = spirv_lq_patch_ex((const uint32_t *)*spv, *size / 4, site == 4 ? 4096u | 262144u | (construct & 63u) << 19 : 4096u | site << 16, &o, &n, &applied, err,
+                              sizeof err, site == 4);
+    if (r == 1 && o && spirv_complete(o, n) && (applied >> 18 & 1)) {
+        free(*spv);
+        *spv = (uint8_t *)o;
+        *size = n * 4;
+        if (!lq_quiet && plat_inc32(&lines) <= 8)
+            rt_log("gfx_shader: light-quad fold applied to stage %016llx (%s)", (unsigned long long)origin, err);
+        return 1;
+    }
+    free(o);
+    if (!lq_quiet && plat_inc32(&failures) <= 8)
+        rt_log("gfx_shader: light-quad fold not applied to stage %016llx (%s); its draws stay skipped", (unsigned long long)origin,
+               r < 0 ? err : "the expected pattern is not there");
+    return 0;
+}
+
+// DKB_LQ_MUL2_ORIGINS=<16-digit origin>[,...] (off by default; Bananza + NVIDIA): the stages named get spirv_lq_patch kind mul2 instead
+// of the fold. Their selector r = cond ? ((P * Q + C) & 3) : 3 keeps its value and is computed from the low two bits of the operands, so the
+// multiply emulated from 16-bit halves goes. Exact for every input, unlike the fold (which fixes r at 0); fails closed when the pattern is not
+// exactly there. A stage in both this list and the fold's gets mul2 only. The patched module is exempt from the light-quad skip like a folded one.
+static int lq_mul2(uint8_t **spv, uint64_t *size, uint64_t origin, int *listed) {
+    static int enabled = -1;
+    static DfOrigins list;
+    static volatile int32_t lines, failures;
+    if (enabled < 0) {
+        const char *x = getenv("DKB_LQ_MUL2_ORIGINS");
+        enabled = 0;
+        if (x && *x) {
+            if (df_parse_whole_origins(&list, x) < 0)
+                rt_log("gfx_shader: DKB_LQ_MUL2_ORIGINS=%s is not a comma-separated list of 16-digit origins (at most %d); ignored", x, DF_MAX_ORIGINS);
+            else enabled = 1, rt_log("gfx_shader: DKB_LQ_MUL2_ORIGINS: the mul2 rewrite is tried on %u stage(s)", list.n);
+        }
+    }
+    *listed = 0;
+    if (!enabled || !fold_platform || df_match_origin(&list, origin) < 0) return 0;
+    *listed = 1;
+    char err[256] = "";
+    uint32_t *o = NULL;
+    uint64_t n = 0;
+    unsigned applied = 0;
+    int r = spirv_lq_patch((const uint32_t *)*spv, *size / 4, 32768u, &o, &n, &applied, err, sizeof err);
+    if (r == 1 && o && spirv_complete(o, n) && (applied >> 21 & 1)) {
+        free(*spv);
+        *spv = (uint8_t *)o;
+        *size = n * 4;
+        if (plat_inc32(&lines) <= 8) rt_log("gfx_shader: mul2 rewrite applied to stage %016llx (%s)", (unsigned long long)origin, err);
+        return 1;
+    }
+    free(o);
+    if (plat_inc32(&failures) <= 8)
+        rt_log("gfx_shader: mul2 rewrite not applied to stage %016llx (%s); the module is unchanged", (unsigned long long)origin,
+               r < 0 ? err : "the expected pattern is not there");
+    return 0;
+}
+
+static int lq_patch(uint8_t **spv, uint64_t *size, const uint8_t key[32]) {
+    static int inited;
+    static unsigned kinds;
+    static char only_keys[512];   // DKB_LQ_PATCH_KEYS: comma-separated prefixes of the cache key (the shader-cache file name)
+    static volatile int32_t key_lines;
+    static volatile int32_t count[21], failures, vs_lines;
+    if (!inited) {
+        inited = 1;
+        const char *v = getenv("DKB_LQ_PATCH");
+        kinds = 0;
+        if (v && *v) {
+            char buf[128];
+            snprintf(buf, sizeof buf, ",%s,", v);
+            if (strstr(buf, ",caps,")) kinds |= 1;
+            if (strstr(buf, ",demote,")) kinds |= 2;
+            if (strstr(buf, ",lod,")) kinds |= 4;
+            if (strstr(buf, ",nullfs,")) kinds |= 8;
+            if (strstr(buf, ",cullvs,")) kinds |= 16;
+            if (strstr(buf, ",nullvs,")) kinds |= 32;
+            if (strstr(buf, ",passvs,")) kinds |= 64;
+            if (strstr(buf, ",flatten,")) kinds |= 1 << 28;
+            if (strstr(buf, ",notrig,")) kinds |= 1 << 29;
+            if (strstr(buf, ",noflags,")) kinds |= 1 << 30;
+            if (strstr(buf, ",ubocomp,")) kinds |= 1u << 31;
+            if (strstr(buf, ",ldcfix,")) kinds |= 256;   // bit 8, read by the patcher only while vsmask (bit 7) is off
+            if (strstr(buf, ",and3exact,")) kinds |= 512;   // bit 9, likewise
+            if (strstr(buf, ",rotexact,")) kinds |= 1024;   // bit 10, likewise
+            if (strstr(buf, ",loadexact,")) kinds |= 2048;  // bit 11, likewise
+            rt_log("gfx_shader: DKB_LQ_PATCH=%s (caps %d, demote %d, lod %d, nullfs %d, cullvs %d, nullvs %d, passvs %d, flatten %d, notrig %d, noflags %d, ubocomp %d, ldcfix %d, and3exact %d, rotexact %d, loadexact %d)",
+                   v, kinds & 1, !!(kinds & 2), !!(kinds & 4), !!(kinds & 8), !!(kinds & 16), !!(kinds & 32), !!(kinds & 64),
+                   !!(kinds & (1 << 28)), !!(kinds & (1 << 29)), !!(kinds & (1 << 30)), !!(kinds & (1u << 31)), !!(kinds & 256), !!(kinds & 512), !!(kinds & 1024), !!(kinds & 2048));
+        }
+        const char *keys = getenv("DKB_LQ_PATCH_KEYS");
+        if (keys && *keys) {
+            snprintf(only_keys, sizeof only_keys, ",%s,", keys);
+            rt_log("gfx_shader: DKB_LQ_PATCH_KEYS=%s: the patches apply only to modules whose cache key starts with one of these prefixes", keys);
+        }
+        const char *classes = getenv("DKB_LQ_AND3_CLASS");
+        if (classes && *classes) rt_log("gfx_shader: DKB_LQ_AND3_CLASS=%s (noflags nulls only the &3 ANDs of those classes: comp, round, test)", classes);
+        const char *only = getenv("DKB_LQ_NOFLAGS_ONLY");
+        if (only && *only) rt_log("gfx_shader: DKB_LQ_NOFLAGS_ONLY=%s (noflags nulls only the OpBitwiseAnd with those constants; nonconst = no constant operand)", only);
+        const char *m = getenv("DKB_LQ_VSMASK");
+        if (m && *m) {
+            unsigned long mv = strtoul(m, NULL, 16) & 0x1ffffUL;
+            if (kinds & (256 | 512 | 1024 | 2048)) rt_log("gfx_shader: DKB_LQ_PATCH=ldcfix / and3exact / rotexact / loadexact are ignored while DKB_LQ_VSMASK is set");
+            kinds &= ~(256u | 512u | 1024u | 2048u);
+            kinds |= 128 | (unsigned)(mv << 8);
+            rt_log("gfx_shader: DKB_LQ_VSMASK=%05lx (keeps Output Locations 0..15 by bit, Position by bit 16)", mv);
+        }
+        const char *cut = getenv("DKB_LQ_VSCUT");
+        if (cut && *cut) {   // the cut names in spirv_opt.cpp vscut_table order
+            static const char *const cuts[7] = {"tdepth", "scale", "rot", "flags", "pos", "offset", "center"};
+            int sel = 0;
+            for (int k = 0; k < 7; k++)
+                if (!strcmp(cut, cuts[k])) sel = k + 1;
+            if (sel) kinds |= (unsigned)sel << 25;
+            rt_log("gfx_shader: DKB_LQ_VSCUT=%s (%s)", cut, sel ? "selected" : "unknown name, ignored");
+        }
+        const char *sfx = getenv("DKB_LQ_SELFIX");
+        if (sfx && *sfx) {   // bit 14: the patcher reads the construct list itself (spirv_opt.h); a mask bit of vsmask, so not with it
+            if (kinds & 128) rt_log("gfx_shader: DKB_LQ_SELFIX is ignored while DKB_LQ_VSMASK is set");
+            else kinds |= 16384, rt_log("gfx_shader: DKB_LQ_SELFIX=%s (those selection constructs run both ways, selected by a select)", sfx);
+        }
+        const char *vsb = getenv("DKB_LQ_VSBLOCK");
+        if (vsb && *vsb) {   // bit 13: the patcher reads the range itself (spirv_opt.h); a mask bit of vsmask, so not with it
+            if (kinds & 128) rt_log("gfx_shader: DKB_LQ_VSBLOCK is ignored while DKB_LQ_VSMASK is set");
+            else kinds |= 8192, rt_log("gfx_shader: DKB_LQ_VSBLOCK=%s (selection constructs forced to one path)", vsb);
+        }
+    }
+    if (!kinds) {
+        int listed = 0;
+        int m = lq_mul2(spv, size, lq_origin, &listed);
+        return listed ? m : lq_fold(spv, size, lq_origin);   // mul2 wins over the fold for a stage in both lists
+    }
+    char khex[65];
+    key_hex(key, khex);
+    if (only_keys[0]) {
+        int hit = 0;
+        for (const char *p = only_keys + 1; *p;) {
+            const char *e = strchr(p, ',');
+            size_t n = e ? (size_t)(e - p) : strlen(p);
+            if (n && !strncmp(khex, p, n)) hit = 1;
+            p = e ? e + 1 : p + n;
+        }
+        if (!hit) return 0;
+    }
+    char err[256] = "";
+    uint32_t *o = NULL;
+    uint64_t n = 0;
+    unsigned applied = 0;
+    // With DKB_LQ_PATCH_KEYS set, a module that matched a prefix is the one the person means: the vertex kinds apply to it
+    // without a Location 9 input.
+    int r = spirv_lq_patch_ex((const uint32_t *)*spv, *size / 4, (unsigned)kinds, &o, &n, &applied, err, sizeof err, only_keys[0] != 0);
+    if (r < 0) {
+        if (plat_inc32(&failures) == 1) rt_log("gfx_shader: DKB_LQ_PATCH failed (%s); keeping the module", err);
+        return 0;
+    }
+    if (r == 0 || !o || !spirv_complete(o, n)) { free(o); return 0; }
+    free(*spv);
+    *spv = (uint8_t *)o;
+    *size = n * 4;
+    static const char *const names[21] = {"caps", "demote", "lod", "nullfs", "cullvs", "nullvs", "passvs", "vsmask", "vscut",
+                                          "vscut-fallback-mask0", "flatten", "notrig", "noflags", "ubocomp", "ldcfix", "and3exact", "rotexact", "loadexact", "fold", "vsblock", "selfix"};
+    for (int k = 0; k < 21; k++)
+        if (applied & (1u << k)) {
+            int32_t c = plat_inc32(&count[k]);
+            if (!(c & (c - 1))) rt_log("gfx_shader: DKB_LQ_PATCH %s patched %d module(s) so far", names[k], c);
+        }
+    if (err[0] && plat_inc32(&vs_lines) <= 64) rt_log("gfx_shader: DKB_LQ_PATCH vertex module: %s", err);
+    if (only_keys[0] && plat_inc32(&key_lines) <= 256) rt_log("gfx_shader: DKB_LQ_PATCH_KEYS: patched module %s (applied %#x)", khex, applied);
+    return 0;
+}
+
 // Reads <key>.spv and <key>.res.json from the pack (packed 1) or the loose files; NULL if either is missing or
 // malformed. iid: the input id, NULL when the caller sets it.
+// ---- the fold, whichever path loaded the module
+// A module is cached by its key, which does not depend on the stage name (origin), and the fold is decided by the origin of the
+// request that loads it from disk (lq_origin). A module that came in without one (the boot prewarm loads the stored inputs of
+// earlier runs by input id; a stage of another origin shares it) sat in the cache unfolded and every later request reused it,
+// so Fort, Tower and Ice drew with the module that faults the NVIDIA driver. Two guards, both before a pipeline exists:
+//  - gfx_shader_fold_fix: every request that returns a module to a caller (gfx_shader_get, gfx_shader_get_async) folds a cached
+//    module of a stage with a rule that is not folded yet, in place; the old words stay allocated (a reader may hold them).
+//  - gfx_shader_lq_suspect: the prewarm, which does not know stages, asks before it builds a pipeline whether a vertex module
+//    has the fold's pattern; such a pipeline is left to the draw, which knows the stage (fold, or the skip in vk_exec_draw.c
+//    lq_fold_missing). A trial may also match a module with no rule: that only costs a prewarm.
+static PlatMutex refold_lock = PLAT_MUTEX_INIT;
+
+int gfx_shader_fold_origin(uint64_t origin) {
+    return origin && fold_platform && fold_enabled() && lq_fold_rule(origin) != NULL;
+}
+
+const GfxShader *gfx_shader_fold_fix(const GfxShader *cs, uint64_t origin) {
+    GfxShader *s = (GfxShader *)cs;
+    if (!s || s->stage != GFX_STAGE_VS) return cs;
+    int rule = gfx_shader_fold_origin(origin);
+    if (!lq_refold_decision(rule, __atomic_load_n(&s->lq_folded, __ATOMIC_ACQUIRE), __atomic_load_n(&s->lq_refold_tried, __ATOMIC_ACQUIRE)))
+        return cs;
+    plat_mutex_lock(&refold_lock);
+    if (lq_refold_decision(rule, s->lq_folded, s->lq_refold_tried)) {
+        s->lq_refold_tried = 1;
+        uint64_t size = s->words * 4;
+        uint8_t *copy = malloc(size);
+        if (copy) {
+            memcpy(copy, s->spirv, size);
+            lq_origin = origin;
+            int folded = lq_patch(&copy, &size, s->key);
+            lq_origin = 0;
+            if (folded) {   // the module a prewarm loaded without the stage: now folded, before any pipeline uses it
+                rt_log("gfx_shader: stage %016llx got a module loaded without its name: folded now", (unsigned long long)origin);
+                s->words = size / 4;
+                __atomic_store_n(&s->spirv, (uint32_t *)copy, __ATOMIC_RELEASE);   // the old words are not freed: a reader may hold them
+                __atomic_store_n(&s->lq_folded, 1, __ATOMIC_RELEASE);
+                copy = NULL;
+            }
+        }
+        free(copy);
+    }
+    plat_mutex_unlock(&refold_lock);
+    return cs;
+}
+
+int gfx_shader_lq_suspect(const GfxShader *cs) {
+    GfxShader *s = (GfxShader *)cs;
+    if (!s || s->stage != GFX_STAGE_VS || !fold_platform || !fold_enabled() || __atomic_load_n(&s->lq_folded, __ATOMIC_ACQUIRE)) return 0;
+    int suspect = 0;
+    plat_mutex_lock(&refold_lock);
+    if (s->lq_suspect) {
+        plat_mutex_unlock(&refold_lock);
+        return s->lq_suspect == 2;
+    }
+    for (size_t i = 0; i < sizeof lq_fold_rules / sizeof *lq_fold_rules && !suspect; i++) {
+        if (i && lq_fold_rules[i].site == lq_fold_rules[i - 1].site && lq_fold_rules[i].construct == lq_fold_rules[i - 1].construct) continue;
+        uint64_t size = s->words * 4;
+        uint8_t *copy = malloc(size);
+        if (!copy) break;
+        memcpy(copy, s->spirv, size);
+        lq_quiet = 1;
+        suspect = lq_fold(&copy, &size, lq_fold_rules[i].origin);
+        lq_quiet = 0;
+        free(copy);
+    }
+    s->lq_suspect = suspect ? 2 : 1;
+    plat_mutex_unlock(&refold_lock);
+    return suspect;
+}
+
 static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int packed, int flags) {
     static volatile int32_t n_bad;
     char hex[65], p[PATH_CAP + 80];
@@ -652,7 +1025,9 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
         return NULL;
     }
     spirv_optimize(&spv, &spv_size);
+    int folded = lq_patch(&spv, &spv_size, key);
     GfxShader *s = calloc(1, sizeof *s);
+    s->lq_folded = folded;
     memcpy(s->key, key, 32);
     if (iid) memcpy(s->iid, iid, 32);
     s->spirv = (uint32_t *)spv;
@@ -909,6 +1284,7 @@ static int handle_slot(int kind, int cbuf_slot, int handle, int separate) {
 static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     GfxShaderRes *r = &s->res[kind][s->nres[kind]++];
     r->set = 0;
+    r->bindless = (int8_t)json_int(o, e, "bindless_slot", -1);
     r->binding = (uint16_t)json_int(o, e, "binding", 0);
     if (kind == GFX_RES_UBO || kind == GFX_RES_SSBO) {
         r->slot = (int16_t)json_int(o, e, "slot", -1);
@@ -1137,6 +1513,7 @@ static int reflect(GfxShader *s, int flags) {
     } else if (json_member(js, end, "geometry_version") || json_member(js, end, "gs_input") ||
                json_member(js, end, "geometry") || json_member(js, end, "gs_passthrough_skip")) return 0;
     if (!geometry_spirv(s)) return 0;
+    s->bl_buffers = (int)json_int(js, end, "bindless_buffers", 0);
     // Driver contracts are unique root fields. Extra nested properties are metadata, not alternate layouts.
     const char *c0 = json_member(js, end, "c0"), *roots = json_member(js, end, "c0_roots"),
                *c0_version = json_member(js, end, "c0_version");
@@ -1586,6 +1963,10 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
     if (host_sbuf) o += sprintf(o, ",\"sbuf_align\":%u", host_sbuf);
     if (subgroup != 32) o += sprintf(o, ",\"subgroup\":%u", subgroup);
     if (host_gather) o += sprintf(o, ",\"gather_bias\":%u", host_gather);
+    if (bindless_xlate && (!strcmp(stage, "vs") || !strcmp(stage, "ps"))) {
+        o += sprintf(o, ",\"bindless_tex\":{\"set\":%d,\"push_offset\":%d}", GFX_BINDLESS_SET, !strcmp(stage, "vs") ? GFX_BINDLESS_PUSH_VS : GFX_BINDLESS_PUSH_FS);
+        if (bindless_buf) o += sprintf(o, ",\"bindless_buf\":{\"record_offset\":%d}", !strcmp(stage, "vs") ? GFX_BINDLESS_REC_VS : GFX_BINDLESS_REC_FS);
+    }
     o += sprintf(o, "},\"out\":\"");
     json_esc(&o, cache_dir);
     o += sprintf(o, "\"}");
@@ -1652,6 +2033,7 @@ typedef struct {
     uint8_t code_hash[32];
     uint8_t key[32];                                       // cache key, or the provisional one with final 0
     uint8_t iid[32];                                       // input id with final 1
+    uint64_t origin;                                       // the NVN 2 stage name of a vertex request, or 0
     int final, require_c0;                                 // DKC1 inputs must have versioned NVN 2 reflection
 } Req;
 
@@ -1719,6 +2101,7 @@ static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *co
         return fail("old NVN 2 compute control: regenerate shader inputs with root layout version 2", NULL), 0;
     r->require_c0 = stage == GFX_STAGE_CS && !memcmp(control + NVN2_C0_LAYOUT, "DKC1", 4);
     r->stage = stage;
+    r->origin = stage == GFX_STAGE_VS ? nvn2_origin(code) : 0;
     r->geometry_input = a ? a->geometry_input : 0;
     r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" :
                     stage == GFX_STAGE_GS ? "gs" : NULL;
@@ -1774,8 +2157,10 @@ static int shader_matches_request(const GfxShader *s, const Req *r) {
 
 static GfxShader *request_disk_load(const Req *r, const uint8_t key[32], const uint8_t *iid) {
     for (int packed = pack_n ? 1 : 0; packed >= 0; packed--) {
+        lq_origin = r->origin;
         GfxShader *s = disk_load_from(key, iid, packed, (r->require_c0 ? REFLECT_REQUIRE_C0 : 0) |
                                                         (r->lowered_body ? REFLECT_LOWERED_BODY : 0));
+        lq_origin = 0;
         if (!s) continue;
         if (shader_matches_request(s, r)) return s;
         shader_free(s);
@@ -1814,7 +2199,7 @@ const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t
     Req r;
     if (!req_init(&r, stage, control, code, code_size, c1, a)) return NULL;
     const GfxShader *s = get_one(&r, stage, control, code, a);
-    if (s) ans_note(&r, stage, control, code, a, s);
+    if (s) ans_note(&r, stage, control, code, a, s), s = gfx_shader_fold_fix(s, r.origin);
     return s;
 }
 
@@ -2140,7 +2525,7 @@ const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const u
     Req r;
     if (!req_init(&r, stage, control, code, code_size, NULL, a)) return NULL;
     const GfxShader *s = get_async_one(r, stage, control, code, a, pending);
-    if (s) ans_note(&r, stage, control, code, a, s);
+    if (s) ans_note(&r, stage, control, code, a, s), s = gfx_shader_fold_fix(s, r.origin);
     return s;
 }
 
@@ -2265,6 +2650,10 @@ void gfx_shader_release_private(const GfxShader *s) {
 
 // ---- boot prewarm (gfx_shader_prewarm)
 
+static int warm_low;   // gfx_shader_prewarm_background: the prewarm workers run below normal priority beside the guest
+
+void gfx_shader_prewarm_background(void) { warm_low = 1; }
+
 typedef struct {
     const uint8_t (*named)[32];                            // loaded into memory, results in out
     size_t n_named;
@@ -2277,6 +2666,7 @@ typedef struct {
 
 static void warm_worker(void *arg) {
     Warm *w = arg;
+    if (warm_low) plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
     for (;;) {
         size_t i = (size_t)plat_inc64(&w->next) - 1;
         if (i >= w->n_named + w->n_other) return;

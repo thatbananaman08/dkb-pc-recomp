@@ -25,7 +25,7 @@ enum {PLAT_FS_OK,PLAT_FS_NOT_FOUND,PLAT_FS_EXISTS,PLAT_FS_NOT_EMPTY,PLAT_FS_BUSY
 @SHADER@
 static GfxShader result;
 static char cache_dir[PATH_CAP];
-static int cache_lock,host_f64=0;
+static int cache_lock,host_f64=0,bindless_xlate=0,bindless_buf=0;
 static uint32_t host_sbuf=16,host_sg[3]={32,64,32},host_gather=8;
 #ifdef FIXTURE_GEOMETRY_CONTRACT
 static uint32_t host_gs_sg;   // this failure-capture fixture requests FS/CS only

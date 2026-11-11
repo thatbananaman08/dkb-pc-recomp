@@ -6,3 +6,52 @@ set hidproxy DKB_SKIP_HID_PROXY 1
 # a transfer memory and talks to IHidServer itself (nn::hid::server::CreateHidServerProxy), past the nn::hid calls the
 # host takes over, and aborts on a failed Result. The host serves no "hid" IPC service, so the call reports success.
 site hidproxy main 73bea0 9404d9d0 2a1f03e0   # bl sub_71008725E0 -> mov w0, wzr
+
+# DKB_ZSTD_PROBE=1 (default off): finds the zstd decoder's entry points in 1.0.0 (runtime/ov_zstd.c). The lifted main holds a
+# zstd (sequence decoder at main+0x378f80, called through main+0x3777c0); its callers are the candidates. Each direct call of
+# one goes to a pass-through host function on the patch page (+0xf00 + 0x10 * candidate) that counts the call and calls the
+# original. Candidates, in slot order: main+0x14ff00, 0x14a540, 0x375f20, 0x376920, 0x3ce730, 0x401fc4, 0x1489770 (the last is
+# only tail-called, so it has no site). Lines from build/prof/gen_probe_sites.py, each original word checked against main.
+set zstdprobe DKB_ZSTD_PROBE 0
+site zstdprobe main 146a70 94002524 948c2924   # bl f_700014ff00 -> page+0xf00
+site zstdprobe main 14a7dc 940015c9 948c19c9   # bl f_700014ff00 -> page+0xf00
+site zstdprobe main 1464cc 9400101d 948c2a91   # bl f_700014a540 -> page+0xf10
+site zstdprobe main 375104 94000387 94836f87   # bl f_7000375f20 -> page+0xf20
+site zstdprobe main 1867968 97ac396e 942fa56e   # bl f_7000375f20 -> page+0xf20
+site zstdprobe main 374e5c 940006b1 94837035   # bl f_7000376920 -> page+0xf30
+site zstdprobe main 18678d4 97ac3c13 942fa597   # bl f_7000376920 -> page+0xf30
+site zstdprobe main 3ce44c 940000b9 94820abd   # bl f_70003ce730 -> page+0xf40
+site zstdprobe main 3ce4dc 94000095 94820a99   # bl f_70003ce730 -> page+0xf40
+site zstdprobe main 4018e8 940001b7 94813d9a   # bl f_7000401fc4 -> page+0xf50
+site zstdprobe main 5b27e8 97f93df7 947a79da   # bl f_7000401fc4 -> page+0xf50
+site zstdprobe main 5b7afc 97f92932 947a6515   # bl f_7000401fc4 -> page+0xf50
+site zstdprobe main 1867d10 97ae68ad 942fa490   # bl f_7000401fc4 -> page+0xf50
+site zstdprobe main 18681c0 97ae6781 942fa364   # bl f_7000401fc4 -> page+0xf50
+
+# DKB_DELTA_PROBE=1 (default off): who reads the framework's measured frame rate (runtime/delta_scan.c).
+set deltaprobe DKB_DELTA_PROBE 0
+site deltaprobe main 138bb30 f0007c68 aa1e03f1 9443151c
+site deltaprobe main 1ead28 94000082 948998a2
+site deltaprobe main 1e9f10 910003e1 910003e1 94899c2c
+site deltaprobe main 1e9f28 910003e1 910003e1 94899c2a
+site deltaprobe main f45f8 bd405100 bd405100 948d7202
+site deltaprobe main f4930 bd405120 bd405120 948d7138
+site deltaprobe main 34ec0c bd405100 bd405100 94840889
+site deltaprobe main 692e80 bd405300 bd405300 9476f7f4
+site deltaprobe main 1510f0c bd405261 bd405261 943cffd5
+site deltaprobe main 1642080 bd405100 bd405100 94383b7c
+
+# Real-time step for Bananza (opt-in, TOTK_REALTIME=1). The frame controller (main+0x1eace8) stores fps = 60 / interval at its +0x50 and two
+# per-frame readers turn it into the step (found with DKB_DELTA_PROBE, runtime/delta_scan.c): main+0x2da110 passes (60 / fps) / 60 seconds to the
+# 0x68-stride updater (main+0x2da5a0), main+0x34ec4c keeps 60 / fps (the interval) in a per-frame record. Both read the patch page instead
+# (+4 seconds, +8 seconds * 60; runtime/frame_rate.c writes them at every present). Readers not exercised in Canyon stay whole-vsync:
+# main+0xf45f8, 0xf4930, 0x692e80, 0x1510f0c and the getter at 0x1642080.
+set realtime TOTK_REALTIME 0
+site realtime main 2da110 bd405120 @page:x16 bd400600   # step: s0 = [page+4] seconds, was ldr s0, [x9, #0x50]: ldr s0, [x9, #0x50]
+site realtime main 2da11c 5e21d800 d503201f   # scvtf -> nop: scvtf s0, s0
+site realtime main 2da120 1e201820 d503201f   # fdiv 60/fps -> nop: fdiv s0, s1, s0
+site realtime main 2da124 1e211800 d503201f   # fdiv /60 -> nop: fdiv s0, s0, s1
+site realtime main 34ec4c bd405100 @page:x16 bd400a00   # interval: s0 = [page+8] seconds*60: ldr s0, [x8, #0x50]
+site realtime main 34ec64 5e21d800 d503201f   # scvtf -> nop: scvtf s0, s0
+site realtime main 34ec68 1e201860 d503201f   # fdiv 60/fps -> nop: fdiv s0, s3, s0
+site deltaprobe main 2da128 bd000be0 bd000be0 9485db56   # step store: keep it, then log it (runtime/delta_scan.c step_probe)

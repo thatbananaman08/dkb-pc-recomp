@@ -28,7 +28,7 @@ def main():
     args = ap.parse_args()
     out = ROOT / 'build/checks/nvn2-mode-trace'
     out.mkdir(parents=True, exist_ok=True)
-    sources = ['tests/nvn_mode_trace.c', 'runtime/nvn_mode_trace.c', 'runtime/nvn_api_cmd.c', 'runtime/nvn_api_nvn2.c']
+    sources = ['tests/nvn_mode_trace.c', 'runtime/nvn_mode_trace.c', 'runtime/nvn_api_cmd.c', 'runtime/nvn_api_nvn2.c', 'tests/census_stub.c']
     fixture = out / 'fixture.c'
     fixture.write_text((ROOT / sources[0]).read_text().replace('@PROF_WRITE@',
         function((ROOT / 'runtime/perf.c').read_text(), 'void prof_write(void)')))
