@@ -179,8 +179,15 @@ static int thaw_fault(uint64_t a) {
     return plat_mem_state(a & ~(PAGE - 1), (a & ~(PAGE - 1)) + PAGE, &end) == PLAT_PROT_RW;
 }
 
+// TOTK_TRACE=perf: mapping changes since the start (mem_map_stats).
+static volatile int64_t ms_n[3], ms_bytes[3];
+void mem_map_stats(uint64_t n[3], uint64_t bytes[3]) {
+    for (int i = 0; i < 3; i++) n[i] = (uint64_t)ms_n[i], bytes[i] = (uint64_t)ms_bytes[i];
+}
+
 // Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
 static void commit(uint64_t a, uint64_t n, const char *what) {
+    plat_inc64(&ms_n[0]), plat_add64(&ms_bytes[0], (int64_t)n);
     hp_lock(&frz_lock, HPW_FRZ);
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_commit(a, n);
@@ -189,6 +196,7 @@ static void commit(uint64_t a, uint64_t n, const char *what) {
 }
 
 static void decommit(uint64_t a, uint64_t n, const char *what) {
+    plat_inc64(&ms_n[1]), plat_add64(&ms_bytes[1], (int64_t)n);
     hp_lock(&frz_lock, HPW_FRZ);
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_decommit(a, n);
@@ -197,6 +205,7 @@ static void decommit(uint64_t a, uint64_t n, const char *what) {
 }
 
 static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
+    plat_inc64(&ms_n[2]), plat_add64(&ms_bytes[2], (int64_t)n);
     hp_lock(&frz_lock, HPW_FRZ);
     thaw_range_locked(a, n, 3);
     int ok = !n || plat_mem_protect(a, n, prot);

@@ -252,9 +252,30 @@ void delta_scan_present(uint64_t display_ns);
 void delta_probe_present(void);
 void delta_probe_present(void);   // delta_scan.c
 
+__attribute__((weak)) void input_frame_presented(void);   // input.c; absent where a test links this file alone
+
+// TOTK_FIXED_STEP=<hz> (testing, needs TOTK_REALTIME=1): every frame steps the game by exactly 1/hz s, whatever the
+// frame took, so the game's time advances identically in every run and a recorded input (input.c "F" lines) replays
+// along the same path. A slow frame plays in slow motion; pair it with TOTK_FPS_LIMIT=<hz>.
+static double fixed_step_s(void) {
+    static double s = -1;
+    if (s < 0) {
+        const char *e = cfg_get("TOTK_FIXED_STEP");
+        double hz = e && *e ? atof(e) : 0;
+        s = hz >= 10 && hz <= 360 ? 1.0 / hz : 0;
+        if (s > 0) rt_log("frame step: TOTK_FIXED_STEP: %.4f s per frame%s", s, step_word ? "" : " (inactive: needs TOTK_REALTIME=1)");
+    }
+    return s;
+}
+
 void frame_step_present(uint64_t display_ns, int interval) {
     frame_limit_live();
     double step = 0, dt = last_ns ? (double)(display_ns - last_ns) * 1e-9 : 0;
+    if (step_word && fixed_step_s() > 0) {   // a constant step instead of the display-interval average
+        step = fixed_step_s();
+        step_store((float)step);
+        dt = step;
+    } else
     if (step_word && last_ns) {
         if (dt > STEP_RESET_S || dt < 0.001) {
             sample_count = sample_next = 0;
@@ -275,6 +296,7 @@ void frame_step_present(uint64_t display_ns, int interval) {
     atomic_store_explicit(&game_us, atomic_load_explicit(&game_us, memory_order_relaxed) + (uint64_t)(game * 1e6 + 0.5),
                           memory_order_relaxed);
     world_clock(dt, step);
+    if (input_frame_presented) input_frame_presented();   // input.c: the scene clock's anchor
     delta_scan_present(display_ns); delta_probe_present();   // DKB_DELTA_SCAN
     if (rt_trace & RT_TRACE_PERF) speed_report(display_ns, step, interval);
 }

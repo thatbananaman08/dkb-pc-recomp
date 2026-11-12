@@ -6,6 +6,9 @@
 #include "host.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
+#include "mtstat.h"
+_Thread_local uint64_t mt_cnt[MT_N];   // vk_exec.c record_impl: the slow-submission counters (TOTK_TRACE=perf)
+_Thread_local uint64_t mt_ns[MTNS_N];
 
 #define H(type, n) ((type)(uintptr_t)(n))
 #define NEED(c) do { checks++; if (!(c)) rt_fatal("fixture line %d: %s", __LINE__, #c); } while (0)
@@ -66,6 +69,7 @@ void rec_stats_log(void) {}
 static void ts_drop(void) {}
 static void state_reset(VkExec *ex) { memset(ex, 0, sizeof *ex); }
 void vk_dump_init(void) {}
+volatile uint64_t vkb_rec_fence;   // vk_bindless.c TOTK_BDA_CHECK: the submission being recorded (unused here)
 void vk_mem_mirror_begin(void) { NEED(x_here); mirror_begin++; }
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t f) { NEED(!x_here && cb == X.cb && f == X.fence); mirror_end++; return 2; }
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t f) {

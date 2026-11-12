@@ -459,6 +459,7 @@ NVN_API(nvnBufferFlushMappedRange) {
 
 // ---------- Sync and events
 uint64_t vk_sync_issued(void);
+void vk_sync_wait_issued(uint64_t value);
 int vk_texture_small_dirty_class(uint64_t fence, uint64_t tiny);
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);
 void vk_texture_write_back_small(uint64_t fence);
@@ -524,15 +525,47 @@ NVN_API(nvnSyncWait) {
     if (!s->fenced) { ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED); return; }
     const GfxBackend *b = gfx_backend();
     if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
-    if ((sync_early_on() || sync_late_on()) && b == &gfx_vulkan_backend && vk_sync_issued() >= s->fence) {
-        // TOTK_SYNC_EARLY / TOTK_SYNC_LATE_SMALL: the submission's replay is done and everything the GPU reads was copied
+    static uint64_t sw_n, sw_early, sw_late, sw_big, sw_waited_issue_ns, sw_gpu_ns;
+    if ((sync_early_on() || sync_late_on()) && b == &gfx_vulkan_backend && timeout) {
+        // TOTK_SYNC_EARLY / TOTK_SYNC_LATE_SMALL: once the submission's replay is done, everything the GPU reads was copied
         // by it. With no small target to write back for it, the wait for the GPU's last part would only delay the guest.
+        // A wait that comes while the replay still runs waits for the replay (vk_sync_wait_issued), not for the GPU.
+        uint64_t t0 = plat_now_ns();
+        if (vk_sync_issued() < s->fence) {
+            NVN_BLOCKING();
+            vk_sync_wait_issued(s->fence);
+        }
+        sw_waited_issue_ns += plat_now_ns() - t0;
         int cls = vk_texture_small_dirty_class(s->fence, 256);
         if (cls == 0 || (cls == 1 && sync_late_on())) {
-            if (cls) late_queue(s->fence);
+            if (cls) late_queue(s->fence), sw_late++;
+            else sw_early++;
+            if ((rt_trace & RT_TRACE_PERF) && ++sw_n % 600 == 0) {
+                rt_log("perf: nvnSyncWait: %llu returned at replay-done (%llu with a late write-back), %llu waited for the GPU (bigger target dirty); replay waits %.2f ms, GPU waits %.2f ms per wait",
+                       (unsigned long long)(sw_early + sw_late), (unsigned long long)sw_late, (unsigned long long)sw_big,
+                       sw_waited_issue_ns / 1e6 / 600, sw_gpu_ns / 1e6 / 600);
+                sw_early = sw_late = sw_big = sw_waited_issue_ns = sw_gpu_ns = 0;
+            }
             ret_x(c, NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED);
             return;
         }
+        sw_big++;
+        uint64_t g0 = plat_now_ns();
+        int ok;
+        {
+            NVN_BLOCKING();
+            ok = b->fence_wait(s->fence, timeout);
+        }
+        sw_gpu_ns += plat_now_ns() - g0;
+        if ((rt_trace & RT_TRACE_PERF) && ++sw_n % 600 == 0) {
+            rt_log("perf: nvnSyncWait: %llu returned at replay-done (%llu with a late write-back), %llu waited for the GPU (bigger target dirty); replay waits %.2f ms, GPU waits %.2f ms per wait",
+                   (unsigned long long)(sw_early + sw_late), (unsigned long long)sw_late, (unsigned long long)sw_big,
+                   sw_waited_issue_ns / 1e6 / 600, sw_gpu_ns / 1e6 / 600);
+            sw_early = sw_late = sw_big = sw_waited_issue_ns = sw_gpu_ns = 0;
+        }
+        if (ok) b->cpu_synced(s->fence);
+        ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
+        return;
     }
     int ok;
     {

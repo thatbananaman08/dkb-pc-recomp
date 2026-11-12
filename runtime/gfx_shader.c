@@ -644,14 +644,18 @@ static int spirv_complete(const uint32_t *w, uint64_t n) {
 // bump (a bump would retranslate every shader and orphan the read-only pack), and TOTK_SPIRV_OPT=0 switches it off for
 // A/B tests without touching the cache. The cost is one pass per shader per run. If the optimizer fails, the original
 // module is kept and one warning is logged.
-static void spirv_optimize(uint8_t **spv, uint64_t *size) {
+static int spirv_opt_on(void) {
     static int on = -1;
-    static volatile int32_t failures;
     if (on < 0) {
         const char *v = cfg_get("TOTK_SPIRV_OPT");
         on = !(v && !strcmp(v, "0"));
     }
-    if (!on) return;
+    return on;
+}
+
+static void spirv_optimize(uint8_t **spv, uint64_t *size) {
+    static volatile int32_t failures;
+    if (!spirv_opt_on()) return;
     char err[256] = "";
     uint64_t n = 0;
     uint32_t *o = spirv_opt_local_single_block((const uint32_t *)*spv, *size / 4, &n, err, sizeof err);
@@ -710,6 +714,16 @@ typedef struct { uint64_t origin; unsigned site, construct; } LqFoldRule;   // s
 static const LqFoldRule lq_fold_rules[] = {
     {0x67a23e6f132386f9ull, 0, 0}, {0xe2bf75f927acd249ull, 0, 0}, {0x3a10ce1a4f3cdf0bull, 0, 0}, {0x8475bd9dadb18f45ull, 0, 0},
     {0x4645f0dd7b4502a2ull, 0, 0}, {0x7a76ae8de5016fd9ull, 0, 0}, {0x1ee77eac998beea5ull, 4, 31},
+    // Tower's 09dab82c5b265a52: a four-vertex strip, ten instances, nine per-instance streams with a Location 9 input (one stream short of
+    // the light_quad_match family, so neither the match nor the skip took it). With TOTK_BINDLESS_BUF=1 it lost the device ~57 s into Tower
+    // in every run; found by a DKB_SKIP_BISECT bisect over vertex origins and confirmed by skipping it alone (2026-11-11).
+    {0x09dab82c5b265a52ull, 0, 0},
+    // VersusDangoroBStage's 66e3e7b46f3849d5 (with fragment 88225f9cda98faed): the same shape (triangle strip, 24 instances, nine
+    // per-instance streams, a Location 9 input), drawn by the effect at the round's time-up. With TOTK_BINDLESS_BUF=1 the device was
+    // lost ("instruction pointer (invalid)") in every run that drew it and in none that did not (DKB_DRAW_FIRSTSEEN, TOTK_DRAW_CRUMBS:
+    // the oldest unfinished draw each time); skipping its fragment origin kept 3 of 3 such runs alive; TOTK_BINDLESS_BUF=0 4 of 4
+    // (2026-11-12). The mud crash on Hill showed 88225f9cda98faed near the fault too.
+    {0x66e3e7b46f3849d5ull, 0, 0},
 };
 static const LqFoldRule *lq_fold_rule(uint64_t origin) {
     for (size_t i = 0; i < sizeof lq_fold_rules / sizeof *lq_fold_rules; i++)
@@ -717,6 +731,39 @@ static const LqFoldRule *lq_fold_rule(uint64_t origin) {
     return NULL;
 }
 static int fold_platform;
+// With TOTK_BINDLESS_BUF=1 the vertex stages the light-quad fold covers (lq_fold_rules) are translated without the record
+// buffers: in their record-buffer form the fold leaves four `&3` ANDs unclassified (0 with buffer slots), and Hill drew
+// black glow quads with a white halo while the camera moved (2026-11-11). The pipeline layout and the draw path take
+// record buffers per stage (vk_pipeline.c add_stage, rec_nb), so such a vertex stage uses buffer slots while its
+// fragment stage keeps the record. Opt-in (TOTK_LQ_NOBUF=1): one run of two still drew a glow quad, and a draw that
+// mixes record and slot stages is not reliable yet (TOTK_BUF_STAGES=vs drew black frames, =fs once corrupted the heap).
+static int fold_enabled(void);
+// DKB_NOBUF_ORIGINS=<origin>,... (experiment, 2026-11-12): those stages are translated without TOTK_BINDLESS_BUF and without the fold,
+// to test whether the instanced-strip effect stages lose the device ("instruction pointer (invalid)") only in their record-buffer form.
+static int nobuf_origin(uint64_t origin) {
+    static DfOrigins list;
+    static int state = -1;
+    if (state < 0) {
+        const char *x = getenv("DKB_NOBUF_ORIGINS");
+        state = x && *x && df_parse_whole_origins(&list, x) >= 0 && list.n;
+        if (x && *x && !state) rt_log("gfx_shader: DKB_NOBUF_ORIGINS is not a comma-separated list of 16-digit origins (at most %d); ignored", DF_MAX_ORIGINS);
+        else if (state) rt_log("gfx_shader: DKB_NOBUF_ORIGINS: %u stage(s) translated without record buffers", list.n);
+    }
+    return state && origin && bindless_buf && df_match_origin(&list, origin) >= 0;
+}
+static int lq_no_buf(uint64_t origin) {
+    if (nobuf_origin(origin)) {
+        static volatile int32_t told;
+        if (plat_inc32(&told) <= 64) rt_log("gfx_shader: stage %016llx: DKB_NOBUF_ORIGINS, translated without TOTK_BINDLESS_BUF", (unsigned long long)origin);
+        return 1;
+    }
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_LQ_NOBUF"); on = e && !strcmp(e, "1"); }
+    if (!on || !bindless_buf || !fold_platform || !origin || !lq_fold_rule(origin) || !fold_enabled()) return 0;
+    static volatile int32_t told;
+    if (plat_inc32(&told) <= 4) rt_log("gfx_shader: stage %016llx: light-quad fold stage, translated without TOTK_BINDLESS_BUF", (unsigned long long)origin);
+    return 1;
+}
 void gfx_shader_set_lq_fold_platform(int on) { fold_platform = on; }
 int gfx_shader_folded(const GfxShader *s) { return s && s->lq_folded; }
 static _Thread_local uint64_t lq_origin;   // the NVN 2 stage name of the request disk_load_from is serving (0: unknown)
@@ -1024,7 +1071,28 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
         free(res), free(spv);
         return NULL;
     }
-    spirv_optimize(&spv, &spv_size);
+    // The optimizer's output is kept beside the cache, so a module pays the pass once, not once per run: on Hill the pass
+    // on first sight was ~90% of the replay thread in its 0.2-2 s frames while running around (2026-11-11). The copy is
+    // named by the key and a hash of the module it was made from (<key>.<fnv64>.o1.spv; "o1" names this optimizer step),
+    // so a pack or loose module that differs, or one translated again, never picks up another module's copy. A missing or
+    // damaged copy is made again.
+    uint64_t mh = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i < spv_size; i++) mh = (mh ^ spv[i]) * 0x100000001b3ull;
+    char op[PATH_CAP + 100];
+    snprintf(op, sizeof op, "%s/%s.%016llx.o1.spv", cache_dir, hex, (unsigned long long)mh);
+    uint64_t opt_size = 0;
+    uint8_t *opt = spirv_opt_on() ? read_file(op, &opt_size) : NULL;
+    uint32_t omagic = 0;
+    if (opt && opt_size >= 20) memcpy(&omagic, opt, 4);
+    if (opt && opt_size % 4 == 0 && omagic == 0x07230203 && spirv_complete((const uint32_t *)opt, opt_size / 4)) {
+        free(spv);
+        spv = opt, spv_size = opt_size;
+    } else {
+        free(opt);
+        uint8_t *before = spv;
+        spirv_optimize(&spv, &spv_size);
+        if (spv != before) write_file(op, spv, (size_t)spv_size);   // only when the pass produced a module
+    }
     int folded = lq_patch(&spv, &spv_size, key);
     GfxShader *s = calloc(1, sizeof *s);
     s->lq_folded = folded;
@@ -1893,7 +1961,7 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
 }
 
 static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control) {
+                            uint32_t c1_len, const GfxShaderAnswers *a, const uint8_t *control, int no_buf) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
@@ -1965,7 +2033,7 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
     if (host_gather) o += sprintf(o, ",\"gather_bias\":%u", host_gather);
     if (bindless_xlate && (!strcmp(stage, "vs") || !strcmp(stage, "ps"))) {
         o += sprintf(o, ",\"bindless_tex\":{\"set\":%d,\"push_offset\":%d}", GFX_BINDLESS_SET, !strcmp(stage, "vs") ? GFX_BINDLESS_PUSH_VS : GFX_BINDLESS_PUSH_FS);
-        if (bindless_buf) o += sprintf(o, ",\"bindless_buf\":{\"record_offset\":%d}", !strcmp(stage, "vs") ? GFX_BINDLESS_REC_VS : GFX_BINDLESS_REC_FS);
+        if (bindless_buf && !no_buf) o += sprintf(o, ",\"bindless_buf\":{\"record_offset\":%d}", !strcmp(stage, "vs") ? GFX_BINDLESS_REC_VS : GFX_BINDLESS_REC_FS);
     }
     o += sprintf(o, "},\"out\":\"");
     json_esc(&o, cache_dir);
@@ -2034,6 +2102,7 @@ typedef struct {
     uint8_t key[32];                                       // cache key, or the provisional one with final 0
     uint8_t iid[32];                                       // input id with final 1
     uint64_t origin;                                       // the NVN 2 stage name of a vertex request, or 0
+    int no_buf;                                            // a light-quad fold stage translated without TOTK_BINDLESS_BUF (lq_no_buf)
     int final, require_c0;                                 // DKC1 inputs must have versioned NVN 2 reflection
 } Req;
 
@@ -2142,6 +2211,21 @@ static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *co
     if (!build_code_hash(stage, control, code, r->length, r->c1, r->c1_len, r->geometry_input, r->code_hash))
         return fail("out of memory", NULL), 0;
     paths();
+    // TOTK_BUF_STAGES=vs|fs (testing): only that stage reads its buffers through the record; the other is translated
+    // with buffer slots, like a light-quad fold stage (its own cache keys).
+    static int buf_stages = -1;
+    if (buf_stages < 0) {
+        const char *e = getenv("TOTK_BUF_STAGES");
+        buf_stages = e && !strcmp(e, "vs") ? 1 : e && !strcmp(e, "fs") ? 2 : 3;
+        if (buf_stages != 3) rt_log("gfx_shader: TOTK_BUF_STAGES=%s: record buffers in that stage only", e);
+    }
+    int stage_off = bindless_buf && ((stage == GFX_STAGE_VS && !(buf_stages & 1)) || (stage == GFX_STAGE_FS && !(buf_stages & 2)));
+    if (stage_off || lq_no_buf(r->origin)) {   // its own cache keys: the record-buffer module of the same stage must not be found instead
+        uint8_t buf[32 + 4];
+        memcpy(buf, r->code_hash, 32), memcpy(buf + 32, "TKNB", 4);
+        rt_sha256(buf, sizeof buf, r->code_hash);
+        r->no_buf = 1;
+    }
     UseMask m;
     r->final = use_find(r->code_hash, &m);
     build_key(r->code_hash, a, r->final ? &m : NULL, r->key, r->iid);
@@ -2399,7 +2483,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     size_t cap = 2 * PATH_CAP * 6 + 2 * r->c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
     if (!req) return plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control);
+    build_request(req, hex, r->stage_name, code_path, r->c1, r->c1_len, a, control, r->no_buf);
     int ok = svc_request(req, reply, sizeof reply);
     if (ok && strncmp(reply, "ok ", 3)) dump_failed_request(hex, req, reply, code + skip, (size_t)(r->length - skip));
     free(req);

@@ -3171,11 +3171,17 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
 }
 
 VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info) {
-    return graphics(s, info, 0, NULL, 0);
+    uint64_t t0 = plat_now_ns();
+    VkPipeline p = graphics(s, info, 0, NULL, 0);
+    mt_ns[MTNS_PIPE] += plat_now_ns() - t0;
+    return p;
 }
 
 VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms) {
-    return graphics(s, info, A.on, pending, wait_ms);
+    uint64_t t0 = plat_now_ns();
+    VkPipeline p = graphics(s, info, A.on, pending, wait_ms);
+    mt_ns[MTNS_PIPE] += plat_now_ns() - t0;
+    return p;
 }
 
 // ---- boot prewarm from the key file (comment at "pipeline keys")

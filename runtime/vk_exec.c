@@ -51,6 +51,7 @@ static _Thread_local int x_worker;   // this thread is a TOTK_REPLAY_SPLIT worke
 // ---- TOTK_TRACE=gfx frame counters
 
 VkExecFrame vk_exec_frame;
+uint64_t vk_exec_draws_total(void) { return __atomic_load_n(&vk_exec_frame.draws_seen, __ATOMIC_RELAXED); }   // input.c scene anchor
 static struct { const uint8_t *mem; uint32_t w, h, fmt, n; } fw[64];   // textures written this frame
 static int nfw;
 
@@ -115,6 +116,7 @@ static void resub_note(uint64_t handle) {
 }
 
 _Thread_local uint64_t mt_cnt[MT_N];
+_Thread_local uint64_t mt_ns[MTNS_N];
 // Multithreaded-replay measurement: draws and time per submitted command buffer and per top-level CallCommands target.
 static struct {
     uint64_t calls, call_draws, call_ns, hist_calls[5], hist_draws[5], hist_ns[5];
@@ -1030,9 +1032,13 @@ static void maybe_split(VkExec *ex) {
     split_draws = 0;
     if (ex->recorded == part_start) return;
     uint64_t sp0 = plat_now_ns();
-    vk_exec_mt_join(ex);
+    // The part's mirror prologue is built at the split, so the TOTK_REPLAY_SPLIT workers must have finished its chunks first: a
+    // worker's first use of a stale VRAM mirror queues the sync copy, and a copy queued after the prologue was built would run
+    // only before the next part, after the draws that read it (stretched black glow quads on Hill, 2026-11-11).
+    if (vk_sync_split_async() && !vk_exec_split_active) vk_exec_mt_flush(ex);   // the chunks are in the ring; the recorder waits for them
+    else vk_exec_mt_join(ex);
     uint64_t sp1 = plat_now_ns();
-    ex->cb = vk_sync_split();
+    ex->cb = vk_sync_split_part();
     { static uint64_t j, q, n; j += sp1 - sp0, q += plat_now_ns() - sp1; if ((rt_trace & RT_TRACE_PERF) && ++n % 1000 == 0) { rt_log("perf: part split cost (us per split): join %.0f, split+submit %.0f (%llu splits)", j / 1e6, q / 1e6, (unsigned long long)n); j = q = 0; } }
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
@@ -1075,7 +1081,9 @@ int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
     ex->recorded += 2;
     vk_mem_count(source.cls, VK_MUSE_COPY_SRC, size);
     VK_MEM_BOUND(source);
+    uint64_t wt0 = plat_now_ns();
     ex->cb = vk_sync_split_wait();   // this prefix, not ex->fence (only the final part signals that value)
+    mt_ns[MTNS_WAIT] += plat_now_ns() - wt0;
     split_draws = 0;
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
@@ -1142,12 +1150,20 @@ int vk_exec_state_op(VkExec *ex, uint32_t op, const void *a) {
     }
 }
 
+// DKB_SPLIT_OPTIME=1 (diagnostic, off by default): time every walk-thread op and every top-level call for the perf log
+// (vk_exec_split_time, mt measure). Two clock reads per op cost the walk ~2-5 ms a frame on Hill, so plain perf runs skip it.
+static int split_optime(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DKB_SPLIT_OPTIME"); on = e && *e && strcmp(e, "0") != 0; }
+    return on;
+}
+
 static void walk(VkExec *ex, const op_hdr *h, int depth) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         const void *a = nvn_op_payload(h);
-        uint64_t sp_t0 = vk_exec_split_active && (rt_trace & RT_TRACE_PERF) ? plat_now_ns() : 0;
+        uint64_t sp_t0 = vk_exec_split_active && (rt_trace & RT_TRACE_PERF) && split_optime() ? plat_now_ns() : 0;
         if (vk_exec_split_active && vk_exec_split_op(ex, h, a)) {   // TOTK_REPLAY_SPLIT: the op went into a chunk
             if (sp_t0) vk_exec_split_time(h->op, plat_now_ns() - sp_t0, 0);
             if ((h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND) && submit_early()) split_draws++;
@@ -1160,7 +1176,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_JUMP: h = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target; continue;
         case OP_CALL:
             if (depth >= CALL_DEPTH) rt_fatal("vk: command buffer calls nested deeper than %d", CALL_DEPTH);
-            if (depth == 0 && (rt_trace & RT_TRACE_PERF)) {
+            if (depth == 0 && (rt_trace & RT_TRACE_PERF) && split_optime()) {
                 uint64_t d0 = vk_exec_frame.draws_seen, t0 = plat_now_ns();
                 walk(ex, nvn_op_first(((const p_jump *)a)->target), depth + 1);
                 uint64_t d = vk_exec_frame.draws_seen - d0, ns = plat_now_ns() - t0;
@@ -1241,7 +1257,17 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
         }
         if (split_draws >= split_n) maybe_split(ex);
-        if (sp_t0) vk_exec_split_time(h->op, plat_now_ns() - sp_t0, 1);
+        if (sp_t0) {
+            uint64_t ns = plat_now_ns() - sp_t0;
+            vk_exec_split_time(h->op, ns, 1);
+            static unsigned slow_told;
+            if (h->op == OP_DRAW && ns > 500000 && slow_told < 12) {   // TOTK_TRACE=perf: what a slow serial draw is
+                const p_draw *d = a;
+                slow_told++;
+                rt_log("perf: slow serial draw %.2f ms: prim %d first %d count %d instances %d, pass_noatt %d, render_disabled %d",
+                       ns / 1e6, d->prim, d->first, d->count, d->instances, ex->pass_noatt, ex->render_disabled);
+            }
+        }
         h = nvn_op_next(h);
     }
 }
@@ -1252,6 +1278,7 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     if (!x_ready) state_reset(ex), vk_dump_init(), x_ready = 1;
     ex->cb = cb;
     ex->fence = fence;
+    __atomic_store_n(&vkb_rec_fence, fence, __ATOMIC_RELAXED);   // TOTK_BDA_CHECK
     ex->submitted_ticks = submitted_ticks;
     ex->recorded = 0;
     ex->in_pass = 0;
@@ -1267,14 +1294,20 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     vk_exec_mt_begin(work != NULL);
     int memory = n || work;
     uint64_t ph = plat_now_ns();
+    const uint64_t sb_t0 = ph;   // TOTK_TRACE=perf: a slow submission gets a line of its own (below)
+    uint64_t sb_mt[MT_N], sb_ns[MTNS_N], sb_t1 = ph, sb_t2 = ph;
+    memcpy(sb_mt, mt_cnt, sizeof sb_mt);
+    memcpy(sb_ns, mt_ns, sizeof sb_ns);
     if (memory) {
         vk_mem_mirror_begin();
         perf_phase(PH_MIRROR_BEGIN, ph);
         ph = plat_now_ns();
+        sb_t1 = ph;
         vk_usnap_begin(handles, n, fence);
         perf_phase(PH_USNAP_BEGIN, ph);
     }
     ph = plat_now_ns();
+    sb_t2 = ph;
     const uint64_t sub_d0 = vk_exec_frame.draws_seen;
     { static int init; if (!init) { const char *e = getenv("TOTK_REPLAY_VERIFY"); VR.on = e && !strcmp(e, "1"); init = 1; } }
     if (work) VR.active = 0; else vr_prepass(ex, handles, n);
@@ -1294,6 +1327,7 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     VR.active = 0;
     perf_phase(PH_OPS, ph);
     ph = plat_now_ns();
+    const uint64_t sb_t3 = ph, sb_draws = vk_exec_frame.draws_seen - sub_d0;
     vk_exec_pass_end(ex);
     x_here = 0;
     uint64_t e0 = plat_now_ns(), e1, e2;
@@ -1313,6 +1347,29 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     }
     ex->cb = VK_NULL_HANDLE;
     perf_phase(PH_END, ph);
+    if (rt_trace & RT_TRACE_PERF) {   // a submission whose replay took 50 ms or more: where its time and its state changes went
+        uint64_t t4 = plat_now_ns();
+        static unsigned told;
+        if (t4 - sb_t0 >= 50000000ull && told < 200) {
+            static const char *const nm[MT_N] = {"mirror create", "mirror forget", "pool index", "usnap drop", "gpu_wrote",
+                "note_written", "view create", "pipeline miss", "pipeline lookup", "tex slot new", "texinfo full", "texinfo call",
+                "scratch", "scratch chunk", "volatile"};
+            char line[700];
+            int o = snprintf(line, sizeof line, "perf: slow submission %.1f ms (mirror begin %.1f, usnap begin %.1f, ops %.1f, end %.1f), %llu draws;",
+                             (t4 - sb_t0) / 1e6, (sb_t1 - sb_t0) / 1e6, (sb_t2 - sb_t1) / 1e6, (sb_t3 - sb_t2) / 1e6, (t4 - sb_t3) / 1e6,
+                             (unsigned long long)sb_draws);
+            for (int k = 0; k < MT_N && o < (int)sizeof line - 40; k++) {
+                uint64_t dv = mt_cnt[k] >= sb_mt[k] ? mt_cnt[k] - sb_mt[k] : mt_cnt[k];   // the 60-frame reset may fall inside
+                if (dv) o += snprintf(line + o, sizeof line - (size_t)o, " %s %llu,", nm[k], (unsigned long long)dv);
+            }
+            o += snprintf(line + o, sizeof line - (size_t)o, " time in mirror create %.1f ms, pipelines %.1f ms, view create %.1f ms, texture lookups %.1f ms, GPU waits %.1f ms",
+                          (mt_ns[MTNS_MIRROR] - sb_ns[MTNS_MIRROR]) / 1e6, (mt_ns[MTNS_PIPE] - sb_ns[MTNS_PIPE]) / 1e6,
+                          (mt_ns[MTNS_VIEW] - sb_ns[MTNS_VIEW]) / 1e6, (mt_ns[MTNS_TEX] - sb_ns[MTNS_TEX]) / 1e6,
+                          (mt_ns[MTNS_WAIT] - sb_ns[MTNS_WAIT]) / 1e6);
+            told++;
+            rt_log("%s", line);
+        }
+    }
     if (memory) n_subs++;
     if ((rt_trace & RT_TRACE_PERF) && n_subs >= 240) {
         rt_log("perf: replay command buffer parts per submission %.2f", (double)(n_subs + n_parts) / (double)n_subs);

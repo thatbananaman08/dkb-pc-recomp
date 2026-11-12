@@ -1451,12 +1451,13 @@ int main(int argc, char **argv) {
         _, after = self.lq('fold_site_no_branch', 4096 | 2 << 16, text=SpirvOpt.VS_FOLD)       # neither reaches a branch
         self.assertIsNone(after)
 
-    def test_the_default_fold_rules_are_the_seven_known_ones(self):
+    def test_the_default_fold_rules_are_the_eight_known_ones(self):
         src = (ROOT / 'runtime' / 'gfx_shader.c').read_text(encoding='utf-8')
         body = src[src.index('static const LqFoldRule lq_fold_rules[]'):]
         body = body[:body.index('};')]
         got = {m[0]: (int(m[1]), int(m[2])) for m in re.findall(r'\{0x([0-9a-f]{16})ull, (\d+), (\d+)\}', body)}
-        whole = {o: (0, 0) for o in ('67a23e6f132386f9', 'e2bf75f927acd249', '3a10ce1a4f3cdf0b', '8475bd9dadb18f45', '4645f0dd7b4502a2', '7a76ae8de5016fd9')}
+        whole = {o: (0, 0) for o in ('67a23e6f132386f9', 'e2bf75f927acd249', '3a10ce1a4f3cdf0b', '8475bd9dadb18f45', '4645f0dd7b4502a2', '7a76ae8de5016fd9',
+                                         '09dab82c5b265a52')}   # Tower's nine-stream quad (2026-11-11)
         self.assertEqual(got, {**whole, '1ee77eac998beea5': (4, 31)})                # Fort: only the ANDs reaching construct 31
         # the diagnostic site pick applies to the stages DKB_LQ_FOLD_ORIGINS names, never to the defaults by themselves
         self.assertIn('if (df_match_origin(&extra, origin) >= 0) {', src)

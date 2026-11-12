@@ -10,6 +10,7 @@
 #include <restartmanager.h>
 #include <shellapi.h>
 #include <timeapi.h>
+#include <tlhelp32.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -504,6 +505,9 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 // ---- virtual memory: VirtualAlloc reservations, MEM_WRITE_WATCH for the watched ones.
 
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
+    static int nowatch = -1;   // DKB_NO_WRITE_WATCH=1 (diagnostic): no reservation is write-watched; the trackers see it untracked
+    if (nowatch < 0) { const char *e = getenv("DKB_NO_WRITE_WATCH"); nowatch = e && *e && strcmp(e, "0"); }
+    if (nowatch) watch = 0;
     void *p = VirtualAlloc((void *)(uintptr_t)addr, n, MEM_RESERVE | (watch ? MEM_WRITE_WATCH : 0), PAGE_NOACCESS);
     if (p && p != (void *)(uintptr_t)addr) {
         VirtualFree(p, 0, MEM_RELEASE);
@@ -557,11 +561,19 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 static int (*fault_hook)(uint64_t addr);
 
 // A write access violation (ExceptionInformation[0] == 1) goes to the hook; registered first, before the crash handler.
+static volatile LONG64 veh_all, veh_av, veh_handled;   // plat_fault_counts
+void plat_fault_counts(uint64_t *all, uint64_t *av, uint64_t *handled) {
+    *all = (uint64_t)veh_all, *av = (uint64_t)veh_av, *handled = (uint64_t)veh_handled;
+}
 static LONG CALLBACK fault_veh(EXCEPTION_POINTERS *ep) {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    InterlockedIncrement64(&veh_all);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) InterlockedIncrement64(&veh_av);
     if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
         return EXCEPTION_CONTINUE_SEARCH;
-    return fault_hook((uint64_t)er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    if (!fault_hook((uint64_t)er->ExceptionInformation[1])) return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedIncrement64(&veh_handled);
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
@@ -1493,7 +1505,173 @@ void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
         *proc_mb = (double)(pmc.PrivateUsage >> 20);
 }
 
+// DKB_FAULT_WATCH=1 (diagnostic, off by default): the process's working-set watch (K32InitializeProcessForWsWatch). A
+// thread drains the soft and hard faults every 50 ms and counts them by the faulting instruction and by the allocation the
+// faulting address belongs to; plat_fault_watch_report prints the biggest of both since the last report.
+#define FW_PCS 4096
+#define FW_BASES 1024
+static struct { uintptr_t pc; uint64_t n; } fw_pc[FW_PCS];
+static struct { uintptr_t base; uint64_t n; DWORD type; } fw_base[FW_BASES];
+static uint64_t fw_total, fw_lost;
+static SRWLOCK fw_lock = SRWLOCK_INIT;
+static int fw_state;   // 0 not read, 1 on, -1 off
+// The size argument is a pointer to the buffer size in bytes (Windows SDK: PDWORD cb); MinGW's psapi.h declares it as a
+// DWORD, so the call goes through a pointer of the right type.
+typedef BOOL (WINAPI *FwGetWsChangesEx)(HANDLE, PPSAPI_WS_WATCH_INFORMATION_EX, PDWORD);
+static DWORD WINAPI fw_main(LPVOID arg) {
+    (void)arg;
+    static PSAPI_WS_WATCH_INFORMATION_EX buf[1 << 16];
+    FwGetWsChangesEx get = (FwGetWsChangesEx)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "K32GetWsChangesEx");
+    if (!get) return 0;
+    for (;;) {
+        Sleep(50);
+        DWORD cb = sizeof buf;
+        if (!get(GetCurrentProcess(), buf, &cb)) {
+            if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) fw_lost++;
+            else if (GetLastError() != ERROR_NO_MORE_ITEMS) continue;
+        }
+        AcquireSRWLockExclusive(&fw_lock);
+        for (size_t i = 0; i < sizeof buf / sizeof *buf && buf[i].BasicInfo.FaultingPc; i++) {
+            uintptr_t pc = (uintptr_t)buf[i].BasicInfo.FaultingPc, va = (uintptr_t)buf[i].BasicInfo.FaultingVa & ~(uintptr_t)1;
+            fw_total++;
+            size_t h = (pc * 0x9E3779B97F4A7C15ull) >> 52;
+            for (size_t k = 0; k < FW_PCS; k++, h = (h + 1) & (FW_PCS - 1))
+                if (!fw_pc[h].pc || fw_pc[h].pc == pc) { fw_pc[h].pc = pc, fw_pc[h].n++; break; }
+            MEMORY_BASIC_INFORMATION mb;
+            if (VirtualQuery((LPCVOID)va, &mb, sizeof mb)) {
+                uintptr_t base = (uintptr_t)mb.AllocationBase;
+                size_t g = (base * 0x9E3779B97F4A7C15ull) >> 54;
+                for (size_t k = 0; k < FW_BASES; k++, g = (g + 1) & (FW_BASES - 1))
+                    if (!fw_base[g].base || fw_base[g].base == base) { fw_base[g].base = base, fw_base[g].n++, fw_base[g].type = mb.Type; break; }
+            }
+        }
+        ReleaseSRWLockExclusive(&fw_lock);
+        memset(buf, 0, sizeof buf[0] * 4);
+    }
+    return 0;
+}
+static void fw_where(uintptr_t pc, char *o, size_t cap) {
+    HMODULE m = NULL;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)pc, &m) &&
+        GetModuleFileNameA(m, name, sizeof name)) {
+        const char *b = strrchr(name, '\\');
+        snprintf(o, cap, "%s+%#llx", b ? b + 1 : name, (unsigned long long)(pc - (uintptr_t)m));
+    } else snprintf(o, cap, "%#llx", (unsigned long long)pc);
+}
+size_t plat_fault_watch_report(char *out, size_t cap) {
+    if (!fw_state) {
+        const char *e = getenv("DKB_FAULT_WATCH");
+        fw_state = e && *e && strcmp(e, "0") && K32InitializeProcessForWsWatch(GetCurrentProcess()) ? 1 : -1;
+        if (fw_state > 0) CloseHandle(CreateThread(NULL, 0, fw_main, NULL, 0, NULL));
+        return 0;
+    }
+    if (fw_state < 0 || !cap) return 0;
+    size_t k = 0;
+    AcquireSRWLockExclusive(&fw_lock);
+    k += (size_t)snprintf(out + k, cap - k, "%llu faults (%llu drains lost); by instruction:", (unsigned long long)fw_total,
+                          (unsigned long long)fw_lost);
+    for (int t = 0; t < 10 && k < cap - 160; t++) {
+        size_t best = FW_PCS;
+        for (size_t i = 0; i < FW_PCS; i++) if (fw_pc[i].n && (best == FW_PCS || fw_pc[i].n > fw_pc[best].n)) best = i;
+        if (best == FW_PCS) break;
+        char w[MAX_PATH + 32];
+        fw_where(fw_pc[best].pc, w, sizeof w);
+        k += (size_t)snprintf(out + k, cap - k, " %s %llu;", w, (unsigned long long)fw_pc[best].n);
+        fw_pc[best].n = 0;
+    }
+    k += (size_t)snprintf(out + k, cap - k, " by allocation:");
+    for (int t = 0; t < 8 && k < cap - 120; t++) {
+        size_t best = FW_BASES;
+        for (size_t i = 0; i < FW_BASES; i++) if (fw_base[i].n && (best == FW_BASES || fw_base[i].n > fw_base[best].n)) best = i;
+        if (best == FW_BASES) break;
+        DWORD ty = fw_base[best].type;
+        k += (size_t)snprintf(out + k, cap - k, " %#llx (%s) %llu;", (unsigned long long)fw_base[best].base,
+                              ty == MEM_IMAGE ? "image" : ty == MEM_MAPPED ? "mapped" : ty == MEM_PRIVATE ? "private" : "?",
+                              (unsigned long long)fw_base[best].n);
+        fw_base[best].n = 0;
+    }
+    memset(fw_pc, 0, sizeof fw_pc), memset(fw_base, 0, sizeof fw_base);
+    fw_total = fw_lost = 0;
+    ReleaseSRWLockExclusive(&fw_lock);
+    return k;
+}
+
+// DKB_WS_MIN_MB=<MiB> (diagnostic, off by default): asks Windows to keep at least this much of the process resident
+// (SetProcessWorkingSetSizeEx, a soft minimum for this process only), to see whether working-set trimming causes the
+// soft page faults a heavy scene takes every frame. Applied once, at the first perf report.
+static void ws_min_once(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *e = getenv("DKB_WS_MIN_MB");
+    SIZE_T mb = e && *e ? (SIZE_T)strtoull(e, NULL, 10) : 0;
+    if (!mb) return;
+    SIZE_T lo = mb << 20, hi = lo + ((SIZE_T)1 << 30);
+    BOOL ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), lo, hi, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    fprintf(stderr, "[host] ws: minimum working set %llu MiB: %s (error %lu)\n", (unsigned long long)mb, ok ? "set" : "refused",
+            ok ? 0ul : (unsigned long)GetLastError());
+}
+
+// DKB_THREAD_CPU=1 (diagnostic, off by default): CPU time of every thread of the process since the last call, busiest
+// first, by thread description (plat_thread_new names them). frames: game frames since the last call.
+#define TC_MAX 512
+static struct { DWORD tid; uint64_t ns; } tc_last[TC_MAX];
+static int tc_n;
+size_t plat_thread_cpu_report(char *out, size_t cap, double frames) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DKB_THREAD_CPU"); on = e && *e && strcmp(e, "0"); }
+    if (!on || !cap || frames <= 0) return 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    static struct { DWORD tid; uint64_t d; wchar_t name[48]; } cur[TC_MAX];
+    static struct { DWORD tid; uint64_t ns; } old[TC_MAX];
+    int old_n = tc_n, n = 0;
+    memcpy(old, tc_last, sizeof old[0] * (size_t)old_n);
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    DWORD pid = GetCurrentProcessId();
+    for (BOOL ok = Thread32First(snap, &te); ok && n < TC_MAX; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        FILETIME c0, e0, k, u;
+        if (GetThreadTimes(t, &c0, &e0, &k, &u)) {
+            uint64_t ns = ((((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime)) * 100;
+            uint64_t prev = 0;
+            for (int i = 0; i < old_n; i++) if (old[i].tid == te.th32ThreadID) { prev = old[i].ns; break; }
+            cur[n].tid = te.th32ThreadID, cur[n].name[0] = 0;
+            PWSTR desc = NULL;
+            if (SUCCEEDED(GetThreadDescription(t, &desc)) && desc) {
+                wcsncpy(cur[n].name, desc, 47), cur[n].name[47] = 0;
+                LocalFree(desc);
+            }
+            cur[n].d = prev ? ns - prev : 0;
+            tc_last[n].tid = te.th32ThreadID, tc_last[n].ns = ns;   // rebuilt in snapshot order; lookups use old[]
+            n++;
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    tc_n = n;
+    size_t k = 0;
+    double total = 0;
+    for (int i = 0; i < n; i++) total += (double)cur[i].d;
+    k += (size_t)snprintf(out + k, cap - k, "%.1f ms per frame in %d threads; busiest:", total / 1e6 / frames, n);
+    for (int t = 0; t < 12 && k < cap - 96; t++) {
+        int best = -1;
+        for (int i = 0; i < n; i++) if (cur[i].d && (best < 0 || cur[i].d > cur[best].d)) best = i;
+        if (best < 0) break;
+        char nm[48];
+        WideCharToMultiByte(CP_UTF8, 0, cur[best].name, -1, nm, sizeof nm, NULL, NULL);
+        k += (size_t)snprintf(out + k, cap - k, " %s(%lu) %.2f;", nm[0] ? nm : "?", (unsigned long)cur[best].tid,
+                              (double)cur[best].d / 1e6 / frames);
+        cur[best].d = 0;
+    }
+    return k;
+}
+
 void plat_process_vm_stats(PlatVmStats *s) {
+    ws_min_once();
     memset(s, 0, sizeof *s);
     PROCESS_MEMORY_COUNTERS pm = {.cb = sizeof pm};
     if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pm, sizeof pm)) s->faults = pm.PageFaultCount, s->peak_resident = pm.PeakWorkingSetSize;

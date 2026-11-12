@@ -10,6 +10,9 @@
 #endif
 #include "vk_exec.h"
 #include "platform/platform.h"
+#include "mtstat.h"
+_Thread_local uint64_t mt_cnt[MT_N];   // vk_exec.c record_impl: the slow-submission counters (TOTK_TRACE=perf)
+_Thread_local uint64_t mt_ns[MTNS_N];
 static void resub_note(uint64_t handle) { (void)handle; }   // vk_exec.c TOTK_TRACE=perf resubmission census
 static struct { int on, active; } VR;   // vk_exec.c TOTK_REPLAY_VERIFY pre-pass (stubs: replay itself is not under test here)
 static void vr_prepass(const VkExec *ex, const uint64_t *handles, int n) { (void)ex, (void)handles, (void)n; }
@@ -39,6 +42,7 @@ typedef struct { VkImageView view; } ViewEnt;
 typedef struct { int n; VkImageView v[]; } ViewList;
 static void state_reset(VkExec *ex) { memset(ex,0,sizeof *ex); }
 void vk_dump_init(void) {}
+volatile uint64_t vkb_rec_fence;   // vk_bindless.c TOTK_BDA_CHECK: the submission being recorded (unused here)
 void vk_exec_pass_end(VkExec *ex) { ex->in_pass=0; }
 void vk_exec_barrier(VkExec *ex) { ex->recorded++; }
 void vk_mem_mirror_begin(void) {}

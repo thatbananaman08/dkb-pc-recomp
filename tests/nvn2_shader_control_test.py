@@ -76,7 +76,7 @@ static char cache_dir[]=".";
 #define PATH_CAP 1024
 enum { PACK_SPV=1, PACK_RES=2 };
 static uint32_t pack_n;
-static unsigned cache_reads;
+static unsigned cache_reads, sidecar_reads, sidecar_writes;
 typedef int UseMask;
 /* Production Req and private GfxShader layouts are inserted below. */
 void rt_log(const char *message, ...) { (void)message; }
@@ -112,19 +112,30 @@ uint64_t nvn2_origin(const uint8_t *code) { (void)code; return 0; }   // the lig
 static uint8_t *pack_read(int kind, const uint8_t key[32], uint64_t *size) {
     (void)kind; (void)key; (void)size; abort(); // This fixture owns loose files only.
 }
+// disk_load_from keeps the optimizer's output beside the cache entry (<key>.<module hash>.o1.spv): a missing copy is normal there, and
+// its reads and writes are counted apart from the two owned loose files.
+static int sidecar(const char *path) { size_t n=strlen(path); return n>7 && !strcmp(path+n-7,".o1.spv"); }
 static uint8_t *read_file(const char *path, uint64_t *size) {
     FILE *f=fopen(path,"rb");
+    if (!f && sidecar(path)) return NULL;
     if (!f || fseek(f,0,SEEK_END)) abort();
     long n=ftell(f);
     if (n<0 || fseek(f,0,SEEK_SET)) abort();
     uint8_t *data=calloc((size_t)n+1,1);
     if (!data || fread(data,1,(size_t)n,f)!=(size_t)n || fclose(f)) abort();
-    *size=(uint64_t)n; cache_reads++; return data;
+    *size=(uint64_t)n; if (sidecar(path)) sidecar_reads++; else cache_reads++; return data;
 }
 static void cache_file(const char *path, const void *data, size_t size) {
     FILE *f=fopen(path,"wb");
     if (!f || fwrite(data,1,size,f)!=size || fclose(f)) abort();
 }
+static int write_file(const char *path, const void *data, size_t size) {   // gfx_shader.c: plat_file_write
+    if (!sidecar(path)) abort();   // the loader writes nothing but the optimizer's copy
+    cache_file(path,data,size); sidecar_writes++; return 1;
+}
+// req_init rehashes the code for a stage translated without TOTK_BINDLESS_BUF; bindless_buf is 0 here.
+void rt_sha256(const void *p, size_t n, uint8_t out[32]) { (void)p; (void)n; (void)out; abort(); }
+/* Forward declarations the production order needs are inserted below. */
 '''
     after = r'''
 int main(void) {
@@ -226,6 +237,10 @@ int main(void) {
     char hex[65],spv_path[80],res_path[80]; key_hex(iid,hex);
     snprintf(spv_path,sizeof spv_path,"%s.spv",hex);
     snprintf(res_path,sizeof res_path,"%s.res.json",hex);
+    uint64_t mh=0xcbf29ce484222325ull;   // disk_load_from names the copy by a hash of the module it was made from
+    for (size_t i=0;i<sizeof spv;i++) mh=(mh^((const uint8_t *)spv)[i])*0x100000001b3ull;
+    char opt_path[100]; snprintf(opt_path,sizeof opt_path,"%s.%016llx.o1.spv",hex,(unsigned long long)mh);
+    remove(opt_path);   // a copy left by an earlier run
     cache_file(spv_path,spv,sizeof spv);
     for (unsigned i=0;i<COUNT(cached);i++) {
         cache_file(res_path,cached[i],strlen(cached[i]));
@@ -249,6 +264,11 @@ int main(void) {
         }
         if (s) gfx_shader_release_private(s);
     }
+    // The pass-through optimizer stub always hands back a new module, so the first load writes the copy and later
+    // loads read it instead of running the pass again (unless TOTK_SPIRV_OPT=0 turns the step off).
+    if (spirv_opt_on()) CHECK(sidecar_writes==1 && sidecar_reads>0);
+    else CHECK(sidecar_writes==0 && sidecar_reads==0);
+    remove(opt_path);
     if (remove(spv_path) || remove(res_path)) return 2;
     printf("shader control/profile: %d checks, %d failures\n", checks, failures);
     return failures != 0;
@@ -267,6 +287,11 @@ int main(void) {
     (void)c1; (void)c1_len; (void)hash; return 1;
 }
 '''
+    # req_init (inserted before the light-quad fold block) asks lq_no_buf whether a fold stage skips TOTK_BINDLESS_BUF.
+    forward = 'static int lq_no_buf(uint64_t origin);' if 'static int lq_no_buf(' in production else ''
+    before = before.replace('/* Forward declarations the production order needs are inserted below. */', forward)
+    if 'const uint8_t *control, int no_buf)' in production:   # build_request's last argument: translated without TOTK_BINDLESS_BUF
+        after = after.replace(',NULL,full);', ',NULL,full,0);')
     before = before.replace('/* The hash provider keeps the production signature for older-source compatibility. */', hash_provider)
     pieces = [function(production, name) for name in (
         'static void json_esc(', 'static uint32_t nvn2_shared(', 'static const char *attr_name(',
@@ -287,6 +312,8 @@ int main(void) {
     pieces += [function(production,name) for name in (
         'static void shader_free(', 'static void key_hex(', 'static int reflection_valid(',
         'static int spirv_complete(')]
+    if 'static int spirv_opt_on(' in production:
+        pieces.append(function(production, 'static int spirv_opt_on('))
     if 'static void spirv_optimize(' in production:
         pieces.append(function(production, 'static void spirv_optimize('))
     if 'static int lq_patch(' in production:   # the fold (gfx_shader.c lq_fold) and what it uses precede lq_patch

@@ -395,6 +395,9 @@ void plat_process_memory(uint64_t *resident, uint64_t *private_bytes);
 // commit_limit the system's committed memory and its limit.
 typedef struct { uint64_t faults, peak_resident, avail_phys, total_phys, commit_used, commit_limit; } PlatVmStats;
 void plat_process_vm_stats(PlatVmStats *s);
+size_t plat_fault_watch_report(char *out, size_t cap);   // DKB_FAULT_WATCH=1: where the page faults since the last call came from (0: off)
+void plat_fault_counts(uint64_t *all, uint64_t *av, uint64_t *handled);
+size_t plat_thread_cpu_report(char *out, size_t cap, double frames);   // DKB_THREAD_CPU=1: CPU ms per frame by thread (0: off)   // exceptions the first-chance handler saw, access violations, handled writes
 
 // ---- child processes: a program with stdin and stdout piped to us (stderr discarded), no console window.
 typedef struct PlatChild PlatChild;

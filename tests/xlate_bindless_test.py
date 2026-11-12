@@ -167,6 +167,15 @@ def main():
             check(5347 in caps2, f'{name}: PhysicalStorageBufferAddresses capability with a record')
             check('bindless_buffers' in res2, f'{name}: the reflection gives the buffer count')
             check(sorted(t['bindless_slot'] for t in res2['textures']) == list(range(len(res2['textures']))), f'{name}: record texture slots')
+            # record layout (0005-bindless-buffer-bounds.patch, runtime/vk_exec_draw.c REC_SIZE_AT): nb 8-byte addresses, nt 4-byte
+            # texture slots, then nb 4-byte buffer sizes that array indexes are clamped to
+            nb, nt = res2['bindless_buffers'], len(res2['textures'])
+            want = [8 * i for i in range(nb)] + [8 * nb + 4 * i for i in range(nt)] + [8 * nb + 4 * nt + 4 * i for i in range(nb)]
+            offsets = {}
+            for op, a in instructions(spv2):
+                if op == OP_MEMBER_DECORATE and a[2] == DEC_OFFSET:
+                    offsets.setdefault(a[0], {})[a[1]] = a[3]
+            check(any([o[k] for k in sorted(o)] == want for o in offsets.values()), f'{name}: a record struct with offsets {want}')
             print(f'{name}: ok ({len(res["textures"])} textures, classes {sorted(table)}, {len(spv)} bytes, default {len(default_spv)} bytes)')
             if args.out:
                 args.out.mkdir(parents=True, exist_ok=True)

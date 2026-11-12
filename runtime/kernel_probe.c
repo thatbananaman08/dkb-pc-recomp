@@ -424,6 +424,40 @@ static void test_cores(Cpu *c) {
     CHECK(ok || !gate, "virtual cores");
 }
 
+// ---- yields: a p44 thread spins on SleepThread(-1) until a p50 thread pinned to the same virtual core sets a flag. On
+// Bananza's Hill the job threads wait like this for lower-priority threads of their core; the yield hands the core to any
+// thread queued for it (kernel.c, TOTK_YIELD_ANY=2, the default), so the flag is set in well under 100 ms. Before, the
+// low thread got the core only when the spinner gave up (2 s here).
+static volatile uint32_t g_ya_flag;
+static volatile uint64_t g_ya_ns;
+static uint64_t a_ya_high, a_ya_low;
+static void ya_high(Cpu *c) {
+    uint64_t t0 = kern_now_ns();
+    while (!ld(&g_ya_flag) && kern_now_ns() - t0 < 2000000000ull) sv(c, 0x0B, (uint64_t)-1, 0, 0, 0);
+    g_ya_ns = kern_now_ns() - t0;
+    exit_thread(c);
+}
+static void ya_low(Cpu *c) {
+    __atomic_store_n(&g_ya_flag, 1, __ATOMIC_SEQ_CST);
+    exit_thread(c);
+}
+static void test_yield_any(Cpu *c) {
+    g_ya_flag = 0, g_ya_ns = 0;
+    uint32_t hi = create(c, a_ya_high, NULL, 44, 1), lo = create(c, a_ya_low, NULL, 50, 1);
+    CHECK(sv(c, 0x0F, hi, 1, 2, 0) == 0 && sv(c, 0x0F, lo, 1, 2, 0) == 0, "SetThreadCoreMask(core 1 only)");
+    start(c, hi);
+    sleep_ms(c, 5);   // the spinner holds core 1 and yields
+    start(c, lo);
+    join(c, lo);
+    join(c, hi);
+    const char *e = cfg_get("TOTK_YIELD_ANY");
+    int on = !(e && *e) || atoi(e) == 2;
+    int ok = ld(&g_ya_flag) && g_ya_ns < 100000000ull;
+    printf("yields: a p44 thread yielding (-1) on the core of a waiting p50 thread saw its flag after %.1f ms: %s\n", g_ya_ns / 1e6,
+           !on ? "not checked (TOTK_YIELD_ANY is not 2)" : ok ? "ok" : "FAIL");
+    CHECK(ok || !on, "a yield gives the core to a lower-priority thread queued for it");
+}
+
 // ---- fibers: two fibers switch to each other; each checks its callee-saved registers, sp and tpidr survive
 typedef struct { uint64_t self, other; int id; } FiberJob;
 static volatile int32_t g_switches, g_runs[3];
@@ -620,6 +654,7 @@ static void probe_main(Cpu *c) {
     test_arbiter(c);
     test_events(c);
     test_cores(c);
+    test_yield_any(c);
     test_fibers(c);
     test_exit(c);
     test_lifted_ticks(c);
@@ -690,6 +725,8 @@ int probe_kernel(void) {
     a_arb_waiter = hostfn_register("probe-kernel arbiter waiter", arb_waiter);
     a_event_waiter = hostfn_register("probe-kernel event waiter", event_waiter);
     a_core_worker = hostfn_register("probe-kernel core worker", core_worker);
+    a_ya_high = hostfn_register("probe-kernel yielding thread", ya_high);
+    a_ya_low = hostfn_register("probe-kernel low thread", ya_low);
     a_exit_entry = hostfn_register("probe-kernel exit entry", exit_entry);
     a_exit_nested = hostfn_register("probe-kernel exit nested", exit_nested);
     a_fiber_fn = hostfn_register("probe-kernel fiber", fiber_fn);

@@ -26,7 +26,9 @@ def source():
 #include <string.h>
 #include "mtstat.h"
 _Thread_local uint64_t mt_cnt[MT_N];
+_Thread_local uint64_t mt_ns[MTNS_N];
 #include "vk_exec.h"
+uint64_t plat_now_ns(void) { static uint64_t now; return now += 1000; }
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
 #define NVN_STAGE_GS 2

@@ -88,6 +88,8 @@ struct RtThread {
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
     uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
     uint64_t wake_at, grant_at;   // when a wait was signalled and a core granted, until the thread runs again
+    uint64_t yield_until;   // YieldToAnyThread gave the core to a worse thread: no kick to take it back before then
+    uint64_t ngrant, grant_last;   // virtual core grants, and the last one (TOTK_STALL_DUMP: does a starved thread get one)
     uint64_t lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;   // those latencies; SleepThread asked/took
     uint64_t sp_n, sp_ho, sp_site;   // spin wait passes and core handoffs, the last loop head (the thread writes them)
     RtThread *target;          // as a core waiter: the owner core_kick asked to give its core up for it (holding G)
@@ -764,9 +766,164 @@ static void dg_sample(RtThread *t) {
            t->dg_cls == DG_HOST ? "host" : "game", (kern_now_ns() - t->dg_since) / 1e6);
 }
 
+// A DG_EQ wait (every core the waiter may use is held by a thread of equal or better priority) that lasted 4 ms: what
+// each of those owners was doing, one line per wait. Its own budget, so the waits of a late hitch are still sampled.
+static uint64_t g_dg_eq_samples;
+static void dg_sample_eq(RtThread *t) {
+    if (g_dg_eq_samples >= 1500) return;
+    g_dg_eq_samples++;
+    char s[1400];
+    int o = snprintf(s, sizeof s, "core-diag: eq wait %.2f ms: waiter %#x p%d mask %#llx; owners:", (kern_now_ns() - t->dg_since) / 1e6,
+                     t->handle, t->prio, (unsigned long long)t->mask);
+    for (int i = 0; i < NCORE && o < (int)sizeof s - 200; i++) {
+        RtThread *w = g_core_owner[i];
+        if (!core_allowed(t, i) || !w) continue;
+        uint64_t rip = 0, rsp;
+        int stopped = w->hthr && plat_intr_stop(w->hthr, &rip, &rsp);
+        int depth = __atomic_load_n(&w->host_depth, __ATOMIC_RELAXED);
+        if (stopped) plat_intr_resume(w->hthr, 0);
+        char mn[256] = "?", lr[128] = "-";
+        uintptr_t m = 0;
+        if (stopped) plat_module_of((uintptr_t)rip, mn, sizeof mn, &m);
+        if (w->cur) ldr_describe(w->cur->x[30], lr, sizeof lr);
+        o += snprintf(s + o, sizeof s - (size_t)o, " c%d %#x p%d depth %d rip %s+%#llx svc %#x lr %s;", i, w->handle, w->prio, depth,
+                      mn, (unsigned long long)(rip - m), w->dg_svc, lr);
+    }
+    rt_log("%s", s);
+}
+
+
+static uint64_t g_yield_n[3], g_yield_any_gave;   // SleepThread yields by type (0, -1, -2); -2 that gave the core to a worse thread
+
+// Stall dump (TOTK_STALL_DUMP=<seconds>, default 5; 0 turns it off): a watchdog thread logs the scheduler state when no
+// frame has been presented for that long, then every 10 s while the stall lasts: who holds each virtual core and who
+// waits for one, with priorities, core masks, pending preempt requests and yield pauses, and every other guest
+// thread's wait. Written for the Forest hangs under TOTK_YIELD_ANY=2 (2026-11-12), where game threads waited for a
+// virtual core for minutes. The dump only reads under the scheduler lock; a lock it cannot get is reported as such.
+static volatile uint64_t g_stall_last_ns, g_stall_last_frame;
+
+static void stall_line(const char *what, const RtThread *t, uint64_t now) {
+    const Cpu *c = t->cur;
+    rt_log("stall: %s %#x p%d (now %d) mask %#llx core %d preempt %d host_depth %d wkind %d waddr %#llx wobj %#llx "
+           "yield pause %.2f ms target %#x pc %#llx lr %#llx loop %#llx; core grants %llu, last %.1f ms ago",
+           what, t->handle, t->prio, prio_of(t), (unsigned long long)t->mask, t->cur_core, t->preempt, t->host_depth,
+           t->wkind, (unsigned long long)t->waddr, (unsigned long long)t->wobj,
+           t->yield_until > now ? (t->yield_until - now) / 1e6 : 0.0, t->target ? t->target->handle : 0,
+           (unsigned long long)(c ? c->pc : 0), (unsigned long long)(c ? c->x[30] : 0), (unsigned long long)t->sp_site,
+           (unsigned long long)t->ngrant, t->grant_last ? (now - t->grant_last) / 1e6 : -1.0);
+}
+
+static void stall_dump(uint64_t idle_ns) {
+    int got = 0;
+    for (int i = 0; i < 200 && !(got = plat_mutex_trylock(&G)); i++) plat_sleep_ms(1);
+    if (!got) {
+        rt_log("stall: no frame for %.1f s; the scheduler lock stayed held for 200 ms: no dump", idle_ns / 1e9);
+        return;
+    }
+    uint64_t now = kern_now_ns();
+    rt_log("stall: no frame for %.1f s after frame %llu; yields %llu/%llu/%llu, given to a worse thread %llu", idle_ns / 1e9,
+           (unsigned long long)g_stall_last_frame, (unsigned long long)g_yield_n[0], (unsigned long long)g_yield_n[1],
+           (unsigned long long)g_yield_n[2], (unsigned long long)g_yield_any_gave);
+    char what[32];
+    for (int i = 0; i < NCORE; i++) {
+        snprintf(what, sizeof what, "core %d owner", i);
+        RtThread *o = g_core_owner[i];
+        if (o) {
+            stall_line(what, o, now);
+            // Where its host thread is now (sampled twice, 1 ms apart) and what asynchronous preemption would see:
+            // the preemption disable count, a redirect still pending, whether the rip is in lifted code.
+            uint64_t rip[2] = {0, 0}, rsp;
+            for (int k = 0; k < 2 && o->hthr; k++) {
+                if (k) plat_sleep_ms(1);
+                if (plat_intr_stop(o->hthr, &rip[k], &rsp)) plat_intr_resume(o->hthr, 0);
+            }
+            uintptr_t b = plat_exe_base();
+            rt_log("stall:   host rip exe+%#llx, exe+%#llx (lifted code %d, %d); disable count %u, redirect pending %d",
+                   (unsigned long long)(rip[0] - b), (unsigned long long)(rip[1] - b),
+                   rip[0] >= g_gen_lo && rip[0] <= g_gen_hi, rip[1] >= g_gen_lo && rip[1] <= g_gen_hi,
+                   o->tlr ? ap_tlr(o)[0] : 0, o->ap_pending);
+        } else rt_log("stall: core %d free", i);
+    }
+    rt_log("stall: asynchronous preemption: %llu interrupted, %llu given up there; refused %llu in a host call, %llu "
+           "outside game code, %llu disabled, %llu failed",
+           (unsigned long long)g_ap_sent, (unsigned long long)g_ap_taken, (unsigned long long)g_ap_host,
+           (unsigned long long)g_ap_pc, (unsigned long long)g_ap_deferred, (unsigned long long)g_ap_fail);
+    // The game's job spin lock (f_7000015520 at main+0x185ac / main+0x1893c): a CAS of [x20] from 0 to the caller's id
+    // (x0, from an SDK import through the PLT stub f_7001985150, a per-thread value), retried without a yield. For
+    // each owner: the lock word and the id it writes; then which threads' blocks (TLR, the current thread object,
+    // TLS) hold the lock word's value: the lock's owner.
+    for (int i = 0; i < NCORE; i++) {
+        RtThread *o = g_core_owner[i];
+        if (!o || !o->cur) continue;
+        uint64_t a = o->cur->x[20], v = 0;
+        int ok = a && !(a & 7) && plat_mem_readable(a, 8);
+        if (ok) v = LD64(a);
+        rt_log("stall: core %d owner %#x: x0 %#llx x20 %#llx [x20] %s%#llx x24 %#llx", i, o->handle,
+               (unsigned long long)o->cur->x[0], (unsigned long long)a, ok ? "" : "(unreadable) ", (unsigned long long)v,
+               (unsigned long long)o->cur->x[24]);
+        if (!ok || !v || (i != 0 && g_core_owner[i - 1] && g_core_owner[i - 1]->cur && g_core_owner[i - 1]->cur->x[20] == a))
+            continue;   // one search per lock word (owners spinning on the same lock are adjacent often enough)
+        for (const RtThread *t = g_all; t; t = t->all) {
+            if (t->exited || !t->tlr) continue;
+            const uint8_t *blk[3] = {t->tlr, (const uint8_t *)(uintptr_t)LD64((uint64_t)(uintptr_t)(t->tlr + 0x1F8)), t->tls};
+            const uint32_t len[3] = {TLR_SIZE, THREAD_OBJ_SIZE, TLS_SIZE};
+            const char *nm[3] = {"TLR", "thread object", "TLS"};
+            for (int b = 0; b < 3; b++) {
+                if (!blk[b] || !plat_mem_readable((uint64_t)(uintptr_t)blk[b], len[b])) continue;
+                for (uint32_t off = 0; off + 8 <= len[b]; off += 8)
+                    if (LD64((uint64_t)(uintptr_t)(blk[b] + off)) == v)
+                        rt_log("stall:   lock value %#llx found in thread %#x p%d core %d: %s+%#x", (unsigned long long)v,
+                               t->handle, t->prio, t->cur_core, nm[b], off);
+            }
+            if (t->cur && t->cur->x[0] == v)
+                rt_log("stall:   lock value %#llx is thread %#x's x0 (core %d, pc %#llx lr %#llx)", (unsigned long long)v,
+                       t->handle, t->cur_core, (unsigned long long)t->cur->pc, (unsigned long long)t->cur->x[30]);
+        }
+    }
+    int k = 0;
+    for (const RtThread *w = g_core_wait; w; w = w->cnext) {
+        snprintf(what, sizeof what, "core waiter %d", k++);
+        stall_line(what, w, now);
+    }
+    for (const RtThread *t = g_all; t; t = t->all) {
+        if (t->exited || !t->started || t->cur_core >= 0) continue;
+        int queued = 0;
+        for (const RtThread *w = g_core_wait; w && !queued; w = w->cnext) queued = w == t;
+        if (!queued) stall_line("blocked", t, now);
+    }
+    unlock();
+}
+
+static void stall_main(void *arg) {
+    uint64_t lim = (uint64_t)(uintptr_t)arg * 1000000000ull, next = 0;
+    for (;;) {
+        plat_sleep_ms(500);
+        uint64_t last = __atomic_load_n(&g_stall_last_ns, __ATOMIC_RELAXED), now = kern_now_ns();
+        if (now - last < lim) {
+            next = 0;
+            continue;
+        }
+        if (next && now < next) continue;
+        stall_dump(now - last);
+        next = now + 10000000000ull;
+    }
+}
 
 // perf_present, every present: a line for a present over 25 ms, the 60-present summary.
 void kern_core_diag_frame(uint64_t frame, uint64_t interval_ns) {
+    __atomic_store_n(&g_stall_last_ns, kern_now_ns(), __ATOMIC_RELAXED);
+    g_stall_last_frame = frame;
+    static int stall_started;
+    if (!stall_started && frame >= 60) {   // after the first frames: the boot's long loads are not stalls
+        stall_started = 1;
+        const char *e = cfg_get("TOTK_STALL_DUMP");
+        int sec = e && *e ? atoi(e) : 5;
+        if (sec > 0) plat_thread_spawn(stall_main, (void *)(uintptr_t)sec, "stall watch", 0);
+    }
+    if ((rt_trace & RT_TRACE_PERF) && frame && frame % 600 == 0)
+        rt_log("kernel: frame %llu: yields without migration %llu, with migration %llu, to any thread %llu (gave the core to a worse thread %llu)",
+               (unsigned long long)frame, (unsigned long long)g_yield_n[0], (unsigned long long)g_yield_n[1], (unsigned long long)g_yield_n[2],
+               (unsigned long long)g_yield_any_gave);
     if (g_ap > 0 && frame && frame % 600 == 0) {   // TOTK_ASYNC_PREEMPT counters since the start
         lock();
         uint64_t v[8] = {g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok, g_sync36};
@@ -840,21 +997,32 @@ static void core_count(void) {
 static struct DgRel g_dg_rel;   // TOTK_CORE_DIAG: the owner core_put is releasing, for core_grant
 
 static void core_grant(int c) {
+    // A waiter in its yield pause (it gave a core to a worse thread with YieldToAnyThread) comes after every other
+    // waiter: otherwise the next yield on that core handed it straight back, and spinning yielders of better priority
+    // passed a core around among themselves while the worse thread they waited for never got it (Forest hangs under
+    // TOTK_YIELD_ANY=2, TOTK_STALL_DUMP, 2026-11-12: p44/p47 yielders on core 2, the p53 thread pinned there starved).
     RtThread *b = NULL, **bp = NULL;
-    int bpri = 0;
+    int bpri = 0, bpause = 0;
+    uint64_t now = 0;
     for (RtThread **p = &g_core_wait; *p; p = &(*p)->cnext) {
         if (!core_allowed(*p, c)) continue;
-        int pr = prio_of(*p);
-        if (!b || pr < bpri || (pr == bpri && (*p)->cseq < b->cseq)) {
+        int pr = prio_of(*p), pause = 0;
+        if ((*p)->yield_until) {
+            if (!now) now = kern_now_ns();
+            pause = (*p)->yield_until > now;
+        }
+        if (!b || pause < bpause || (pause == bpause && (pr < bpri || (pr == bpri && (*p)->cseq < b->cseq)))) {
             b = *p;
             bp = p;
             bpri = pr;
+            bpause = pause;
         }
     }
     if (!b) return;
     *bp = b->cnext;
     b->cnext = NULL;
     b->cur_core = c;
+    b->ngrant++, b->grant_last = kern_now_ns();
     g_core_owner[c] = b;
     core_count();
     if (g_diag > 0) b->dg_rel = g_dg_rel;
@@ -901,7 +1069,13 @@ static void core_kick(void) {
     RtThread *w[64];
     int wp[64], op[NCORE], n = 0, claimed = 0;
     for (int i = 0; i < NCORE; i++) op[i] = g_core_owner[i] ? prio_of(g_core_owner[i]) : 0;
+    uint64_t now = 0;
     for (RtThread *p = g_core_wait; p && n < 64; p = p->cnext) {
+        if (p->yield_until) {   // gave its core away with YieldToAnyThread: no claim until then
+            if (!now) now = kern_now_ns();
+            if (p->yield_until > now) continue;
+            p->yield_until = 0;
+        }
         int i = n++, pp = prio_of(p);
         for (; i > 0 && (wp[i - 1] > pp || (wp[i - 1] == pp && w[i - 1]->cseq > p->cseq)); i--) {
             w[i] = w[i - 1];
@@ -921,6 +1095,10 @@ static void core_kick(void) {
         if (v < 0) continue;
         claimed |= 1 << v;
         RtThread *o = g_core_owner[v];
+        // A waiter given a new owner to displace is woken: one asleep without a timeout (core_take's wait when it had
+        // no target) would otherwise never interrupt it, and an owner spinning without a checkpoint keeps the core for
+        // good (Forest hangs under TOTK_YIELD_ANY=2, 2026-11-12: three cores held 25 s with the request pending).
+        if (w[k]->target != o && g_ap_int) plat_cond_signal(&w[k]->cv);
         w[k]->target = o;
         if (o->preempt) continue;
         if (rt_trace & RT_TRACE_SCHED) {
@@ -949,6 +1127,7 @@ static void core_take(RtThread *t) {
         if (core_allowed(t, i) && !g_core_owner[i]) c = i;
     if (c >= 0) {
         t->cur_core = c;
+        t->ngrant++, t->grant_last = kern_now_ns();
         g_core_owner[c] = t;
         core_count();
         acct(t, S_RUN);
@@ -976,13 +1155,20 @@ static void core_take(RtThread *t) {
     while (t->cur_core < 0) {
         uint32_t ms = 0;   // 0: until signalled
         if (g_ap_int && ap_try(t) != AP_NONE) ms = 1;   // the owner keeps its core: again in a millisecond
-        int sample = g_diag > 0 && !sampled && (t->dg_cls == DG_GAME || t->dg_cls == DG_HOST);
+        if (t->yield_until) {   // after a YieldToAnyThread: claim a core once the pause is over
+            // The kick gives this waiter its target only now, after this pass's ap_try: come back in a millisecond
+            // to interrupt it rather than sleeping until signalled.
+            if (kern_now_ns() >= t->yield_until) t->yield_until = 0, core_kick(), ms = 1;
+            else ms = 1;
+        }
+        int sample = g_diag > 0 && !sampled && (t->dg_cls == DG_GAME || t->dg_cls == DG_HOST || t->dg_cls == DG_EQ);
         if (sample && !ms) ms = 2;
         if (ms) plat_cond_wait_ms(&t->cv, &G, ms);
         else plat_cond_wait(&t->cv, &G);
-        if (sample && t->cur_core < 0 && kern_now_ns() - t->dg_since >= 2000000) {
+        if (sample && t->cur_core < 0 && kern_now_ns() - t->dg_since >= (t->dg_cls == DG_EQ ? 4000000u : 2000000u)) {
             sampled = 1;
-            dg_sample(t);
+            if (t->dg_cls == DG_EQ) dg_sample_eq(t);
+            else dg_sample(t);
         }
     }
     if (g_diag > 0) dg_done(t);
@@ -1702,17 +1888,68 @@ int kern_svc(Cpu *c, uint32_t imm) {
             return 1;
         }
         // Yield: hand the core to a waiting thread of equal or better priority.
+        // A thread nobody may take the core from keeps it; while one is queued for this core (a worse priority, or
+        // one a kick will bring in), the yield does not go to the host scheduler: SwitchToThread gives a busy host's
+        // processor away for up to a quantum with the virtual core still held, and the game spins on YieldThread
+        // (Hill, running: the owner of the core in host calls 1-9 ms per frame of other threads' core waits, 2026-11-11).
+        // A short pause returns to the guest loop, whose next SVC or checkpoint hands the core over as usual.
+        // TOTK_YIELD_SPIN=1 (default off: on the drifting Hill route test it showed no gain, median 24.9 fps against
+        // 24.9-32.9 without it) turns this on.
+        static int spin = -1;
+        if (spin < 0) spin = cfg_bool("TOTK_YIELD_SPIN");
         lock();
-        int give = 0;
+        int give = 0, queued = 0;
         int tp = prio_of(t);
-        for (RtThread *w = g_core_wait; w && !give; w = w->cnext)
-            give = t->cur_core >= 0 && core_allowed(w, t->cur_core) && prio_of(w) <= tp;
+        // Horizon's yield types: 0 without core migration and -1 with it go to threads of equal priority; -2
+        // (YieldToAnyThread) gives the core to any thread waiting for it, of whatever priority. Treating -2 like 0 left
+        // p44 job threads yielding in a loop on the core that the lower-priority (p45-p54) threads they waited for were
+        // pinned to: most of the "eq" core waits in Hill's 250-400 ms frames (TOTK_CORE_DIAG eq samples, 2026-11-11).
+        // TOTK_YIELD_ANY=0 treats -2 as before. Bananza only yields with -1 (1.3 million in 3600 frames of the Hill route,
+        // none with -2), so TOTK_YIELD_ANY=2 (the default) also treats -1 that way: here a spinning yield holds the
+        // virtual core through a host yield, where on the Switch the work it waits for runs meanwhile. Route test, 3 runs
+        // each: median 37.3 fps against 32.5, frames over 100 ms 10/12/21 per run against about 25 (2026-11-11).
+        // TOTK_YIELD_ANY=1 honours -2 only, 0 neither.
+        static int any = -1;
+        if (any < 0) any = cfg_get("TOTK_YIELD_ANY") && *cfg_get("TOTK_YIELD_ANY") ? atoi(cfg_get("TOTK_YIELD_ANY")) : 2;
+        int to_any = (any && ns == -2) || (any == 2 && ns == -1);
+        for (RtThread *w = g_core_wait; w && !give; w = w->cnext) {
+            int here = t->cur_core >= 0 && core_allowed(w, t->cur_core);
+            queued |= here;
+            give = here && (to_any || prio_of(w) <= tp);
+        }
+        g_yield_n[ns == 0 ? 0 : ns == -1 ? 1 : 2]++;
+        if (give && to_any) {
+            int worse = 1;
+            for (RtThread *w = g_core_wait; w; w = w->cnext)
+                if (t->cur_core >= 0 && core_allowed(w, t->cur_core) && prio_of(w) <= tp) worse = 0;
+            if (worse) t->yield_until = kern_now_ns() + 500000, g_yield_any_gave++;   // the worse thread runs at least 0.5 ms
+        }
         if (give) {
             core_put(t);
             core_take(t);
         }
+        if (!give && spin && queued) {
+            unlock();
+            for (int i = 0; i < 64; i++) _mm_pause();
+            return 1;
+        }
+        // TOTK_YIELD_AWAY=1 (default off): the host yield happens without the virtual core: SwitchToThread can give a busy
+        // host's processor away for a quantum, and while this thread held its core there a better thread pinned to that
+        // core waited for it. On Hill's route the owners were p44/p48 threads in YieldThread and the waiters p30/p31 threads
+        // of mask 2 or 0x20, 5-25 ms per wait, which added up to the 250-360 ms frames (TOTK_CORE_DIAG, 2026-11-11). The
+        // core goes back to the wait list and is taken again after the yield, as rt_spin_gate hands it over. On the route
+        // test it did not help: median 35.2 fps against 32.5, but 36 frames over 100 ms per run against 25 (3 runs each).
+        static int away = -1;
+        if (away < 0) away = cfg_get("TOTK_YIELD_AWAY") && !strcmp(cfg_get("TOTK_YIELD_AWAY"), "1");
+        int put = !give && away && t->cur_core >= 0 && cores_enabled();
+        if (put) core_put(t);
         unlock();
         if (!give) plat_yield();
+        if (put) {
+            lock();
+            core_take(t);
+            unlock();
+        }
         return 1;
     }
     case 0x0C: {   // GetThreadPriority(w1 handle -> w1)

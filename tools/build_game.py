@@ -91,8 +91,10 @@ CLANG = UCRT / 'clang.exe' if WIN else on_path('clang')
 NINJA = UCRT / 'ninja.exe' if WIN else on_path('ninja')
 SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll'] if WIN else []
 
-# Flags for generated code as LAS Recomp builds it (Makefile GENFLAGS, Windows), plus -march for the FP/SIMD lowering.
-GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
+# Flags for generated code as LAS Recomp builds it (Makefile GENFLAGS, Windows), plus -march for the FP/SIMD lowering,
+# at -O2 instead of LAS Recomp's -O1: on Bananza's Hill route it cut guest CPU time 5-9% and had fewer frames over 50 ms
+# (52 vs 70 per run, 3 runs each, 2026-11-11); the fps median was within noise.
+GEN_FLAGS = ['-O2', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
              '-march=x86-64-v3']
 RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
 if WIN:

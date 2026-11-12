@@ -51,17 +51,19 @@ static void describe(uint32_t code, char *o, size_t size) {
     static const char *const kinds[] = {"nothing", "the start of a part of submission", "the end of submission",
                                         "the start of upload batch", "the end of upload batch",
                                         "ASTC decode chunk", "the start of present",
-                                        "the end of present"};
+                                        "the end of present", "draw"};
     unsigned k = code >> 28;
     if (!code) snprintf(o, size, "nothing yet");
+    else if (k == VK_CRUMB_DRAW) vk_exec_draw_crumb_describe(code & 0x0fffffff, o, size);
     else if (k < sizeof kinds / sizeof *kinds) snprintf(o, size, "%s %u", kinds[k], code & 0x0fffffff);
     else snprintf(o, size, "unknown code %#x", code);
 }
 
 void vk_crumbs_report(void) {
     if (!words) return;
-    char reached[96], finished[96];
+    char reached[256], finished[256];
     describe(words[0], reached, sizeof reached);
     describe(words[1], finished, sizeof finished);
     rt_log("vk: GPU breadcrumbs: the GPU last reached %s; everything before %s had finished", reached, finished);
+    if (words[1] >> 28 == VK_CRUMB_DRAW) vk_exec_draw_crumb_after(words[1] & 0x0fffffff, 12);
 }

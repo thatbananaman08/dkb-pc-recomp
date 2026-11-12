@@ -78,7 +78,10 @@ void vk_device_fault_report(VkResult r);
 // twice, when the command processor reaches it and when all work before it has finished. After a lost device the two
 // codes bracket the work that hung. Without the extension every call returns at once.
 enum { VK_CRUMB_SUBMIT = 1, VK_CRUMB_SUBMIT_END, VK_CRUMB_UPLOAD, VK_CRUMB_UPLOAD_END, VK_CRUMB_ASTC, VK_CRUMB_PRESENT,
-       VK_CRUMB_PRESENT_END };
+       VK_CRUMB_PRESENT_END, VK_CRUMB_DRAW };
+// TOTK_DRAW_CRUMBS=1: a crumb before every draw (vk_exec_draw.c); describes draw crumb n into o (its stages, its thread).
+void vk_exec_draw_crumb_describe(uint32_t n, char *o, size_t size);
+void vk_exec_draw_crumb_after(uint32_t n, int count);   // logs the next count draws after draw crumb n
 void vk_crumbs_init(VkCtx *c);       // after the allocator exists
 void vk_crumbs_release(void);
 // Records crumb kind with number n (a timeline value, a batch number; the low 28 bits are kept) into cb. Only the
@@ -407,6 +410,7 @@ uint64_t vk_sync_reserve(void);            // asynchronous replay: the value the
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns);   // 1 when done; 0 on timeout or a value never submitted
 uint64_t vk_sync_fence_done(void);         // highest done value
 uint64_t vk_sync_issued(void);             // newest submitted value (the one being recorded is this + 1)
+void vk_sync_wait_issued(uint64_t value);   // until value was submitted (replay done), not until the GPU reached it
 void vk_sync_finish(void);                 // every submitted value done
 void vk_sync_shutdown(void);               // finish, stop the completion thread, free the command buffers
 // The op-stream replay (vk_exec.c): records the command handles of one submission into cb, which the caller has
@@ -423,6 +427,9 @@ uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t su
 // batch) without a signal, and returns a new begun one for the rest of the submission. The submission's timeline value
 // is signalled by its last part, whose signal covers every earlier part in submission order.
 VkCommandBuffer vk_sync_split(void);
+VkCommandBuffer vk_sync_split_part(void);   // an early-submit part (TOTK_SPLIT_ASYNC: the recorder submits it)
+void vk_sync_part_submit(VkCommandBuffer pro, VkCommandBuffer cb, uint64_t fence);   // the recorder thread: a part TOTK_SPLIT_ASYNC handed it
+int vk_sync_split_async(void);                                   // TOTK_SPLIT_ASYNC on
 // Submit the recorded prefix and wait for its dedicated fence, without advancing the full submission's timeline.
 // Replay thread, outside a render pass. Returns a fresh recording command buffer; old resources keep their lifetime.
 VkCommandBuffer vk_sync_split_wait(void);
@@ -606,6 +613,12 @@ int vkb_verify(uint32_t cls, uint32_t slot, VkSampler samp, VkImageView view, Vk
 VkBufferUsageFlags vkb_buf_usage(void);        // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT for every buffer a shader can read when the mode is requested, else 0
 int vkb_buf_mode(void);                        // 1 when bindless buffers are on (the shaders are record shaders and the device has bufferDeviceAddress)
 VkDeviceAddress vkb_buffer_address(VkBuffer buffer);   // cached vkGetBufferDeviceAddress
+void vkb_buffer_gone(void);                     // before a buffer is destroyed: the cached addresses are looked up again
+void vkb_buffer_gone_at(VkBuffer b, const char *site);   // the same for buffer b; TOTK_BDA_CHECK checks it is not in use
+int vkb_check(void);                            // TOTK_BDA_CHECK=1
+extern volatile uint64_t vkb_rec_fence;         // TOTK_BDA_CHECK: the submission whose draws are being recorded
+void vkb_check_stale(const char *what, uint64_t cached, uint64_t fresh, uint64_t a, uint64_t b);
+void vkb_check_log(uint64_t frame);
 uint64_t vkb_gen(void);                        // changes whenever a table slot is released (a cached slot number may be stale)
 void vkb_view_gone(VkImageView view);          // before the view is destroyed: its slots are freed and hold the stand-in
 void vkb_sampler_gone(VkSampler samp);

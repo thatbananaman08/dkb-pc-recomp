@@ -22,7 +22,9 @@ static volatile uint64_t head, tail;   // words published by the producer / cons
 static volatile int32_t sleeping;         // the recorder waits for wake_ev
 static PlatEvent wake_ev;              // auto-reset
 static uint64_t put_h;                 // producer: words written (published up to head)
-static VkCommandBuffer rec_cb;         // the part being recorded (set while the recorder is idle)
+static VkCommandBuffer rec_cb;         // producer: the part being recorded (set while the recorder is idle, or by rec_split_submit)
+static VkCommandBuffer cons_cb;        // consumer: the part the recorder records into (rec_begin, then each R_Submit)
+static volatile uint64_t split_issued, split_done;   // TOTK_SPLIT_ASYNC parts handed to / submitted by the recorder
 static int rec_live;                   // producer: rec_begin started the recorder for rec_cb
 static PlatThread *rec_thread;
 static int rec_prio;                   // the submitting thread's priority, which the recorder takes
@@ -39,7 +41,7 @@ enum {
     R_SetDepthWriteEnable, R_SetFrontFace, R_SetPrimitiveRestartEnable, R_SetPrimitiveTopology,
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
-    R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb, R_Crumb, R_Chunk,
+    R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb, R_Crumb, R_Chunk, R_Submit,
 };
 
 static uint64_t now_ns(void) { return plat_now_ns(); }
@@ -97,7 +99,7 @@ static void wait_space(uint64_t need) {
 // the chunk, makes its calls in order, and gives the buffer back. A packet never crosses a block (as in the ring).
 #define CHUNK_BLOCK_WORDS (1u << 16)
 typedef struct RecBlock { struct RecBlock *next; uint64_t used; uint64_t w[CHUNK_BLOCK_WORDS]; } RecBlock;
-struct RecChunk { RecBlock *blocks, *last, *cur; volatile int state; struct RecChunk *next_free; uint64_t packets; };
+struct RecChunk { RecBlock *blocks, *last, *cur; volatile int state; struct RecChunk *next_free; uint64_t packets; VkCommandBuffer cb; };
 static _Thread_local RecChunk *sink;
 static PlatMutex chunk_lock = PLAT_MUTEX_INIT;
 static RecChunk *chunk_free;
@@ -108,7 +110,7 @@ RecChunk *rec_chunk_alloc(void) {
     if (c) chunk_free = c->next_free;
     plat_mutex_unlock(&chunk_lock);
     if (!c && !(c = calloc(1, sizeof *c))) rt_fatal("vk_rec: out of memory");
-    c->next_free = NULL, c->cur = NULL, c->packets = 0;
+    c->next_free = NULL, c->cur = NULL, c->packets = 0, c->cb = rec_cb;   // the walk thread: the part the chunk belongs to
     __atomic_store_n(&c->state, 0, __ATOMIC_RELAXED);
     return c;
 }
@@ -212,7 +214,7 @@ void rec_begin(VkCommandBuffer cb) {
     RS_.parts++;
     if (!RT_KNOB_ON(mode)) return;
     RS_.parts_on++;
-    rec_cb = cb;   // the recorder is idle: rec_end drained it
+    rec_cb = cons_cb = cb;   // the recorder is idle: rec_end drained it
     rec_live = 1;
 }
 
@@ -248,6 +250,28 @@ int rec_end_cb(VkCommandBuffer cb, int crumb, uint64_t n) {
     return 1;
 }
 
+// TOTK_SPLIT_ASYNC (vk_sync.c vk_sync_split): the producer hands the part being recorded to the recorder, which ends and
+// submits it when it reaches this packet, begins `next` and records the rest into it. The submitting thread goes on at
+// once instead of waiting for the ring (and the split workers' chunks) to drain. Only the recorder touches the command
+// pool between rec_begin and rec_end; the producer's own calls on `next` go into the ring after this packet.
+typedef struct { VkCommandBuffer pro, next; uint64_t fence; } A_Submit;
+int rec_owns(VkCommandBuffer cb) { return !sink && rec_live && cb == rec_cb; }
+void rec_split_submit(VkCommandBuffer pro, VkCommandBuffer next, uint64_t fence) {
+    A_Submit *a = put(R_Submit, sizeof *a);
+    *a = (A_Submit){pro, next, fence};
+    split_issued++;
+    rec_cb = next;
+    pub();
+}
+// Waits until the recorder submitted every part handed to it (queue order against what the caller submits next).
+void rec_split_wait(void) {
+    for (int i = 0; __atomic_load_n(&split_done, __ATOMIC_ACQUIRE) != split_issued; i++) {
+        if (i == 0) { __atomic_store_n(&head, put_h, __ATOMIC_RELEASE); wake(); }
+        if (i < 20000) _mm_pause();
+        else plat_yield();
+    }
+}
+
 void rec_stats_log(void) {
     if (!(rt_trace & RT_TRACE_PERF) || !RS_.parts) return;
     rt_log("vk_rec: %llu of %llu parts recorded by the recorder: %llu packets (%.1f MiB), %llu drains (%llu for a call "
@@ -258,7 +282,8 @@ void rec_stats_log(void) {
     memset(&RS_, 0, sizeof RS_);
 }
 
-#define OWNED(cb) (rec_live && (cb) == rec_cb)
+// A split worker's chunk belongs to the part that was current when the walk thread made it (TOTK_SPLIT_ASYNC moves rec_cb on).
+#define OWNED(cb) (sink ? (cb) == sink->cb : rec_live && (cb) == rec_cb)
 // A call the ring takes no packet for: everything queued first, then the call here.
 #define FALLBACK() (sink ? rt_fatal("vk_rec: a call without a packet on a replay split worker") : (void)0, rec_drain(), RS_.fallbacks++)
 
@@ -629,7 +654,7 @@ static void exec_chunk(RecChunk *c) {
 }
 
 static void exec_packet(uint32_t op, void *p) {
-    VkCommandBuffer cb = rec_cb;
+    VkCommandBuffer cb = cons_cb;
     if (op == R_Chunk) { exec_chunk(*(RecChunk **)p); return; }
     rec_last_op[1] = rec_last_op[0], rec_last_op[0] = op;
     if (op == R_BindDescriptorSets) {
@@ -706,6 +731,18 @@ static void exec_packet(uint32_t op, void *p) {
     case R_BlendEquation: { A_Targets *a = p; ((PFN_vkCmdSetColorBlendEquationEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_WriteMask: { A_Targets *a = p; ((PFN_vkCmdSetColorWriteMaskEXT)a->fn)(cb, a->first, a->n, a->v); break; }
     case R_Crumb: { A_Crumb *a = p; vk_crumb(cb, a->kind, a->n); break; }
+    case R_Submit: {
+        A_Submit *a = p;
+        vkEndCommandBuffer(cb);
+        vk_sync_part_submit(a->pro, cb, a->fence);
+        VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        vkBeginCommandBuffer(a->next, &bi);
+        vk_crumb(a->next, VK_CRUMB_SUBMIT, a->fence);
+        cons_cb = a->next;
+        __atomic_add_fetch(&split_done, 1, __ATOMIC_RELEASE);
+        break;
+    }
     case R_EndCb: {
         A_EndCb *a = p;
         if (a->kind) vk_crumb(cb, a->kind, a->n);

@@ -559,8 +559,13 @@ static void fs_backtrace(const char *what, const char *path) {
     }
 }
 
+// Set at the first open of a stage's parameters (Bananza "content:/Stage/StageParam/<stage>..."): a save is loading.
+// The title screen opens none (2026-11-11 trace). input.c TOTK_SKIP_TITLE stops pressing A here.
+volatile int romfs_stage_opened;
+
 void fs_trace(const char *what, const char *path) {
     static double t0;
+    if (!romfs_stage_opened && path && strstr(path, "/Stage/StageParam/")) romfs_stage_opened = 1;
     fs_backtrace(what, path);
     if (!(rt_trace & RT_TRACE_FS)) return;
     if (!t0) t0 = now_s();

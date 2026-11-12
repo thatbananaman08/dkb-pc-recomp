@@ -1,0 +1,4 @@
+# Turns the camera with the right stick for 30 s once a stage has loaded and its intro has passed (with
+# TOTK_SKIP_TITLE=1 the stage loads near tick 1250). For checks of flickering draws while the view moves. Timings only.
+2700 RSTICK 22000 0 900
+3600 RSTICK -22000 0 900

@@ -34,6 +34,9 @@ int rec_chunk_active(void);
 uint64_t rec_chunk_packets(const RecChunk *c);
 void rec_chunk_publish(RecChunk *c);   // c is complete; the recorder may run it
 void rec_chunk_release(RecChunk *c);   // c was never enqueued
+int rec_owns(VkCommandBuffer cb);                              // cb is the part the recorder records, on the producer
+void rec_split_submit(VkCommandBuffer pro, VkCommandBuffer next, uint64_t fence);   // TOTK_SPLIT_ASYNC: the recorder ends, submits, begins next
+void rec_split_wait(void);                                      // every handed part is in the queue
 void rec_chunk_enqueue(RecChunk *c);   // the walk thread (producer): c's place in the call order             // TOTK_TRACE=perf: packets, bytes, drains and waits since the last call
 
 // Extension commands called through device function pointers.

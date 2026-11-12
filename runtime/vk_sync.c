@@ -457,7 +457,123 @@ static VkCommandBuffer split_impl(int wait) {
     return s->cb;
 }
 
+// The recorder thread (vk_rec.c R_Submit): submit a part handed to it by split_async. The uploads went first.
+void vk_sync_part_submit(VkCommandBuffer pro, VkCommandBuffer cb, uint64_t fence) {
+    VkCtx *c = vk_ctx();
+    VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
+                                        {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb}};
+    VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
+                        .pCommandBufferInfos = pro ? cbi : cbi + 1};
+    vk_queue_lock();
+    VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
+    vk_queue_unlock();
+    if (r != VK_SUCCESS) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: vkQueueSubmit2 of a part of value %llu failed (%d)", (unsigned long long)fence, (int)r);
+    }
+}
+
+// TOTK_SPLIT_ASYNC=1 (default off): a split does not wait for the recorder to drain. The walk thread claims the next
+// command buffer, flushes the uploads, and hands both parts to the recorder (rec_split_submit), which ends, submits and
+// begins them in ring order. Falls back to split_impl when the part is not the recorder's, the mirror prologue has copies
+// (its command buffer would be recorded beside the recorder's, from the same pool) or a new command buffer must be made.
+int vk_sync_split_async(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("TOTK_SPLIT_ASYNC");
+        on = e && *e ? atoi(e) : 0;   // 2: diagnostic, no wait for the earlier parts (uploads may pass them)
+        if (on) rt_log("vk: TOTK_SPLIT_ASYNC: the recorder submits split parts");
+    }
+    return on;
+}
+static struct { uint64_t wait, shadow, flush, n, fb_owner, fb_mirror, fb_slot, fb_ns; } SA;   // TOTK_TRACE=perf
+static void sa_log(void) {
+    if (!(rt_trace & RT_TRACE_PERF) || ++SA.n % 1000) return;
+    rt_log("perf: async split (us per split): earlier parts %.0f, shadow sync %.0f, upload flush + prologue %.0f; fallbacks: not the recorder's %llu, mirror prologue %llu, no slot %llu (%.0f us each)",
+           SA.wait / 1e6, SA.shadow / 1e6, SA.flush / 1e6, (unsigned long long)SA.fb_owner, (unsigned long long)SA.fb_mirror,
+           (unsigned long long)SA.fb_slot, SA.fb_owner + SA.fb_mirror + SA.fb_slot ? SA.fb_ns / 1e3 / (double)(SA.fb_owner + SA.fb_mirror + SA.fb_slot) : 0.0);
+    uint64_t n = SA.n;
+    memset(&SA, 0, sizeof SA);
+    SA.n = n;
+}
+// The mirror prologue of an async part, recorded by the walk thread while the recorder records into cmd_pool: a pool of its
+// own, used only here. VK_NULL_HANDLE: no copies; *full: no free command buffer (the caller falls back).
+#define PRO_SLOTS 32
+static VkCommandPool pro_pool;
+static struct { VkCommandBuffer cb; uint64_t fence; } pro_slot[PRO_SLOTS];
+static int npro;
+static VkCommandBuffer prologue_async(VkCtx *c, uint64_t fence, uint64_t gpu, int *full) {
+    *full = 0;
+    if (!vk_mem_mirror_pending()) return VK_NULL_HANDLE;
+    if (!pro_pool) {
+        VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = c->gfx_family};
+        if (vkCreateCommandPool(c->device, &pi, NULL, &pro_pool) != VK_SUCCESS) rt_fatal("vk: prologue command pool");
+    }
+    int i = 0;
+    while (i < npro && pro_slot[i].fence > gpu) i++;
+    if (i == npro) {
+        if (npro == PRO_SLOTS) return *full = 1, VK_NULL_HANDLE;
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pro_pool,
+                                          .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        if (vkAllocateCommandBuffers(c->device, &ai, &pro_slot[i].cb) != VK_SUCCESS) rt_fatal("vk: command buffer allocation");
+        npro++;
+    }
+    pro_slot[i].fence = fence;
+    VkCommandBuffer cb = pro_slot[i].cb;
+    VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkBeginCommandBuffer(cb, &bi);
+    int pair = ts_open(cb);
+    vk_mem_mirror_prologue(cb);
+    ts_close(cb, pair, fence, NULL);
+    vkEndCommandBuffer(cb);
+    return cb;
+}
+
+static VkCommandBuffer split_fallback(uint64_t *count) {
+    uint64_t t0 = plat_now_ns();
+    VkCommandBuffer cb = split_impl(0);
+    (*count)++, SA.fb_ns += plat_now_ns() - t0;
+    sa_log();
+    return cb;
+}
+static VkCommandBuffer split_async(void) {
+    VkCtx *c = vk_ctx();
+    VkCommandBuffer cb = slots[cur_slot].cb;
+    if (!rec_owns(cb)) return split_fallback(&SA.fb_owner);
+    uint64_t t0 = plat_now_ns();
+    if (vk_sync_split_async() != 2) rec_split_wait();   // the earlier parts are in the queue before this part's uploads
+    uint64_t t1 = plat_now_ns();
+    vk_mem_shadow_sync();      // shadow storage: the CPU's writes go in before the part is submitted
+    uint64_t t2 = plat_now_ns();
+    SA.wait += t1 - t0, SA.shadow += t2 - t1;
+    uint64_t gpu = 0;
+    vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
+    int i = 0;
+    while (i < nslots && slots[i].fence > gpu) i++;
+    if (i == nslots) return split_fallback(&SA.fb_slot);
+    int pi = 0;
+    while (pi < npro && pro_slot[pi].fence > gpu) pi++;
+    if (vk_mem_mirror_pending() && pi == npro && npro == PRO_SLOTS) return split_fallback(&SA.fb_mirror);
+    ts_end(cb, cur_fence);     // through the ring, into cb
+    uint64_t t3 = plat_now_ns();
+    vk_upload_flush(0);        // the uploads this part asked for precede it in queue order
+    int full;
+    VkCommandBuffer pro = prologue_async(c, cur_fence, gpu, &full);   // after the uploads, as split_impl orders them
+    SA.flush += plat_now_ns() - t3;
+    slots[i].fence = cur_fence, cur_slot = i;
+    VkCommandBuffer next = slots[i].cb;
+    rec_split_submit(pro, next, cur_fence);
+    ts_begin(next);            // the ring: after the recorder began next
+    sa_log();
+    return next;
+}
+
 VkCommandBuffer vk_sync_split(void) { return split_impl(0); }
+
+// vk_exec.c maybe_split: an early-submit part, handed to the recorder under TOTK_SPLIT_ASYNC.
+VkCommandBuffer vk_sync_split_part(void) { return vk_sync_split_async() ? split_async() : split_impl(0); }
 
 VkCommandBuffer vk_sync_split_wait(void) { return split_impl(1); }
 
@@ -615,6 +731,15 @@ uint64_t vk_sync_fence_done(void) { return __atomic_load_n(&done, __ATOMIC_ACQUI
 
 uint64_t vk_sync_issued(void) { return __atomic_load_n(&issued, __ATOMIC_ACQUIRE); }
 
+// Waits until value was submitted (its replay is done; the GPU may still be running it). nvnSyncWait's
+// TOTK_SYNC_EARLY / TOTK_SYNC_LATE_SMALL paths: the guest waits for the replay, not for the GPU.
+void vk_sync_wait_issued(uint64_t value) {
+    if (__atomic_load_n(&issued, __ATOMIC_ACQUIRE) >= value) return;
+    plat_mutex_lock(&st_lock);
+    while (__atomic_load_n(&issued, __ATOMIC_ACQUIRE) < value && !stop) plat_cond_wait(&cv_work, &st_lock);   // cv_work: broadcast on every submission
+    plat_mutex_unlock(&st_lock);
+}
+
 void vk_sync_finish(void) {
     vk_sync_start();
     vk_sync_fence_wait(__atomic_load_n(&issued, __ATOMIC_ACQUIRE), UINT64_MAX);
@@ -637,6 +762,8 @@ void vk_sync_shutdown(void) {
         plat_mutex_lock(&sub_lock);
         VkCtx *c = vk_ctx();
         if (c && cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
+        if (c && pro_pool) vkDestroyCommandPool(c->device, pro_pool, NULL);
+        pro_pool = VK_NULL_HANDLE, npro = 0;
         perf_gpu_stats = NULL;
         if (c && ts_pool) vkDestroyQueryPool(c->device, ts_pool, NULL);
         ts_pool = VK_NULL_HANDLE;

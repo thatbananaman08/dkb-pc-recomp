@@ -15,9 +15,11 @@
 #include "perfmon.h"
 #include "prof.h"
 #include "platform/platform.h"
+void mem_map_stats(uint64_t n[3], uint64_t bytes[3]);   // memory.c
 
 void ov_zstd_probe_log(uint64_t frame);
 void vkb_log(uint64_t frame);
+void vkb_check_log(uint64_t frame);
 
 volatile uint32_t prof_render_tid, prof_main_tid, prof_replay_tid;
 
@@ -248,6 +250,24 @@ static void perf_gpu_line(uint64_t frame, double interval_ms, double pace_share,
            (unsigned long long)frame, (unsigned long long)(last_faults ? vm.faults - last_faults : 0),
            last_faults ? (double)(vm.faults - last_faults) / n : 0.0, ws, vm.peak_resident / M, priv, vm.avail_phys / M, vm.total_phys / M,
            vm.commit_used / M, vm.commit_limit / M);
+    {   // exceptions seen by the first-chance handler (each also counts as a page fault when it is an access violation)
+        static uint64_t la, lv, lh;
+        uint64_t a, v, h;
+        plat_fault_counts(&a, &v, &h);
+        rt_log("perf: frame %llu: exceptions %.0f per frame (access violations %.0f, handled writes %.0f)", (unsigned long long)frame,
+               (double)(a - la) / n, (double)(v - lv) / n, (double)(h - lh) / n);
+        la = a, lv = v, lh = h;
+        static uint64_t lmn[3], lmb[3];
+        uint64_t mn[3], mb[3];
+        mem_map_stats(mn, mb);
+        rt_log("perf: frame %llu: guest mapping per frame: commit %.1f (%.2f MiB), decommit %.1f (%.2f MiB), protect %.1f (%.2f MiB)",
+               (unsigned long long)frame, (double)(mn[0] - lmn[0]) / n, (double)(mb[0] - lmb[0]) / n / 1048576.0,
+               (double)(mn[1] - lmn[1]) / n, (double)(mb[1] - lmb[1]) / n / 1048576.0, (double)(mn[2] - lmn[2]) / n,
+               (double)(mb[2] - lmb[2]) / n / 1048576.0);
+        for (int i = 0; i < 3; i++) lmn[i] = mn[i], lmb[i] = mb[i];
+    }
+    { char tc[2048]; if (plat_thread_cpu_report(tc, sizeof tc, (double)n)) rt_log("perf: frame %llu: thread cpu: %s", (unsigned long long)frame, tc); }
+    { char fw[2048]; if (plat_fault_watch_report(fw, sizeof fw)) rt_log("perf: frame %llu: fault watch: %s", (unsigned long long)frame, fw); }
     last_faults = vm.faults;
 }
 
@@ -349,6 +369,7 @@ void perf_present(uint64_t frame) {
     if (frame % 60) return;
     ov_zstd_probe_log(frame);
     vkb_log(frame);   // TOTK_BINDLESS_TEX
+    vkb_check_log(frame);   // TOTK_BDA_CHECK
     hostprof_log(frame);   // DKB_ZSTD_PROBE (ov_zstd_probe.c): one line per probed call site
     uint64_t span = now - win_start;
     int64_t win[PERF_CNT_N];

@@ -149,6 +149,7 @@ void vk_exec_set_worker(int on);
 void vk_exec_split_refused(void);                         // a worker was asked for something only the walk thread can do
 int vk_exec_oq_counting(void);                            // vk_exec_xfer.c: samples-passed counting is on
 void vk_exec_mt_join(VkExec *ex);
+void vk_exec_mt_flush(VkExec *ex);   // TOTK_SPLIT_ASYNC: the open split chunk into the ring, no wait (joins otherwise)
 VkBuffer vk_exec_inline_buffer(VkDeviceSize size);
 // vk_exec.c: the stand-in a 3D BC render target is drawn through goes with its image (vk_exec_image_gone).
 void vk_exec_bc_gone(VkImage image);

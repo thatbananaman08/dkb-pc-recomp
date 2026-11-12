@@ -1671,3 +1671,8 @@ long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     while (k < 0 && errno == EINTR);
     return (long)k;
 }
+
+// Windows-only diagnostics (win32.c): nothing to report here.
+size_t plat_fault_watch_report(char *out, size_t cap) { (void)out, (void)cap; return 0; }
+void plat_fault_counts(uint64_t *all, uint64_t *av, uint64_t *handled) { *all = *av = *handled = 0; }
+size_t plat_thread_cpu_report(char *out, size_t cap, double frames) { (void)out, (void)cap, (void)frames; return 0; }

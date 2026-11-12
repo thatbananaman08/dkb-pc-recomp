@@ -167,6 +167,8 @@ static VkResult synthetic_device_idle(VkDevice d) {
 }
 void vk_texture_shutdown(void) { check(scenario == SHUTDOWN, "shutdown uses an empty synthetic texture cache"); }
 void vkb_view_gone(VkImageView view) { (void)view; }
+void vkb_buffer_gone(void) {}   // vk_bindless.c: the address-cache generation (no bindless table in this fixture)
+void vkb_buffer_gone_at(VkBuffer b, const char *site) { (void)b, (void)site; }   // the same, per buffer
 
 #define cmd_pool memory_cmd_pool
 @MEMORY_FUNCTIONS@

@@ -28,7 +28,8 @@ How a run ended is one of:
                    or the reporter itself failing); the exit code says how (0xC0000005 access violation, 0xC00000FD stack
                    overflow, 0xC0000409 fast fail)
   device lost      Vulkan lost the device; the log has the VK_EXT_device_fault report when the driver gives one
-  hung             no exit within the time limit (seconds x 6 + 180 s); the process was killed
+  hung             no exit within the time limit (seconds x 6 + 180 s), or a log silent for STALL_S while the run was
+                   not over; before the kill, hang-stacks.txt gets every thread's stack (gdb attached, when installed)
   did not start    the exe could not be started (missing build, wrong path)
 Then the checks: a perf verdict (OK, HITCHY or SLOW, tools/perf_check.py); that the last frame is in the scene (its
 HUD band has bright pixels; a loading screen or fade has none, and then nothing about the picture is judged); and
@@ -146,6 +147,30 @@ NTSTATUS = {0xC0000005: 'access violation', 0xC00000FD: 'stack overflow', 0xC000
 
 
 EXIT_GRACE_S = 120   # a run that saved its last frame but has not exited this long after is killed and counted done
+STALL_S = 120   # the game logs perf lines every second while it runs; this long without a log write is a hang
+
+
+def hang_stacks(pid, out):
+    """Every thread's stack of the hung process into out (gdb attached in batch mode; host addresses, no symbols:
+    tools/hang_stacks.py names them from totk.map). Best effort: no gdb, or gdb failing, leaves a note."""
+    gdb = shutil.which('gdb')
+    if not gdb:
+        out.write_text('no gdb on PATH: no stacks\n', encoding='utf-8')
+        return
+    # Two snapshots 5 s apart: threads whose stacks stay put are blocked, ones that move are running (a livelock).
+    text = ''
+    for i in range(2):
+        if i:
+            time.sleep(5)
+        try:
+            r = subprocess.run([gdb, '-batch', '-nx', '-p', str(pid), '-ex', 'thread apply all bt 40'],
+                               capture_output=True, text=True, errors='replace', timeout=300, stdin=subprocess.DEVNULL)
+            text += f'==== snapshot {i + 1}\n' + r.stdout + r.stderr
+        except (OSError, subprocess.TimeoutExpired) as e:
+            text += f'==== snapshot {i + 1}\ngdb failed: {e}\n'
+    out.write_text(text, encoding='utf-8')
+
+
 GPUAV_SETTINGS = ROOT / 'tools' / 'vk_gpuav_safe.txt'
 VK_REPORT = re.compile(r'^\[host\] vk validation (error|warning): (.*)$', re.M)
 VK_SHADER = re.compile(r'Shader Module \(0x[0-9a-f]+\) \(internal ID (\d+)\)')
@@ -194,6 +219,8 @@ def ending(code, text, timed_out):
     lost = re.search(r'.*(device lost|VK_ERROR_DEVICE_LOST|failed \(-4\)).*', text)
     m = FATAL.search(text)
     if timed_out is True:
+        if 'scenario: hung (log silent)' in text:
+            return 'hung', f'log silent for {STALL_S} s; stacks in hang-stacks.txt; killed'
         return 'hung', 'no exit within the time limit; killed'
     if lost:
         fault = re.search(r'.*device fault address \d+: .*', text)
@@ -292,6 +319,9 @@ def run_env(s, env_extra, out, base):
     env['TOTK_INPUT_SCRIPT'] = str(ROOT / s['input'])
     env.update({k: str(v) for k, v in s['env'].items()})
     env.update({k: str(v) for k, v in env_extra.items()})
+    if (env.get('TOTK_SKIP_TITLE', '0') not in ('', '0') and Path(s['input']).name == 'dkb-title-to-save.txt'
+            and env.get('TOTK_INPUT_SCRIPT') == str(ROOT / s['input'])):   # an --env TOTK_INPUT_SCRIPT stays
+        del env['TOTK_INPUT_SCRIPT']   # the runtime presses through the title itself (runtime/input.c TOTK_SKIP_TITLE)
     for k in set(s['env']) | set(env_extra):
         env[k] = env[k].replace('{run}', str(out))
     env['TOTK_TRACE'] = ','.join(sorted(set(filter(None, env.get('TOTK_TRACE', '').split(',') + ['perf']))))
@@ -350,6 +380,7 @@ def run_once(s, exe, out, env_extra, args, warp=None):
         try:
             p = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
             finished = None   # when the game logged its end-of-run screenshot (runtime/boot.c)
+            last_size, last_write = -1, time.monotonic()
             while code is None:
                 try:
                     code = p.wait(timeout=5)
@@ -357,9 +388,18 @@ def run_once(s, exe, out, env_extra, args, warp=None):
                     now = time.monotonic()
                     if finished is None and b'boot: shot ' in (out / 'game.log').read_bytes()[-20000:]:
                         finished = now
-                    if now - start > limit or finished is not None and now - finished > EXIT_GRACE_S:
+                    size = (out / 'game.log').stat().st_size
+                    if size != last_size:
+                        last_size, last_write = size, now
+                    stalled = finished is None and now - last_write > STALL_S * (5 if args.safe_gpu else 1)
+                    if now - start > limit or stalled or finished is not None and now - finished > EXIT_GRACE_S:
                         # Under the validation layer the process can hang in its teardown after the run is over.
                         timed_out = 'exit' if finished is not None else True
+                        if timed_out is True:
+                            log.write(f'\nscenario: hung ({"log silent" if stalled else "time limit"}); '
+                                      'stacks in hang-stacks.txt\n')
+                            log.flush()
+                            hang_stacks(p.pid, out / 'hang-stacks.txt')
                         p.kill()
                         p.wait()
                         break
@@ -454,6 +494,9 @@ def main(argv=None):
                          'device loss with 3 at once may be the memory; confirm it with --jobs 1')
     ap.add_argument('--ab', metavar='VARIANTS', help='the scenario\'s [variants.<name>] table to alternate')
     ap.add_argument('--env', action='append', default=[], metavar='KEY=VALUE', help='extra environment for every run')
+    ap.add_argument('--skip-title', action='store_true',
+                    help='TOTK_SKIP_TITLE=1: the runtime presses A through the logos, title and save menu until the stage '
+                    'loads, instead of the timed title script (a scenario whose input is only dkb-title-to-save.txt)')
     ap.add_argument('--seconds', type=float, help="override the scenario's game time")
     ap.add_argument('--keep-profile', action='store_true', help='keep the run\'s profile copy (for a save to inspect)')
     ap.add_argument('--force', action='store_true', help='run even while another game process is running')
@@ -494,6 +537,8 @@ def main(argv=None):
     extra = {}
     if a.safe_gpu:
         a.env = safe_gpu_env() + a.env
+    if a.skip_title:
+        a.env = a.env + ['TOTK_SKIP_TITLE=1']
     for item in a.env:
         k, sep, v = item.partition('=')
         if not sep:

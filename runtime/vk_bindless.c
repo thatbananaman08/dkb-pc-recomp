@@ -249,15 +249,111 @@ int vkb_buf_mode(void) {
     return buf_requested() && gfx_shader_bindless_buf() && vkb_mode() == 1 && vkb_buf_usage();
 }
 
-typedef struct { VkBuffer buffer; VkDeviceAddress address; } AddrCache;
+// A per-thread cache of buffer device addresses. A destroyed buffer's handle can come back for a new buffer at another address,
+// so every destroy of a buffer that may have been looked up bumps addr_gen (vkb_buffer_gone) and entries of an older generation
+// are looked up again. Without it, a replay worker (TOTK_REPLAY_SPLIT) kept the address of a freed uniform scratch chunk: the
+// workers' own command-buffer resources overflow the spare chunk list, so chunks are destroyed and made every frame, and draws
+// read their uniforms from the wrong memory (black glow quads and black terrain chips on Hill, 2026-11-11).
+typedef struct { VkBuffer buffer; VkDeviceAddress address; uint64_t gen; } AddrCache;
 static _Thread_local AddrCache addr_cache[512];
+static uint64_t addr_gen = 1;
+
+// ---- TOTK_BDA_CHECK=1 (diagnosis of lost devices with bindless buffers): every buffer whose device address a draw record
+// takes is noted with the submission being recorded (vkb_rec_fence); a destroy of such a buffer before the GPU has reached
+// that submission is logged with its site, and every address served from a cache is compared with a fresh resolve. Both
+// mean a draw may read memory that is gone or another buffer's. Counts in vkb_check_log.
+volatile uint64_t vkb_rec_fence;
+static int check_on = -1;
+static PlatMutex chk_lock = PLAT_MUTEX_INIT;
+#define CHK_N (1u << 16)
+static struct { VkBuffer b; uint64_t fence; } *chk;   // open addressing; a full table stops noting
+static uint64_t chk_uses, chk_early, chk_stale, chk_full;
+int vkb_check(void) {
+    if (check_on < 0) {
+        const char *e = getenv("TOTK_BDA_CHECK");
+        int on = e && atoi(e) == 1;
+        if (on && !(chk = calloc(CHK_N, sizeof *chk))) on = 0;
+        if (on) rt_log("bindless: TOTK_BDA_CHECK: buffer lifetimes and cached device addresses are checked");
+        check_on = on;
+    }
+    return check_on;
+}
+static uint32_t chk_slot(VkBuffer b) { return (uint32_t)(((uint64_t)(uintptr_t)b * 0x9E3779B97F4A7C15ull) >> 48); }
+static void chk_note(VkBuffer b) {
+    uint64_t f = __atomic_load_n(&vkb_rec_fence, __ATOMIC_RELAXED);
+    plat_mutex_lock(&chk_lock);
+    chk_uses++;
+    uint32_t i = chk_slot(b), n = 0;
+    while (chk[i].b && chk[i].b != b && n < CHK_N) i = (i + 1) & (CHK_N - 1), n++;
+    if (n == CHK_N) chk_full++;
+    else if (chk[i].b != b || chk[i].fence < f) chk[i].b = b, chk[i].fence = f;
+    plat_mutex_unlock(&chk_lock);
+}
+
+void vkb_buffer_gone_at(VkBuffer b, const char *site) {
+    __atomic_add_fetch(&addr_gen, 1, __ATOMIC_RELEASE);
+    if (check_on <= 0 || !b) return;
+    plat_mutex_lock(&chk_lock);
+    uint32_t i = chk_slot(b), n = 0;
+    while (chk[i].b && chk[i].b != b && n < CHK_N) i = (i + 1) & (CHK_N - 1), n++;
+    uint64_t f = n < CHK_N && chk[i].b == b ? chk[i].fence : 0;
+    if (f) {   // remove, keeping the probe chains intact (backward-shift deletion)
+        uint32_t j = i;
+        for (;;) {
+            chk[i].b = VK_NULL_HANDLE, chk[i].fence = 0;
+            int moved = 0;
+            for (;;) {
+                j = (j + 1) & (CHK_N - 1);
+                if (!chk[j].b) break;
+                uint32_t h = chk_slot(chk[j].b);
+                if (i <= j ? (h <= i || h > j) : (h <= i && h > j)) { moved = 1; break; }
+            }
+            if (!moved) break;
+            chk[i] = chk[j], i = j;
+        }
+    }
+    plat_mutex_unlock(&chk_lock);
+    if (!f) return;
+    uint64_t gpu = 0;
+    vkGetSemaphoreCounterValue(vk_ctx()->device, vk_ctx()->timeline, &gpu);
+    if (gpu < f) {
+        uint64_t k = __atomic_add_fetch(&chk_early, 1, __ATOMIC_RELAXED);
+        if (k <= 40)
+            rt_log("bindless check: buffer %#llx destroyed (%s) while submission %llu, whose draws took its address, is not done "
+                   "on the GPU (at %llu)", (unsigned long long)(uintptr_t)b, site, (unsigned long long)f, (unsigned long long)gpu);
+    }
+}
+void vkb_buffer_gone(void) { __atomic_add_fetch(&addr_gen, 1, __ATOMIC_RELEASE); }
+
+void vkb_check_log(uint64_t frame) {
+    if (check_on <= 0) return;
+    rt_log("bindless check %llu: %llu address uses noted, %llu buffers destroyed in use, %llu stale cached addresses, table full %llu",
+           (unsigned long long)frame, (unsigned long long)chk_uses, (unsigned long long)chk_early, (unsigned long long)chk_stale,
+           (unsigned long long)chk_full);
+}
+void vkb_check_stale(const char *what, uint64_t cached, uint64_t fresh, uint64_t a, uint64_t b) {
+    uint64_t k = __atomic_add_fetch(&chk_stale, 1, __ATOMIC_RELAXED);
+    if (k <= 40)
+        rt_log("bindless check: stale %s: cached %#llx, fresh %#llx (%#llx %#llx)", what, (unsigned long long)cached,
+               (unsigned long long)fresh, (unsigned long long)a, (unsigned long long)b);
+}
 
 VkDeviceAddress vkb_buffer_address(VkBuffer buffer) {
     AddrCache *e = &addr_cache[((uintptr_t)buffer * 0x9E3779B97F4A7C15ull) >> 55];
-    if (e->buffer == buffer) return e->address;
+    uint64_t gen = __atomic_load_n(&addr_gen, __ATOMIC_ACQUIRE);
+    int chk_now = check_on > 0 || (check_on < 0 && vkb_check());
+    if (chk_now && buffer) chk_note(buffer);
+    if (e->buffer == buffer && e->gen == gen) {
+        if (chk_now) {
+            VkBufferDeviceAddressInfo ci = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = buffer};
+            VkDeviceAddress f = vkGetBufferDeviceAddress(vk_ctx()->device, &ci);
+            if (f != e->address) vkb_check_stale("buffer address", e->address, f, (uint64_t)(uintptr_t)buffer, gen);
+        }
+        return e->address;
+    }
     VkBufferDeviceAddressInfo ai = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = buffer};
     VkDeviceAddress a = vkGetBufferDeviceAddress(vk_ctx()->device, &ai);
-    *e = (AddrCache){buffer, a};
+    *e = (AddrCache){buffer, a, gen};
     return a;
 }
 

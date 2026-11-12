@@ -58,7 +58,38 @@ static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
 // applied once. In a script with timed lines (a recording) the untimed ones belong before the world clock: they stop
 // when it starts, as the load ends at another tick in each run.
 // at, hold: ticks, or microseconds of the world clock when timed.
-typedef struct { uint64_t at, hold; int bit, stick, timed; int32_t x, y; int logged; char text[48]; } ScriptEv;
+typedef struct { uint64_t at, hold; int bit, stick, timed, staged, scened; int32_t x, y; int logged; char text[48]; } ScriptEv;
+// A line "S<ms> ..." is timed on the stage clock instead: milliseconds of the world clock since the game began loading a
+// stage (romfs.c romfs_stage_opened), so a recording made with TOTK_SKIP_TITLE replays at the same point of the stage
+// whatever the boot and title took. TOTK_INPUT_RECORD writes S lines once a stage is loading.
+extern volatile int romfs_stage_opened;
+static int64_t stage_w = -1;   // the world clock when the stage began loading, -1 before
+static int64_t stage_clock(int64_t w) {
+    if (stage_w < 0 && w >= 0 && romfs_stage_opened) stage_w = w;
+    return stage_w < 0 || w < 0 ? -1 : w - stage_w;
+}
+// A line "F<ticks> ..." (hold in ticks) is timed on the scene clock: 60 Hz ticks of game time (frame_step_ticks) since
+// the first frame that drew the stage, one that replayed SCENE_DRAWS draws after the stage began loading. With
+// TOTK_FIXED_STEP the game's time advances the same in every run, so F lines replay a recorded path; loading and its
+// screens, whose length varies, come before the anchor. TOTK_INPUT_RECORD writes F lines once the scene was drawn.
+#define SCENE_DRAWS 1500
+__attribute__((weak)) uint64_t vk_exec_draws_total(void);   // vk_exec.c; absent without the Vulkan back end
+static volatile int64_t scene_tick = -1;
+// Once per present (frame_rate.c frame_step_present): the draws since the previous present decide the anchor. The game
+// polls input several times a frame, so the input path itself sees only part of a frame's draws.
+void input_frame_presented(void) {
+    static uint64_t last_draws;
+    if (scene_tick >= 0 || !vk_exec_draws_total) return;
+    uint64_t d = vk_exec_draws_total(), tick = frame_step_ticks();
+    if (romfs_stage_opened && last_draws && d - last_draws >= SCENE_DRAWS) {
+        scene_tick = (int64_t)tick;
+        rt_log("input: the scene is drawn at tick %llu (%llu draws in a frame): F lines start here", (unsigned long long)tick,
+               (unsigned long long)(d - last_draws));
+    }
+    last_draws = d;
+}
+static int64_t scene_clock(uint64_t tick) { return scene_tick < 0 ? -1 : (int64_t)tick - scene_tick; }
+int64_t input_scene_ticks(void) { return scene_clock(frame_step_ticks()); }   // boot.c TOTK_END_SCENE_TICKS
 static const struct { const char *name; int bit; } script_buttons[] = {
     {"A", B_A}, {"B", B_B}, {"X", B_X}, {"Y", B_Y}, {"LCLICK", B_STICK_L}, {"RCLICK", B_STICK_R}, {"L", B_L}, {"R", B_R},
     {"ZL", B_ZL}, {"ZR", B_ZR}, {"PLUS", B_PLUS}, {"MINUS", B_MINUS}, {"LEFT", B_LEFT}, {"UP", B_UP}, {"RIGHT", B_RIGHT}, {"DOWN", B_DOWN},
@@ -81,11 +112,13 @@ static void script_load(void) {
         if (h) *h = 0;
         char name[32];
         double at;
-        int off = 0, timed = line[0] == '@';
-        if (sscanf(line + timed, "%lf %31s%n", &at, name, &off) < 2 || at < 0) continue;
-        off += timed;
-        double unit = timed ? 1000.0 : 1.0;   // ms to us, or presents
-        ScriptEv e = {.at = (uint64_t)(at * unit + 0.5), .hold = timed ? 66667 : 4, .bit = -1, .timed = timed};
+        int off = 0, timed = line[0] == '@' || line[0] == 'S', staged = line[0] == 'S', scened = line[0] == 'F';
+        int skip = timed || scened;
+        if (sscanf(line + skip, "%lf %31s%n", &at, name, &off) < 2 || at < 0) continue;
+        off += skip;
+        double unit = timed ? 1000.0 : 1.0;   // ms to us, or ticks
+        ScriptEv e = {.at = (uint64_t)(at * unit + 0.5), .hold = timed ? 66667 : 4, .bit = -1, .timed = timed, .staged = staged,
+                      .scened = scened};
         long a, b;
         double c;
         if (!strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
@@ -113,15 +146,35 @@ static void script_load(void) {
     rt_log("input: script %s, %d events", path, script_n);
 }
 
+// TOTK_SKIP_TITLE=1 (default off): from about 2 s after the first present, presses A for 4 ticks every 30 ticks (half a
+// second) until the game opens a stage's parameters (romfs.c romfs_stage_opened: the save is loading), so the logos,
+// the title and the save menu pass with the first slot chosen, and no press reaches gameplay. Gives up after 6000
+// ticks (100 s of game time). Bananza 1.0.0: the stage load starts at the second accepted press.
+extern volatile int romfs_stage_opened;
+static void skip_title_apply(uint64_t *b) {
+    static int on = -1, done;
+    if (on < 0) on = cfg_bool("TOTK_SKIP_TITLE");
+    if (!on || done) return;
+    uint64_t tick = frame_step_ticks();
+    if (romfs_stage_opened || tick > 6000) {
+        done = 1;
+        rt_log("input: TOTK_SKIP_TITLE: %s at tick %llu", romfs_stage_opened ? "the stage is loading, presses stop" : "no stage after 6000 ticks, presses stop",
+               (unsigned long long)tick);
+        return;
+    }
+    if (tick >= 120 && (tick - 120) % 30 < 4) *b |= 1ull << B_A;
+}
+
 static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
+    skip_title_apply(b);
     if (!script_state) script_load();
     if (!script_n) return;
     uint64_t fr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), tick = frame_step_ticks();
-    int64_t w = frame_step_world_us();
+    int64_t w = frame_step_world_us(), sw = stage_clock(w), st = scene_clock(tick);
     for (int i = 0; i < script_n; i++) {
         ScriptEv *e = &script_ev[i];
-        if (e->timed ? w < 0 : script_mixed && w >= 0) continue;
-        uint64_t now = e->timed ? (uint64_t)w : tick;
+        if (e->scened ? st < 0 : e->staged ? sw < 0 : e->timed ? w < 0 : script_mixed && w >= 0) continue;
+        uint64_t now = e->scened ? (uint64_t)st : e->staged ? (uint64_t)sw : e->timed ? (uint64_t)w : tick;
         if (now < e->at || (now >= e->at + e->hold && (e->logged || !e->timed))) continue;
         if (!e->logged) {
             e->logged = 1;
@@ -149,7 +202,12 @@ static int64_t rec_last_w = -1;      // the world clock at the previous apply
 
 // "<tick> <what> <hold>" or "@<ms> <what> <hold ms>": from tick from and world clock from_w to now.
 static void rec_line(uint64_t from, int64_t from_w, uint64_t fr, int64_t w, const char *what) {
-    if (from_w >= 0 && w >= from_w)
+    if (scene_tick >= 0 && (int64_t)from >= scene_tick)   // on the scene clock, in ticks
+        fprintf(rec, "F%llu %s %llu\n", (unsigned long long)(from - (uint64_t)scene_tick), what,
+                (unsigned long long)(fr > from ? fr - from : 1));
+    else if (from_w >= 0 && w >= from_w && stage_w >= 0 && from_w >= stage_w)   // on the stage clock
+        fprintf(rec, "S%.1f %s %.1f\n", (from_w - stage_w) / 1000.0, what, (w > from_w ? w - from_w : 1000) / 1000.0);
+    else if (from_w >= 0 && w >= from_w)
         fprintf(rec, "@%.1f %s %.1f\n", from_w / 1000.0, what, (w > from_w ? w - from_w : 1000) / 1000.0);
     else
         fprintf(rec, "%llu %s %llu\n", (unsigned long long)from, what, (unsigned long long)(fr > from ? fr - from : 1));
@@ -186,6 +244,8 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
     if (rec_state != 1) return;
     uint64_t fr = frame_step_ticks();
     int64_t w = frame_step_world_us();
+    stage_clock(w);
+    scene_clock(fr);
     int wrote = 0;
     if (w >= 0 && rec_last_w < 0) {   // the world clock starts: what is held goes on as timed events from @0
         for (int i = 0; i < 16; i++)

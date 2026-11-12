@@ -555,7 +555,13 @@ static int read_nowait(uint64_t addr, uint64_t size, uint64_t f) {
         enabled = !rt_game_version && cfg_bool("TOTK_NX2_READ_NOWAIT");
         __atomic_store_n(&on, enabled, __ATOMIC_RELEASE);
     }
-    if (!enabled || size > NOWAIT_MAX) return 0;
+    static uint64_t max = 0;
+    if (!max) {   // TOTK_NX2_READ_NOWAIT_MAX=<bytes>: reads up to this size take the deferred write-back (default NOWAIT_MAX)
+        const char *e = getenv("TOTK_NX2_READ_NOWAIT_MAX");
+        uint64_t v = e && *e ? strtoull(e, NULL, 0) : 0;
+        max = v ? v : NOWAIT_MAX;
+    }
+    if (!enabled || size > max) return 0;
     static PlatMutex m = PLAT_MUTEX_INIT;
     static NowaitSeen seen[NOWAIT_SEEN];
     static unsigned next;
@@ -586,11 +592,28 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
             plat_mutex_lock(&rl);
             dr_waits[DR_GUEST_READ]++, dr_twaits[DR_GUEST_READ]++;
             dr_ns[DR_GUEST_READ] += d, dr_tns[DR_GUEST_READ] += d;
+            static unsigned logged;
+            if (logged < 24 && (rt_trace & RT_TRACE_PERF))   // which reads wait (TOTK_NX2_READ_NOWAIT covers up to NOWAIT_MAX)
+                logged++, rt_log("vk: guest read waited %.2f ms: %#llx + %llu bytes", d / 1e6, (unsigned long long)addr, (unsigned long long)size);
             plat_mutex_unlock(&rl);
         }
     }
+    uint64_t w0 = (rt_trace & RT_TRACE_PERF) ? kern_now_ns() : 0;
     vk_present_drain();
     vk_texture_write_back(addr, size);
+    if (w0) {   // TOTK_TRACE=perf: the synchronous read-backs a guest read still pays for
+        static uint64_t wb_n, wb_ns, wb_bytes, wb_logged;
+        uint64_t d = kern_now_ns() - w0;
+        plat_mutex_lock(&rl);
+        wb_n++, wb_ns += d, wb_bytes += size;
+        if (d > 300000 && wb_logged < 24)
+            wb_logged++, rt_log("vk: guest read write-back %.2f ms: %#llx + %llu bytes", d / 1e6, (unsigned long long)addr,
+                                (unsigned long long)size);
+        if (wb_n % 2000 == 0)
+            rt_log("vk: guest read write-backs: %llu, %.2f ms each, %.1f KiB each", (unsigned long long)wb_n,
+                   wb_ns / 1e6 / (double)wb_n, wb_bytes / 1024.0 / (double)wb_n);
+        plat_mutex_unlock(&rl);
+    }
 }
 // After a fence wait: the value is done, so its replay is too; a later submission the replay records meanwhile marks
 // its targets with a later fence, which write_back_small leaves alone. No drain.

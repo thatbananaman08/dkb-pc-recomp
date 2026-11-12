@@ -38,6 +38,7 @@ int probe_cfg(void) {
         "last = no newline at the end";
     plat_setenv("TOTK_LOCALE", NULL);
     plat_setenv("TOTK_FPS60", NULL);
+    plat_setenv("TOTK_REALTIME", NULL);   // cfg_init puts Bananza's speed defaults in the environment, which wins over the ini
     CHECK(plat_file_write(path, ini, sizeof ini - 1), "write the probe ini");
     CHECK(cfg_load(path) == 1, "load the probe ini");
     CHECK(EQ(cfg_get("TOTK_FPS60"), "0"), "value read, whitespace trimmed, lower-case key");

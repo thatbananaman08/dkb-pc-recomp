@@ -24,6 +24,11 @@ class InstallerTest(unittest.TestCase):
     def setUp(self):
         self.work = tempfile.TemporaryDirectory()
         self.addCleanup(self.work.cleanup)
+        # The installer's free-space check (dkb.space) asks for a real install's ~13 GB; these synthetic installs are
+        # tiny, so the disk the test runs on reports plenty of room. A test that checks the space error patches this again.
+        space = patch.object(b.shutil, 'disk_usage', return_value=SimpleNamespace(total=1 << 50, used=0, free=1 << 50))
+        space.start()
+        self.addCleanup(space.stop)
         # Resolved, like the installer's own paths: a TEMP with an 8.3 short name (C:\Users\RUNNER~1 on GitHub's
         # Windows runners) would otherwise never compare equal to the long form the installer resolves it to.
         base = Path(self.work.name).resolve()

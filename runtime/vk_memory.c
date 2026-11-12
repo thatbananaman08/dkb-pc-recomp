@@ -234,6 +234,8 @@ static PoolRec *phys_find(const pool_t *key) {
 }
 
 static void destroy_rec(VkCtx *c, PoolRec *r) {
+    vkb_buffer_gone_at(r->mbuf, "pool mirror");
+    vkb_buffer_gone_at(r->buf, "pool buffer");
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
@@ -697,6 +699,11 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
 #define GEN_CHUNKS (RT_ADDRESS_LIMIT >> GEN_CHUNK_SHIFT)
 #define GEN_PER_CHUNK (1u << (GEN_CHUNK_SHIFT - GEN_PAGE_SHIFT))
 static uint32_t *gen_chunk[GEN_CHUNKS];
+// TOTK_MIRROR_WB_CLEAN: per page, the generation of the last stamp that came from a mirror's own write-back while the
+// mirror already held every earlier write of that page (wb_written). mirror_sync skips a page whose stamp is that one.
+static uint32_t *wb_chunk[GEN_CHUNKS];
+static int wb_clean = -1;
+static uint64_t wb_skipped_pages;   // gen_lock: pages mirror_sync skipped (TOTK_TRACE=perf)
 static uint32_t gen_now;                 // last generation handed out
 static PlatMutex gen_lock = PLAT_MUTEX_INIT;
 static uint64_t gen_pages[1024];
@@ -774,6 +781,28 @@ static void stamp_page(uint64_t a, uint32_t g) {
 
 static void stamp_range(uint64_t lo, uint64_t hi, uint32_t g) {
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page(a, g);
+}
+
+// A completed submission's write-back from mirror r: the pages are stamped like any write (textures and other
+// consumers see the change), and those the mirror was already current on are marked, since the mirror holds what the
+// write-back put there. A later CPU write gets a newer stamp from the write-watch query and is copied as usual.
+static void wb_written(PoolRec *r, uint64_t addr, uint64_t size) {
+    uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+    plat_mutex_lock(&gen_lock);
+    uint32_t g = ++gen_now, mgen = r->mgen;
+    for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) {
+        uint32_t *s = gen_slot(a, 1);
+        if (!s) continue;
+        int clean = *s <= mgen;
+        stamp_page(a, g);
+        uint64_t ci = a >> GEN_CHUNK_SHIFT;
+        if (!wb_chunk[ci]) {
+            if (!clean) continue;
+            if (!(wb_chunk[ci] = calloc(GEN_PER_CHUNK, sizeof(uint32_t)))) rt_fatal("vk: out of memory for write-back pages");
+        }
+        wb_chunk[ci][(a >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] = clean ? g : 0;
+    }
+    plat_mutex_unlock(&gen_lock);
 }
 
 void vk_guest_written(uint64_t addr, uint64_t size) {
@@ -1110,6 +1139,20 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
             if (spend[i].lo == addr && spend[i].hi == addr + size) { spend[i] = spend[--nspend]; break; }
         plat_mutex_unlock(&shadow_lock);
         plat_mutex_unlock_shared(&pool_lock);
+    }
+    if (wb_clean < 0) {
+        const char *e = getenv("TOTK_MIRROR_WB_CLEAN");
+        wb_clean = e && *e && strcmp(e, "0") != 0;
+        if (wb_clean) rt_log("mem: TOTK_MIRROR_WB_CLEAN: a mirror's own write-back does not make its pages stale");
+    }
+    if (wb_clean && vk_mirror_on && size && !nvn_gpu_only(addr)) {
+        plat_mutex_lock_shared(&pool_lock);
+        const pidx_ent *e = pidx_find(&pool_index, addr, size);
+        PoolRec *r = e ? e->buf : NULL;
+        int mirrored = r && r->mstate == MS_ON && addr >= r->import_lo && addr + size <= r->import_hi;
+        if (mirrored) wb_written(r, addr, size);
+        plat_mutex_unlock_shared(&pool_lock);
+        if (mirrored) return;
     }
     vk_guest_written(addr, size);
 }
@@ -1453,6 +1496,10 @@ static void mirror_create(PoolRec *r) {
     plat_mutex_unlock(&pool_lock);
     r->acc_sub = msub;
     r->mstate = MS_ON;
+    // Again now the pool resolves to the mirror: the bump at the top marked the window in which it reads as refused, and
+    // a resolve made in that window (another replay thread's) was cached under the newer generation with the import
+    // buffer's address; TOTK_BDA_CHECK found such stale storage record addresses on Hill (2026-11-11).
+    __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     range_add(&pend, &npend, &cpend, r, 0, n);
     mrep.first_n++, mrep.first_bytes += n;
     plat_inc64(&m_live_n);
@@ -1515,9 +1562,13 @@ static void mirror_sync(PoolRec *r) {
         if (b > hi) b = hi;
         const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if (!ch) continue;
-        for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT)
-            if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since)
-                range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT);
+        const uint32_t *wb = wb_chunk[a >> GEN_CHUNK_SHIFT];
+        for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT) {
+            uint32_t idx = (uint32_t)((x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)), st = ch[idx];
+            if (st <= since) continue;
+            if (wb && wb[idx] == st) { wb_skipped_pages++; continue; }   // its newest stamp is this mirror's own write-back
+            range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT);
+        }
     }
     r->mgen = gen_now;
     if (excl) plat_mutex_unlock(&gen_lock);
@@ -1554,7 +1605,7 @@ void vk_mem_use(VkMemSpan *sp) {
     if (vk_mem_worker && vk_mem_use_ready(sp)) return;   // nothing to create or sync: no lock
     SPLIT_LOCK();
     PoolRec *r = sp->pool;
-    if (r->mstate == MS_NONE) mirror_create(r);
+    if (r->mstate == MS_NONE) { uint64_t t0 = plat_now_ns(); mirror_create(r); mt_ns[MTNS_MIRROR] += plat_now_ns() - t0; }
     if (r->mstate == MS_ON) {
         if (r->acc_sub != msub) mirror_sync(r);
         sp->buffer = r->mbuf;
@@ -1818,6 +1869,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
 static void mirror_log(uint64_t frame) {
     static uint64_t last, ww_last;
     plat_mutex_lock(&gen_lock);
+    if (wb_clean > 0) rt_log("mem: mirror frame %llu: pages skipped as their mirror's own write-back: %llu", (unsigned long long)frame, (unsigned long long)wb_skipped_pages), wb_skipped_pages = 0;
     uint64_t wc = ww_calls, wb = ww_bytes, wt = ww_ticks, dc = ww_dirty_calls, dt = ww_dirty_ticks, wp = ww_pages;
     ww_pages = 0;
     uint64_t nr = n_frz_refused;
@@ -2054,7 +2106,7 @@ static void collect_locked(VkCtx *c) {
             vkb_view_gone((VkImageView)(uintptr_t)d->handle);   // TOTK_BINDLESS_TEX: its table slots hold the stand-in from now on
             vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL);
             break;
-        case DEAD_BUFFER_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
+        case DEAD_BUFFER_VMA: vkb_buffer_gone_at((VkBuffer)(uintptr_t)d->handle, "deferred buffer"), vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
         }
     }
     ndead = k;

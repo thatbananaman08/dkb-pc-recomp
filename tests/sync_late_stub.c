@@ -5,6 +5,8 @@
 #include <stdint.h>
 
 uint64_t vk_sync_issued(void) { return 0; }
+void vk_sync_wait_issued(uint64_t value) { (void)value; }
+uint64_t plat_now_ns(void) { return 0; }
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns) { (void)value, (void)timeout_ns; return 1; }
 int vk_texture_small_dirty_class(uint64_t fence, uint64_t tiny) { (void)fence, (void)tiny; return 2; }
 void vk_texture_write_back_small(uint64_t fence) { (void)fence; }

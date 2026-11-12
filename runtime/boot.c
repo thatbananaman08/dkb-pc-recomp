@@ -302,11 +302,17 @@ static void series_shot(const tex_t *t, uint64_t n) {
 // A --seconds run ends at the first present after the world clock (game time since the save's first frame,
 // frame_step_world_us) passed S seconds, so a run covers the same game time at any frame rate; any other frame is
 // counted by the back end only.
+// TOTK_END_SCENE_TICKS=<n> (testing): a --seconds run also ends n 60 Hz ticks after the scene was first drawn
+// (input.c scene clock), so replays of a recorded path end, and take their --shot, at the same game time.
+int64_t input_scene_ticks(void);   // input.c: ticks since the scene was first drawn, -1 before
 void rt_frame_presented(const tex_t *t, uint64_t n) {
     const RtConfig *cfg = rt_config();
     series_shot(t, n);
+    static long end_ticks = -1;
+    if (end_ticks < 0) { const char *e = getenv("TOTK_END_SCENE_TICKS"); end_ticks = e && *e ? atol(e) : 0; }
     int64_t w = cfg->seconds ? frame_step_world_us() : -1;
-    if (w < 0 || (double)w < cfg->seconds * 1e6) return;
+    int64_t st = cfg->seconds && end_ticks > 0 ? input_scene_ticks() : -1;
+    if (!(st >= 0 && st >= end_ticks) && (w < 0 || (double)w < cfg->seconds * 1e6)) return;
     if (cfg->shot) save_shot(t, cfg->shot);
     GfxStats g = gfx_stats();
     rt_logf("boot: frames %llu presented (nvn calls %llu, distinct %llu, unimplemented %llu, validation errors %llu, "

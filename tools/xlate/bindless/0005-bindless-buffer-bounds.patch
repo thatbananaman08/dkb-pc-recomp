@@ -1,0 +1,134 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -48,6 +48,10 @@
+         public Instruction BindlessPushU64Pointer { get; set; }
+         public int BindlessRecordTexMember { get; set; }
+         public int BindlessBufferCount { get; set; }
++        // Record member of the first buffer size (after the addresses and the texture slots), and per buffer binding the byte offset
++        // and array stride of each field: indexes into a field's array are clamped to the buffer's size (bounds of bindless buffers).
++        public int BindlessRecordSizeMember { get; set; }
++        public Dictionary<int, (int[] Offsets, int[] Strides)> BindlessFieldLayout { get; } = new();
+ 
+         public bool IsBindlessBuffers =>
+             HostCapabilities.BindlessBufferRecord >= 0 &&
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -163,6 +163,16 @@
+ 
+                 if (context.BindlessBufferRank != null && context.BindlessBufferRank.ContainsKey(buffer.Binding))
+                 {
++                    int[] strides = new int[buffer.Type.Fields.Length];
++
++                    for (int fieldIndex = 0; fieldIndex < strides.Length; fieldIndex++)
++                    {
++                        StructureField field = buffer.Type.Fields[fieldIndex];
++                        strides[fieldIndex] = field.Type.HasFlag(AggregateType.Array) ? (field.Type.GetSizeInBytes() + alignmentMask) & ~alignmentMask : 0;
++                    }
++
++                    context.BindlessFieldLayout[buffer.Binding] = (structFieldOffsets, strides);
++
+                     // No variable: the buffer is a PhysicalStorageBuffer64 pointer loaded from the record where it is used.
+                     context.BindlessBufferTypes.Add(buffer.Binding, structType);
+                     continue;
+@@ -398,6 +408,15 @@
+                 offsets.Add(buffers * 8 + i * 4);
+             }
+ 
++            // Then the size in bytes of each buffer (the range the descriptor path would bind): array indexes are clamped to it.
++            context.BindlessRecordSizeMember = members.Count;
++
++            for (int i = 0; i < buffers; i++)
++            {
++                members.Add(context.TypeU32());
++                offsets.Add(buffers * 8 + textures * 4 + i * 4);
++            }
++
+             if (members.Count == 0)
+             {
+                 return;
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1754,6 +1754,7 @@
+             int srcIndex = 0;
+             IoVariable? perVertexBuiltIn = null;
+             int memoryLength = 0;   // DKB: elements of the shared or local array the index is clamped to
++            SpvInstruction bindlessLast = null;   // bindless buffer field array: the last index its size allows
+ 
+             switch (storageKind)
+             {
+@@ -1789,6 +1790,30 @@
+                         storageClass = StorageClass.PhysicalStorageBuffer;
+                         physical = true;
+                         baseObj = context.ConvertUToPtr(context.BindlessBufferPointerTypes[buffer.Binding], address);
++
++                        // Bounds: an index into the field's array is clamped to the last element inside the buffer's size, which the
++                        // record holds after the texture slots. A descriptor-bound buffer has robustBufferAccess (runtime/vk_device.c)
++                        // to keep an out-of-range read harmless; a raw address has nothing, and a read past the end of the mapped
++                        // memory loses the device. Last = (max(size, offset + stride) - offset) / stride - 1, so at least element 0.
++                        if (context.BindlessFieldLayout.TryGetValue(buffer.Binding, out var layout) &&
++                            fieldIndex.Value < layout.Strides.Length &&
++                            layout.Strides[fieldIndex.Value] > 0)
++                        {
++                            int fieldOffset = layout.Offsets[fieldIndex.Value];
++                            int stride = layout.Strides[fieldIndex.Value];
++                            SpvInstruction sizePointer = context.AccessChain(
++                                context.BindlessRecordU32Pointer,
++                                BindlessRecord(context),
++                                context.Constant(context.TypeU32(), context.BindlessRecordSizeMember + bufferRank));
++                            SpvInstruction size = context.LoadAligned(context.TypeU32(), sizePointer, 4);
++                            SpvInstruction limit = context.Delegates.GlslUMax(context.TypeU32(), size, context.Constant(context.TypeU32(), fieldOffset + stride));
++                            SpvInstruction count = context.UDiv(
++                                context.TypeU32(),
++                                context.ISub(context.TypeU32(), limit, context.Constant(context.TypeU32(), fieldOffset)),
++                                context.Constant(context.TypeU32(), stride));
++                            bindlessLast = context.ISub(context.TypeU32(), count, context.Constant(context.TypeU32(), 1));
++                        }
++
+                         break;
+                     }
+ 
+@@ -1946,12 +1971,12 @@
+                     break;
+                 case 2:
+                     e0 = context.Get(AggregateType.S32, operation.GetSource(srcIndex++));
+-                    e1 = context.Get(AggregateType.S32, operation.GetSource(srcIndex++));
++                    e1 = BindlessClamp(context, operation.GetSource(srcIndex++), bindlessLast);
+                     pointer = context.AccessChain(context.TypePointer(storageClass, context.GetType(varType)), baseObj, e0, e1);
+                     break;
+                 case 3:
+                     e0 = context.Get(AggregateType.S32, operation.GetSource(srcIndex++));
+-                    e1 = context.Get(AggregateType.S32, operation.GetSource(srcIndex++));
++                    e1 = BindlessClamp(context, operation.GetSource(srcIndex++), bindlessLast);
+                     e2 = context.Get(AggregateType.S32, operation.GetSource(srcIndex++));
+                     pointer = context.AccessChain(context.TypePointer(storageClass, context.GetType(varType)), baseObj, e0, e1, e2);
+                     break;
+@@ -1961,7 +1986,9 @@
+ 
+                     for (; index < inputsCount; srcIndex++, index++)
+                     {
+-                        indexes[index] = context.Get(AggregateType.S32, operation.GetSource(srcIndex));
++                        indexes[index] = index == 1
++                            ? BindlessClamp(context, operation.GetSource(srcIndex), bindlessLast)
++                            : context.Get(AggregateType.S32, operation.GetSource(srcIndex));
+                     }
+ 
+                     pointer = context.AccessChain(context.TypePointer(storageClass, context.GetType(varType)), baseObj, indexes);
+@@ -1971,6 +1998,18 @@
+             return pointer;
+         }
+ 
++        // The array index of a bindless buffer access, clamped (as unsigned, so a negative one is too) to the last element inside the
++        // buffer; without a bound (not a bindless buffer, or a field without an array) the index as it is.
++        private static SpvInstruction BindlessClamp(CodeGenContext context, IAstNode source, SpvInstruction last)
++        {
++            if (last == null)
++            {
++                return context.Get(AggregateType.S32, source);
++            }
++
++            return context.Delegates.GlslUMin(context.TypeU32(), context.Get(AggregateType.U32, source), last);
++        }
++
+         private static SpvInstruction GetScalarInput(CodeGenContext context, IoVariable ioVariable)
+         {
+             (_, AggregateType varType) = IoMap.GetSpirvBuiltIn(ioVariable);

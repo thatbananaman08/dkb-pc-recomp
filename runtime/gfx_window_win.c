@@ -148,7 +148,7 @@ void gfx_window_apply_settings(void) {
 
 
 void gfx_window_request_close(void) {
-    if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+    if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0x51554954, 0);   // wParam 'QUIT': the menu's quit button (logged at WM_CLOSE)
 }
 
 // ---- refresh rate of the window's monitor (TOTK_FPS_LIMIT=display), measured when the window opens, lands on another
@@ -271,7 +271,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
-    case WM_CLOSE:
+    case WM_CLOSE:   // what asked: the menu's quit button, Alt+F4 (Alt held), or the title bar, taskbar or another program
+        rt_log("gfx: close requested by %s", w == 0x51554954 ? "the menu's quit button"
+                                            : GetKeyState(VK_MENU) < 0 ? "Alt+F4"
+                                                                       : "the window's close button, the taskbar or another program");
         gfx_window_closed();
     case WM_ERASEBKGND:
         return 1;
